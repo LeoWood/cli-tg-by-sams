@@ -800,17 +800,17 @@ class ResponseFormatter:
         return messages
 
     def _get_quick_actions_keyboard(self) -> InlineKeyboardMarkup:
-        """Get quick actions inline keyboard."""
+        """Get menu-like inline keyboard for common command entry points."""
         keyboard = [
             [
-                InlineKeyboardButton("🧪 Test", callback_data="quick:test"),
-                InlineKeyboardButton("📦 Install", callback_data="quick:install"),
-                InlineKeyboardButton("🎨 Format", callback_data="quick:format"),
+                InlineKeyboardButton("📋 Projects", callback_data="action:show_projects"),
+                InlineKeyboardButton("📁 Files", callback_data="action:ls"),
+                InlineKeyboardButton("📊 Status", callback_data="action:status"),
             ],
             [
-                InlineKeyboardButton("🔍 Find TODOs", callback_data="quick:find_todos"),
-                InlineKeyboardButton("🔨 Build", callback_data="quick:build"),
-                InlineKeyboardButton("📊 Git Status", callback_data="quick:git_status"),
+                InlineKeyboardButton("🆕 New", callback_data="action:new_session"),
+                InlineKeyboardButton("🌿 Git", callback_data="git:status"),
+                InlineKeyboardButton("❓ Help", callback_data="action:help"),
             ],
         ]
 

@@ -365,7 +365,7 @@ class TestResponseFormatter:
         # Check that buttons have callback data
         for row in keyboard.inline_keyboard:
             for button in row:
-                assert button.callback_data.startswith("quick:")
+                assert button.callback_data.startswith(("action:", "git:"))
 
     def test_confirmation_keyboard(self, formatter):
         """Test confirmation keyboard creation."""

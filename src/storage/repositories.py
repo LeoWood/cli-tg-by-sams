@@ -397,6 +397,18 @@ class AuditLogRepository:
     async def log_event(self, audit_log: AuditLogModel) -> int:
         """Log audit event and return ID."""
         async with self.db.get_connection() as conn:
+            # Keep audit logging resilient even when user profile row has not been
+            # created yet (e.g. failures raised before session initialization).
+            now = datetime.utcnow()
+            await conn.execute(
+                """
+                INSERT OR IGNORE INTO users
+                (user_id, telegram_username, first_seen, last_active, is_allowed)
+                VALUES (?, ?, ?, ?, ?)
+            """,
+                (audit_log.user_id, None, now, now, False),
+            )
+
             event_data_json = (
                 json.dumps(audit_log.event_data) if audit_log.event_data else None
             )

@@ -20,6 +20,7 @@ from ...services.session_lifecycle_service import SessionLifecycleService
 from ...services.session_service import SessionService
 from ..features.session_export import ExportFormat
 from ..utils.cli_engine import (
+    DEFAULT_CLI_ENGINE,
     ENGINE_CLAUDE,
     ENGINE_CODEX,
     SUPPORTED_CLI_ENGINES,
@@ -2401,7 +2402,7 @@ async def handle_resume_callback(query, param, context):
     target_engine = (
         normalize_cli_engine((preview or {}).get("engine"))
         if preview
-        else ENGINE_CLAUDE
+        else DEFAULT_CLI_ENGINE
     )
     scanner = _get_or_create_resume_scanner(
         context=context,

@@ -569,6 +569,32 @@ class TestSessionEventRepository:
 class TestAuditLogRepository:
     """Test audit log repository filters."""
 
+    async def test_log_event_auto_creates_missing_user(self, audit_repo, user_repo):
+        """Audit logging should not fail when user row does not exist yet."""
+        now = datetime.utcnow()
+        missing_user_id = 9901
+
+        await audit_repo.log_event(
+            AuditLogModel(
+                id=None,
+                user_id=missing_user_id,
+                event_type="security_violation",
+                event_data={"violation_type": "system_error"},
+                success=False,
+                timestamp=now,
+                ip_address=None,
+            )
+        )
+
+        created_user = await user_repo.get_user(missing_user_id)
+        assert created_user is not None
+        assert created_user.user_id == missing_user_id
+        assert created_user.is_allowed == 0  # SQLite stores boolean as integer
+
+        events = await audit_repo.get_user_audit_log(missing_user_id, limit=10)
+        assert len(events) == 1
+        assert events[0].event_type == "security_violation"
+
     async def test_get_events_with_filters(self, audit_repo, user_repo):
         """Repository should support combined user/type/time filtering."""
         now = datetime.utcnow()

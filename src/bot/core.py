@@ -29,7 +29,7 @@ from ..claude.task_registry import TaskRegistry
 from ..config.settings import Settings
 from ..exceptions import ClaudeCodeTelegramError
 from .features.registry import FeatureRegistry
-from .utils.cli_engine import ENGINE_CLAUDE
+from .utils.cli_engine import get_default_cli_engine
 from .utils.command_menu import build_bot_commands_for_engine
 from .utils.telegram_send import send_message_resilient
 from .utils.update_dedupe import UpdateDedupeCache
@@ -123,9 +123,17 @@ class ClaudeCodeBot:
     async def _set_bot_commands(self) -> None:
         """Set bot command menu (non-fatal on failure)."""
         try:
-            commands = build_bot_commands_for_engine(ENGINE_CLAUDE)
+            integrations = self.deps.get("cli_integrations")
+            default_engine = get_default_cli_engine(
+                integrations if isinstance(integrations, dict) else None
+            )
+            commands = build_bot_commands_for_engine(default_engine)
             await self.app.bot.set_my_commands(commands)
-            logger.info("Bot commands set", commands=[cmd.command for cmd in commands])
+            logger.info(
+                "Bot commands set",
+                engine=default_engine,
+                commands=[cmd.command for cmd in commands],
+            )
         except Exception as e:
             logger.warning(
                 "Failed to set bot commands, will retry on next startup",

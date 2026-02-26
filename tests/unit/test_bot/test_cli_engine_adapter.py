@@ -878,7 +878,7 @@ async def test_engine_callback_rejects_unavailable_target(tmp_path):
 
 
 def test_get_cli_integration_respects_active_engine_with_fallback():
-    """Adapter resolver should pick active engine then fallback to claude."""
+    """Adapter resolver should pick active engine then fallback to available engine."""
     claude_integration = object()
     codex_integration = object()
     engine, selected = get_cli_integration(
@@ -897,8 +897,27 @@ def test_get_cli_integration_respects_active_engine_with_fallback():
         bot_data={"cli_integrations": {"claude": claude_integration}},
         scope_state={ENGINE_STATE_KEY: "codex"},
     )
-    assert fallback_engine == "codex"
+    assert fallback_engine == "claude"
     assert fallback_selected is claude_integration
+
+
+def test_get_cli_integration_defaults_to_codex_when_state_missing():
+    """Adapter resolver should default to Codex when both engines are available."""
+    claude_integration = object()
+    codex_integration = object()
+
+    engine, selected = get_cli_integration(
+        bot_data={
+            "cli_integrations": {
+                "claude": claude_integration,
+                "codex": codex_integration,
+            }
+        },
+        scope_state={},
+    )
+
+    assert engine == "codex"
+    assert selected is codex_integration
 
 
 @pytest.mark.asyncio
