@@ -1,406 +1,88 @@
-# 贡献指南 - Claude Code Telegram Bot
+# 贡献指南
 
-感谢你有兴趣为本项目做贡献！本文档提供了参与贡献的指引。
+感谢你为 CLITG 贡献代码。
 
-## 开发状态
+## 先看这几份文档
 
-本项目目前正在积极开发中，当前进度：
+- `README.md`：安装、运行、命令用法（用户视角）
+- `AGENTS.md`：仓库内协作约定（开发与运维流程）
+- `docs/development.md`：开发工作流与调试建议
+- `docs/configuration.md`：配置项说明
 
-- **项目结构与配置**（完成）
-- **认证与安全**（完成）
-- **Bot 核心与集成**（TODO-4、TODO-5，完成）
-- **存储层**（TODO-6，完成）
-- **高级功能**（TODO-7，下一步）
+## 环境要求
 
-## 快速上手
+- Python 3.10+
+- Poetry
+- Git
+- 可选：tmux（推荐用于长期运行）
 
-### 前置条件
+## 本地开发快速开始
 
-- Python 3.9 或更高版本
-- Poetry 依赖管理工具
-- Git 版本控制
+1. 克隆仓库并进入目录。
+2. 安装依赖：`make dev`
+3. 复制配置：`cp .env.example .env`
+4. 按需修改 `.env`（至少填 `TELEGRAM_BOT_TOKEN`、`TELEGRAM_BOT_USERNAME`、`APPROVED_DIRECTORY`）
+5. 运行测试：`make test`
+6. 运行静态检查：`make lint`
 
-### 配置开发环境
+## 日常开发命令
 
-1. **Fork 并克隆仓库**：
-   ```bash
-   git clone https://github.com/your-username/claude-code-telegram.git
-   cd claude-code-telegram
-   ```
+- `make test`：运行测试
+- `make lint`：黑白名单检查（black/isort/flake8/mypy）
+- `make format`：格式化代码
+- `make run`：tmux 托管重启 bot（单实例校验）
+- `make run-debug`：tmux 托管 debug 重启
+- `make run-local`：当前终端前台运行
 
-2. **安装依赖**：
-   ```bash
-   make dev
-   ```
+## 分支与提交
 
-3. **配置环境**：
-   ```bash
-   cp .env.example .env
-   # 编辑 .env 填写你的开发配置
-   ```
+建议流程：
 
-4. **验证配置**：
-   ```bash
-   make test
-   make lint
-   ```
+1. 从 `main` 拉出功能分支
+2. 完成功能与测试
+3. 提交前执行：`make format && make lint && make test`
+4. 提交信息使用 Conventional Commits（如 `feat:`、`fix:`、`docs:`、`test:`、`refactor:`、`chore:`）
 
-## 开发流程
+示例：
 
-### 开始工作前
+- `feat: add codex status window formatter`
+- `fix: avoid stale tmux session duplicate process`
+- `docs: align setup and development guides`
 
-1. **查看已有 issue**，看是否有类似工作
-2. 如果没有，**创建一个 issue**
-3. **在 issue 下评论**表示你正在处理
-4. 从 main 分支**创建功能分支**
+## Pull Request 建议内容
 
-### 进行修改
+- 变更背景与目标
+- 主要改动点
+- 测试结果（至少相关定向测试）
+- 兼容性/迁移说明（如有）
+- 若影响 Telegram 交互，附关键日志或截图
 
-1. **遵循项目结构**：
-   ```
-   src/
-   ├── config/     # 配置（完成）
-   ├── security/   # 认证与安全（完成）
-   ├── bot/        # Telegram bot（完成 - TODO-4）
-   ├── claude/     # Claude 集成（完成 - TODO-5）
-   └── storage/    # 数据库（完成 - TODO-6）
-   ```
+## 代码规范
 
-2. **为新功能编写测试**：
-   ```bash
-   # 在 tests/unit/ 或 tests/integration/ 中添加测试
-   make test
-   ```
+- 4 空格缩进，Black 行宽 88
+- 类型标注必须完整（mypy 开启 `disallow_untyped_defs`）
+- 模块/函数：`snake_case`，类：`PascalCase`，常量：`UPPER_SNAKE_CASE`
+- 优先复用 `src/exceptions.py` 异常层级
+- 日志使用结构化字段（`structlog`）
 
-3. **遵循代码规范**：
-   ```bash
-   make format  # 自动格式化代码
-   make lint    # 检查代码质量
-   ```
+## 测试规范
 
-4. 按需**更新文档**
+- 测试目录当前以 `tests/unit/` 为主
+- 文件命名：`test_*.py`
+- 异步用例使用 `@pytest.mark.asyncio`
+- 先跑受影响模块定向测试，再跑全量 `make test`
 
-### 代码规范
+## 安全与配置注意事项
 
-#### 类型标注
+- 不要提交 `.env`、token、密钥、真实用户 ID 等敏感信息
+- 变更路径访问逻辑时，必须验证 `APPROVED_DIRECTORY` 边界
+- 涉及重启/进程管理逻辑时，以 `scripts/tmux-bot.sh` 与 `scripts/restart-bot.sh` 为准
+- 远程重启链路为 `/restartbot -> scripts/restart-from-telegram.sh`
 
-所有代码必须包含完整的类型标注：
+## 文档维护要求
 
-```python
-from typing import Optional, List, Dict, Any
-from pathlib import Path
+当你修改了以下内容时，请同步更新文档：
 
-async def process_data(
-    items: List[Dict[str, Any]],
-    config: Optional[Path] = None
-) -> bool:
-    """使用可选配置处理数据。"""
-    # 实现
-    return True
-```
-
-#### 错误处理
-
-使用自定义异常层级：
-
-```python
-from src.exceptions import ConfigurationError, SecurityError
-
-try:
-    # 某些操作
-    pass
-except ValueError as e:
-    raise ConfigurationError(f"无效配置: {e}") from e
-```
-
-#### 日志
-
-使用结构化日志：
-
-```python
-import structlog
-
-logger = structlog.get_logger()
-
-def some_function():
-    logger.info("Operation started", operation="example", user_id=123)
-    # 实现
-```
-
-#### 测试
-
-编写全面的测试：
-
-```python
-import pytest
-from src.config import create_test_config
-
-@pytest.mark.asyncio
-async def test_feature():
-    """测试功能。"""
-    config = create_test_config(debug=True)
-    # 测试实现
-    assert config.debug is True
-```
-
-## 贡献类型
-
-### 高优先级（当前 TODO）
-
-#### TODO-7: 高级功能（当前优先）
-- 带安全验证的文件上传处理
-- 仓库操作的 Git 集成
-- 常用工作流的快捷操作系统
-- 会话导出功能（Markdown、JSON、HTML）
-- 图片/截图支持与处理
-
-**需要创建/修改的文件**：
-- `src/bot/handlers/file.py`
-- `src/git/integration.py`
-- `src/features/quick_actions.py`
-- `src/features/export.py`
-- `tests/unit/test_features.py`
-
-### 近期已完成
-
-#### TODO-4: Telegram Bot 核心
-- Bot 连接和处理器注册
-- 命令路由系统
-- 消息解析和格式化
-- 内联键盘支持
-- 错误处理中间件
-
-#### TODO-5: Claude Code 集成
-- Claude CLI 子进程管理
-- 响应流式传输和解析
-- 会话状态持久化
-- 超时处理
-- 工具使用监控
-
-#### TODO-6: 存储层
-- SQLite 数据库模式
-- 仓储模式实现
-- 迁移系统
-- 分析与报告
-
-### 文档改进
-
-- API 文档
-- 用户指南
-- 部署指南
-- 架构文档
-
-### 测试改进
-
-- 集成测试
-- 端到端测试
-- 性能测试
-- 安全测试
-
-## 提交变更
-
-### Pull Request 流程
-
-1. **确保测试通过**：
-   ```bash
-   make test
-   make lint
-   ```
-
-2. 按需**更新文档**
-
-3. **创建 Pull Request** 并包含：
-   - 清晰的标题和描述
-   - 关联的 issue
-   - 变更列表
-   - 如涉及 UI 则附截图
-
-4. **及时回应审查反馈**
-
-### 提交信息格式
-
-使用约定式提交：
-
-```
-feat: add rate limiting functionality
-fix: resolve configuration validation issue
-docs: update development guide
-test: add tests for authentication system
-refactor: reorganize bot handlers
-```
-
-### Pull Request 模板
-
-```markdown
-## 描述
-简要描述所做的变更。
-
-## 关联 Issue
-Fixes #123
-
-## 变更类型
-- [ ] Bug 修复
-- [ ] 新功能
-- [ ] 破坏性变更
-- [ ] 文档更新
-
-## 测试
-- [ ] 已添加/更新测试
-- [ ] 所有测试通过
-- [ ] 已完成手动测试
-
-## 检查清单
-- [ ] 代码遵循项目风格指南
-- [ ] 已完成自查
-- [ ] 文档已更新
-- [ ] 无破坏性变更（或已明确记录）
-```
-
-## 代码审查指南
-
-### 对贡献者
-
-- 提交前**自查**代码
-- **编写清晰的提交信息**和 PR 描述
-- **及时回应**审查反馈
-- **保持 PR 聚焦**于单一变更
-- 为新功能**添加测试**
-
-### 对审查者
-
-- 提供**建设性**和有帮助的反馈
-- 尽可能**测试功能**
-- **检查安全影响**
-- **验证文档更新**
-- **确保测试全面**
-
-## Issue 指南
-
-### Bug 报告
-
-```markdown
-**描述 Bug**
-清晰描述这个 Bug 是什么。
-
-**复现步骤**
-复现该行为的步骤。
-
-**期望行为**
-你期望发生什么。
-
-**环境**
-- 操作系统：[如 macOS、Linux]
-- Python 版本：[如 3.9]
-- Poetry 版本：[如 1.7.1]
-
-**补充说明**
-关于该问题的其他上下文。
-```
-
-### 功能请求
-
-```markdown
-**你的功能请求是否与某个问题相关？**
-清晰描述该问题是什么。
-
-**描述你期望的解决方案**
-清晰描述你希望实现什么。
-
-**描述你考虑过的替代方案**
-你考虑过的替代解决方案或功能。
-
-**补充说明**
-关于该功能请求的其他上下文。
-```
-
-## 安全
-
-### 报告安全问题
-
-**不要**为安全漏洞创建公开的 issue。
-
-请：
-1. 将安全问题发送至 [维护者邮箱]
-2. 包含漏洞的详细描述
-3. 在公开披露前等待确认
-
-### 安全指南
-
-- **永远不要提交**密钥或凭据
-- **彻底验证所有输入**
-- 数据库操作**使用参数化查询**
-- **遵循最小权限原则**
-- **记录安全相关事件**
-
-## 开发环境
-
-### 必需工具
-
-- **Poetry**：依赖管理
-- **Black**：代码格式化
-- **isort**：导入排序
-- **flake8**：代码检查
-- **mypy**：类型检查
-- **pytest**：测试
-
-### 推荐的 IDE 配置
-
-#### VS Code
-```json
-{
-    "python.defaultInterpreterPath": ".venv/bin/python",
-    "python.formatting.provider": "black",
-    "python.linting.enabled": true,
-    "python.linting.flake8Enabled": true,
-    "python.linting.mypyEnabled": true
-}
-```
-
-#### PyCharm
-- 配置 Poetry 解释器
-- 启用 Black 格式化
-- 启用 flake8 和 mypy 检查
-
-## 社区指南
-
-### 行为准则
-
-- **尊重**他人并包容
-- **欢迎新人**并帮助他们入门
-- 提供**建设性反馈**
-- **聚焦于代码**，而非个人
-- **假设善意**
-
-### 沟通
-
-- 使用**清晰、简洁的语言**
-- 在 issue 和 PR 中**提供上下文**
-- 不确定时**提出问题**
-- **分享知识**并帮助他人
-
-## 获取帮助
-
-### 文档
-- 查看 `docs/` 目录中的指南
-- 查看现有代码了解模式
-- 阅读配置指南
-
-### 提问
-- 先搜索已有 issue
-- 提供上下文和示例
-- 包含相关环境信息
-- 具体说明你尝试过什么
-
-### 调试
-- 使用 `make run-debug` 获取详细日志
-- 用 `make test` 检查测试输出
-- 运行 `poetry run mypy src` 进行类型检查
-
-## 致谢
-
-贡献者将在以下位置获得致谢：
-- `CHANGELOG.md` 中记录其贡献
-- 项目文档
-- 发布说明
-
-感谢你为 Claude Code Telegram Bot 做出贡献！
+- 命令菜单或 handler 注册：更新 `README.md`
+- 启停/运维脚本：更新 `AGENTS.md` 与相关运维文档
+- 配置项：更新 `.env.example` 与 `docs/configuration.md`

@@ -1,41 +1,83 @@
 # Repository Guidelines
 
 ## 项目结构与模块组织
-核心代码位于 `src/`，按职责分层：`config/`（配置加载与环境覆盖）、`security/`（鉴权与限流）、`bot/`（Telegram 交互与处理器）、`claude/`（Claude 集成）、`storage/`（SQLite 与仓储模式）、`utils/`（常量与通用工具）。入口为 `src/main.py`。  
-测试代码位于 `tests/`，当前以 `tests/unit/` 为主，目录结构尽量镜像 `src/`。文档在 `docs/`，运维与部署相关说明见 `README.md`、`SECURITY.md`、`SYSTEMD_SETUP.md`。
+核心代码位于 `src/`：
+- `bot/`：Telegram 处理器、回调、消息流与中间件
+- `claude/`：Claude/Codex 统一集成层与会话能力
+- `services/`：会话、事件、审批等应用服务
+- `storage/`：SQLite、仓储与门面
+- `config/`、`security/`、`utils/`：配置、安全、通用工具
+
+入口为 `src/main.py`，Poetry 脚本为 `cli-tg-bot` 与 `claude-telegram-bot`（均指向同一入口）。
+测试以 `tests/unit/` 为主，当前没有独立 `tests/integration/` 目录。
 
 ## 构建、测试与开发命令
- - `make dev`：安装开发依赖（Poetry）并尝试安装提交钩子。
- - `make install`：仅安装生产依赖。
- - `make run`：启动机器人。
- - `make run-debug`：调试模式启动，输出更详细日志。
- - `make test`：运行 `pytest` 与覆盖率统计。
- - `make lint`：执行 `black --check`、`isort --check-only`、`flake8`、`mypy`。
- - `make format`：自动格式化 `src` 与 `tests`。
+以 `Makefile` 为准：
+- `make dev`：安装开发依赖并尝试安装 pre-commit
+- `make install`：安装生产依赖
+- `make test`：运行 `pytest`
+- `make lint`：`black --check` + `isort --check-only` + `flake8` + `mypy`
+- `make format`：自动格式化 `src/`、`tests/`
+- `make run`：通过 `scripts/tmux-bot.sh restart` 重启并校验单实例
+- `make run-debug`：调试模式重启（`BOT_DEBUG=1`）
+- `make run-local`：前台直接运行 bot（不走 tmux）
+- `make bot-stop|bot-status|bot-logs|bot-attach`：运维辅助命令
 
-## 重启服务
-本仓库在 macOS 上通常没有 systemd，推荐使用项目内脚本重启：
-1. 残留进程定义：新进程已启动，但旧 bot 进程未退出，会导致并发轮询或响应异常。
-2. 标准做法（推荐 `tmux`）：先 `tmux kill-session -t cli_tg_bot`，再 `tmux new-session -d -s cli_tg_bot -c /Users/suqi3/PycharmProjects/cli-tg './scripts/restart-bot.sh'`。
-3. 验证仅有一个 bot 进程：`ps -Ao pid,ppid,command | rg -i 'cli-tg-bot|claude-telegram-bot|src.main' | rg -v 'rg -i'`。
-4. 验证轮询正常：`tmux capture-pane -t cli_tg_bot -p | tail -n 80`，应持续看到 `getUpdates 200 OK`，且无异常栈。
-5. 执行约束：默认不自动重启。只有用户明确要求“重启”时，才按上述流程执行。
-6. 用户侧无响应排查顺序：先确认服务在线（`tmux` 会话、唯一进程、`getUpdates 200 OK`），再检查命令格式与路由。
-7. 用户名一致性：`/engine@<bot_username>` 里的用户名必须与 Telegram `getMe` 返回一致；当前应为 `CodingSam_bot`，并保持 `.env` 的 `TELEGRAM_BOT_USERNAME` 同步。
-8. `./scripts/restart-bot.sh` 内部会 `pkill -f cli-tg` 后执行 `poetry run claude-telegram-bot`，对 Claude CLI 与 Codex CLI 都生效。
+## 运行与重启流程（当前实现）
+默认使用 `tmux` 托管进程，不建议手写 `tmux new-session` 命令。
+
+1. 标准重启：`./scripts/tmux-bot.sh restart`（或 `make run`）。
+2. 停止服务：`./scripts/tmux-bot.sh stop`（或 `make bot-stop`）。
+3. 查看状态：`./scripts/tmux-bot.sh status`（或 `make bot-status`）。
+4. 查看日志：`./scripts/tmux-bot.sh logs`（或 `make bot-logs`）。
+
+实现细节（以脚本为准）：
+- 会先清理旧 tmux session 与残留 bot 进程，再启动新实例。
+- 启动后会检查 bot 进程数，期望值是 `1`；不满足会返回失败。
+- tmux 会话名默认 `cli_tg_bot`，可用环境变量 `BOT_TMUX_SESSION` 覆盖。
+
+远程重启链路：
+- Telegram 命令 `/restartbot` 会调用 `scripts/restart-from-telegram.sh`。
+- 重启事件记录在 `logs/restart-events.log`。
+
+注意：
+- 仅在用户明确要求“重启”时执行重启操作。
+- 不要在文档中硬编码机器本地绝对路径或固定 bot 用户名。
 
 ## 代码风格与命名约定
-使用 Python 3.10+，统一 4 空格缩进，行宽 88（Black 规则）。导入顺序由 isort（与 Black 兼容配置）管理。  
-命名规范：模块/函数使用 `snake_case`，类使用 `PascalCase`，常量使用 `UPPER_SNAKE_CASE`。  
-类型标注为强制要求（mypy 开启 `disallow_untyped_defs`），新增或修改接口时必须补齐类型。优先复用 `src/exceptions.py` 中的异常层级与结构化日志模式。
+使用 Python 3.10+，4 空格缩进，Black 行宽 88。
+- 模块/函数：`snake_case`
+- 类：`PascalCase`
+- 常量：`UPPER_SNAKE_CASE`
+
+`mypy` 开启 `disallow_untyped_defs`，新增或修改接口需补齐类型标注。
+优先复用 `src/exceptions.py` 异常层级与结构化日志（`structlog`）模式。
 
 ## 测试指南
-测试框架为 `pytest` + `pytest-asyncio` + `pytest-cov`。测试文件命名使用 `test_*.py`，测试函数使用 `test_*`。异步用例显式添加 `@pytest.mark.asyncio`。  
-执行 `make test` 后查看终端缺失覆盖率报告与 `htmlcov/`。项目当前总体覆盖率约 85%，新增变更应避免拉低覆盖率（建议保持在 80% 以上）。
+测试栈：`pytest` + `pytest-asyncio` + `pytest-cov`。
+- 文件命名：`test_*.py`
+- 异步测试：显式 `@pytest.mark.asyncio`
+- 建议先跑定向测试，再跑全量 `make test`
+
+覆盖率阈值以当前 CI/团队约定为准，不在此文件写死固定百分比。
 
 ## 提交与合并请求规范
-提交信息遵循约定式提交（Conventional Commits），历史中常见前缀：`feat:`、`fix:`、`refactor:`、`docs:`、`test:`、`chore:`。示例：`feat: add session export command`。  
-发起合并请求（Pull Request）时请包含：变更目的、关联 Issue、测试结果（至少 `make test` 与 `make lint`）、必要文档更新。若变更影响 Telegram 交互流程，附上关键聊天截图或日志片段。
+建议使用 Conventional Commits：`feat:`、`fix:`、`refactor:`、`docs:`、`test:`、`chore:`。
+
+PR 建议包含：
+- 变更目的与范围
+- 测试结果（至少相关定向测试；大改建议附 `make test` 与 `make lint`）
+- 必要文档更新
+- 若影响 Telegram 交互，附关键日志或截图
 
 ## 安全与配置提示
-从 `.env.example` 复制生成 `.env`，严禁提交令牌、密钥或真实凭据。重点检查 `ALLOWED_USERS` 与 `APPROVED_DIRECTORY`，避免越权访问。涉及 Claude 命令执行路径时，优先使用本地 `claude-wrapper.sh` 并在提交前确认未泄露敏感配置。
+从 `.env.example` 复制 `.env`，禁止提交真实凭据。
+
+重点配置：
+- `TELEGRAM_BOT_TOKEN`、`TELEGRAM_BOT_USERNAME`
+- `ALLOWED_USERS`
+- `APPROVED_DIRECTORY`
+- `ENABLE_CODEX_CLI`、`CODEX_CLI_PATH`、`CODEX_ENABLE_MCP`
+
+当前默认引擎为 Codex（见 `src/bot/utils/cli_engine.py`）。
+涉及 CLI 路径、代理和启动参数时，以 `scripts/restart-bot.sh` 与 `scripts/tmux-bot.sh` 的实际逻辑为准。

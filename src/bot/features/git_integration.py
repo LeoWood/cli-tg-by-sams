@@ -10,6 +10,7 @@ from typing import List, Optional, Set, Tuple
 
 from src.config.settings import Settings
 from src.exceptions import SecurityError
+from src.utils.beijing_time import format_datetime_beijing
 
 logger = logging.getLogger(__name__)
 
@@ -402,8 +403,9 @@ class GitIntegration:
         lines = ["📜 Commit History:"]
 
         for commit in commits:
+            commit_time = format_datetime_beijing(commit.date, fmt="%Y-%m-%d %H:%M")
             lines.append(
-                f"\n🔹 {commit.hash} - {commit.date.strftime('%Y-%m-%d %H:%M')}"
+                f"\n🔹 {commit.hash} - {commit_time}"
             )
             lines.append(f"   👤 {commit.author}")
             lines.append(f"   💬 {commit.message}")

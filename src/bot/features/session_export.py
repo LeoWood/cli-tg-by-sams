@@ -8,6 +8,7 @@ from html import escape
 
 from src.storage.facade import Storage
 from src.storage.models import MessageModel, SessionModel
+from src.utils.beijing_time import format_datetime_beijing, now_beijing
 from src.utils.constants import MAX_SESSION_LENGTH
 
 
@@ -89,7 +90,7 @@ class SessionExporter:
             raise ValueError(f"Unsupported export format: {format}")
 
         # Create filename
-        timestamp = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
+        timestamp = now_beijing().strftime("%Y%m%d_%H%M%S")
         filename = f"session_{session_id[:8]}_{timestamp}.{extension}"
 
         return ExportedSession(
@@ -98,13 +99,13 @@ class SessionExporter:
             filename=filename,
             mime_type=mime_type,
             size_bytes=len(content.encode("utf-8")),
-            created_at=datetime.utcnow(),
+            created_at=now_beijing(),
         )
 
     @staticmethod
     def _format_datetime(value: datetime) -> str:
         """Format datetime for exported content."""
-        return value.strftime("%Y-%m-%d %H:%M:%S")
+        return format_datetime_beijing(value)
 
     def _export_markdown(
         self, session: SessionModel, messages: list[MessageModel]

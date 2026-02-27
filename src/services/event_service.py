@@ -10,6 +10,7 @@ import structlog
 
 from ..storage.facade import Storage
 from ..storage.models import SessionEventModel
+from ..utils.beijing_time import format_datetime_beijing
 
 logger = structlog.get_logger()
 
@@ -79,7 +80,7 @@ class EventService:
     @staticmethod
     def _to_compact_datetime(value: datetime) -> str:
         """Render datetime in compact sortable format."""
-        return value.strftime("%Y-%m-%d %H:%M:%S")
+        return format_datetime_beijing(value)
 
     @staticmethod
     def _clip_text(value: str, max_chars: int = 48) -> str:

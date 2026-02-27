@@ -17,7 +17,7 @@ def test_format_rate_limit_summary_shows_remaining_percent():
     assert "5h window: 87.5% remaining" in summary
     assert "7d window: 63.0% remaining" in summary
     assert "\n" in summary
-    assert "(updated 2026-02-15T10:56:46.914000Z)" in summary
+    assert "(updated 2026-02-15 18:56:46)" in summary
 
 
 def test_format_rate_limit_summary_clamps_remaining_between_0_and_100():

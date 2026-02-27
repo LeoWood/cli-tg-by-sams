@@ -1,3 +1,5 @@
+> ⚠️ **归档说明**：本文档为历史设计/阶段性记录，可能与当前实现不一致。请以 README.md、AGENTS.md、docs/development.md、docs/configuration.md 为准。
+
 # TODO-1: 项目结构与基础搭建
 
 ## 目标
@@ -6,7 +8,7 @@
 ## 目录结构
 
 ```
-claude-code-telegram/
+cli-tg/
 ├── src/
 │   ├── __init__.py
 │   ├── bot/
@@ -93,13 +95,13 @@ claude-code-telegram/
 ### pyproject.toml
 ```toml
 [tool.poetry]
-name = "claude-code-telegram"
+name = "cli-tg"
 version = "0.1.0"
 description = "Telegram bot for remote Claude Code access"
 authors = ["Your Name <email@example.com>"]
 license = "MIT"
 readme = "README.md"
-repository = "https://github.com/yourusername/claude-code-telegram"
+repository = "https://github.com/codingSamss/cli-tg"
 keywords = ["telegram", "bot", "claude", "ai", "development"]
 
 [tool.black]

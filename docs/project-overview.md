@@ -1,126 +1,64 @@
-# Claude Code Telegram Bot - 项目概述
+# CLITG 项目概述
 
-## 项目简介
+## 项目定位
 
-一个 Telegram bot，提供对 Claude Code 的远程访问，让开发者可以随时随地与项目交互。该 bot 通过 Telegram 提供类似终端的界面，支持项目导航、文件管理以及带完整上下文持久化的 Claude Code 会话。
+CLITG 是一个通过 Telegram 远程操控 CLI 编码智能体的 Python Bot，支持 Claude/Codex 双引擎、会话持久化、权限审批、流式输出与运维诊断。
 
-## 核心目标
+## 当前核心能力
 
-1. **远程开发访问**：让开发者在离开主开发机器时也能使用 Claude Code
-2. **安全优先设计**：实现严格的安全边界，防止未授权访问
-3. **直观的界面**：在 Telegram 的聊天界面中提供熟悉的终端命令
-4. **会话持久化**：跨对话和项目切换保持 Claude Code 上下文
-5. **开源就绪**：面向社区贡献和扩展性进行构建
+- 多引擎切换：`/engine claude|codex`
+- 会话管理：`/new`、`/continue`、`/end`、`/resume`
+- 上下文与用量：`/context`、`/status`、`/codexdiag`
+- 项目导航：`/projects`、`/cd`、`/ls`、`/pwd`
+- 工具能力：文件处理、图片处理、Git 信息、会话导出
+- 运维能力：`/restartbot`、`/opsstatus`、tmux 托管与单实例校验
 
-## 目标用户
+## 架构分层
 
-- 需要在移动端获取编码辅助的开发者
-- 需要共享 Claude Code 访问权限的团队
-- 偏好基于聊天界面进行开发任务的用户
-- 需要远程管理多个项目的开发者
-
-## 核心功能
-
-### 导航与文件管理
-- 类终端命令（cd、ls、pwd）
-- 可视化选择的项目快速切换
-- 文件上传与审查功能
-- Git 状态集成
-
-### Claude Code 集成
-- 完整的 Claude Code CLI 集成
-- 按用户/项目维度的会话管理
-- 长时间操作的流式响应
-- 工具使用可见性
-- 费用追踪与限额
-
-### 安全与访问控制
-- 受批准的目录边界
-- 用户认证（白名单和令牌认证）
-- 按用户限流
-- 费用上限，防止过度使用
-- 审计日志
-
-### 用户体验
-- 常用操作的内联键盘
-- 长时间操作的进度指示器
-- 带语法高亮的格式化代码输出
-- 会话导出与分享
-- 快捷操作按钮
-
-## 技术架构
-
-### 组件
-
-1. **Bot 核心**（`bot.py`）
-   - Telegram bot 接口
-   - 命令处理器
-   - 消息路由
-
-2. **配置**（`config.py`）
-   - 基于环境的配置
-   - 功能开关
-   - 安全设置
-
-3. **认证**（`auth.py`）
-   - 用户验证
-   - 令牌管理
-   - 权限检查
-
-4. **Claude 集成**（`claude_integration.py`）
-   - Claude Code 子进程管理
-   - 响应解析与流式传输
-   - 会话状态管理
-
-5. **存储层**（`storage/`）
-   - SQLite 数据库，完整的表结构
-   - 仓储模式的数据访问
-   - 会话持久化与分析
-   - 费用追踪与审计日志
-
-6. **安全**（`security.py`）
-   - 目录遍历防护
-   - 输入净化
-   - 限流
-
-7. **工具模块**（`utils.py`）
-   - 消息格式化
-   - 文件处理
-   - 错误管理
-
-### 数据流
-
-```
-User Message → Telegram Bot → Auth Check → Command Parser
-                                              ↓
-                                    Claude Code Process
-                                              ↓
-Storage ← Response Formatter ← Parse Output ←
-   ↓
-User Response
+```text
+Telegram Client
+   -> Telegram Bot API (long polling)
+   -> src/bot            # handlers + middleware + ui
+   -> src/claude         # engine integration (Claude/Codex)
+   -> src/services       # session/event/approval orchestration
+   -> src/storage        # sqlite + repositories
+   -> src/security       # auth/rate-limit/validation
+   -> src/config         # settings + feature flags
 ```
 
-### 安全模型
+## 代码结构
 
-- **目录隔离**：所有操作限制在受批准的目录树内
-- **用户认证**：白名单或令牌认证访问
-- **限流**：防止滥用并控制费用
-- **审计追踪**：记录所有操作以供安全审查
-- **输入校验**：净化所有用户输入
+```text
+src/
+├── bot/
+├── claude/
+├── services/
+├── storage/
+├── config/
+├── security/
+├── utils/
+└── main.py
 
-## 开发原则
+tests/
+└── unit/
+```
 
-1. **安全优先**：每个功能都必须考虑安全影响
-2. **用户体验**：终端的熟悉感与聊天的便利性
-3. **可扩展性**：面向社区功能的插件化架构
-4. **可测试性**：全面的测试覆盖
-5. **文档完善**：为用户和贡献者提供清晰的文档
+## 运行模型
 
-## 成功标准
+- 默认使用 long polling（无需公网入口）。
+- 推荐通过 `scripts/tmux-bot.sh` 托管进程，确保单实例运行。
+- 默认引擎为 Codex；可随时切换至 Claude。
 
-- 目录访问零安全漏洞
-- 基础命令响应时间小于 2 秒
-- bot 可用性 99% 以上
-- 支持 10+ 并发用户
-- 与本地 Claude Code 使用完全功能对等
-- 活跃的开源社区（首年 10+ 贡献者）
+## 配置与安全基线
+
+- 必填：`TELEGRAM_BOT_TOKEN`、`TELEGRAM_BOT_USERNAME`、`APPROVED_DIRECTORY`
+- 建议开启：`ALLOWED_USERS`
+- 禁止提交：`.env` 与任何真实密钥
+- 路径访问受 `APPROVED_DIRECTORY` 边界限制
+
+## 文档入口
+
+- 用户使用：`README.md`
+- 开发流程：`docs/development.md`
+- 配置项：`docs/configuration.md`
+- 仓库协作约定：`AGENTS.md`

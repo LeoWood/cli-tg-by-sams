@@ -1,3 +1,5 @@
+> ⚠️ **归档说明**：本文档为历史设计/阶段性记录，可能与当前实现不一致。请以 README.md、AGENTS.md、docs/development.md、docs/configuration.md 为准。
+
 # TODO-2: 配置管理
 
 ## 目标

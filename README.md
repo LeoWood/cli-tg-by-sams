@@ -143,13 +143,16 @@ codex login status
 ### Step 8: 启动
 
 ```bash
-# 普通启动
+# 普通启动（通过 tmux 托管，自动重启并校验单实例）
 make run
 
-# 或 Debug 日志启动
+# Debug 日志启动（tmux 托管）
 make run-debug
 
-# 或直接运行
+# 前台直接运行（不经过 tmux）
+make run-local
+
+# 或直接运行入口
 poetry run python -m src.main
 ```
 
@@ -188,6 +191,9 @@ poetry run python -m src.main
 | `/actions` | 快捷动作菜单 | 全部 |
 | `/export` | 导出当前会话 | 全部 |
 | `/cancel` | 取消当前运行中的任务 | 全部 |
+| `/provider` | Claude 通道切换（cc-switch） | Claude |
+| `/restartbot` | 远程重启 bot（管理员） | 全部 |
+| `/opsstatus` | 查看运行态诊断信息（管理员） | 全部 |
 
 ### 会话导出说明
 
@@ -249,8 +255,9 @@ poetry run python -m src.main
 ```bash
 make dev          # 安装所有依赖 (含开发依赖)
 make install      # 仅安装生产依赖
-make run          # 启动 Bot
-make run-debug    # Debug 日志启动
+make run          # tmux 托管重启（单实例校验）
+make run-debug    # tmux 托管 Debug 重启
+make run-local    # 当前终端前台运行
 make test         # 运行测试 + 覆盖率
 make lint         # Black + isort + flake8 + mypy
 make format       # 自动格式化代码

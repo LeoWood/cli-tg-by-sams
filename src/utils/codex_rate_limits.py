@@ -5,18 +5,11 @@ from __future__ import annotations
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 
+from .beijing_time import format_iso_datetime_beijing, format_unix_timestamp_beijing
+
 
 def _format_unix_timestamp(value: Any) -> str:
-    try:
-        ts = int(value)
-    except (TypeError, ValueError):
-        return ""
-    if ts <= 0:
-        return ""
-    try:
-        return datetime.fromtimestamp(ts).strftime("%Y-%m-%d %H:%M")
-    except (OverflowError, OSError, ValueError):
-        return ""
+    return format_unix_timestamp_beijing(value)
 
 
 def _window_label(window_minutes: int) -> str:
@@ -136,7 +129,7 @@ def format_rate_limit_summary(rate_limits: Any) -> Optional[str]:
         parts.append(line)
 
     summary = "\n".join(parts)
-    updated = str(rate_limits.get("updated_at") or "").strip()
+    updated = format_iso_datetime_beijing(rate_limits.get("updated_at"))
     if updated:
         summary += f"\n(updated {updated})"
     return summary

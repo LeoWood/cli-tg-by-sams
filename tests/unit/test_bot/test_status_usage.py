@@ -175,7 +175,7 @@ def test_build_precise_context_status_lines_renders_codex_usage_windows():
     assert "Usage Limits (/status)" in joined
     assert "5h window: `83.0% remaining`" in joined
     assert "7d window: `56.0% remaining`" in joined
-    assert "Updated: `2026-02-09T13:54:15Z`" in joined
+    assert "Updated: `2026-02-09 21:54:15`" in joined
 
 
 def test_build_precise_context_status_lines_can_render_windows_without_context():

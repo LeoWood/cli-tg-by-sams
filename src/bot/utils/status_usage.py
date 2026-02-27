@@ -1,7 +1,11 @@
 """Helpers for formatting status context/token usage."""
 
-from datetime import datetime
 from typing import Any, Dict, List, Optional
+
+from src.utils.beijing_time import (
+    format_iso_datetime_beijing,
+    format_unix_timestamp_beijing,
+)
 
 
 def estimate_context_window_tokens(model_name: Optional[str]) -> Optional[int]:
@@ -213,7 +217,7 @@ def _build_rate_limit_lines(rate_limits: Any) -> List[str]:
     entries.sort(key=lambda item: int(item.get("window_minutes", 0)))
 
     lines: List[str] = ["", "*Usage Limits (/status)*"]
-    updated_at = str(rate_limits.get("updated_at") or "").strip()
+    updated_at = format_iso_datetime_beijing(rate_limits.get("updated_at"))
     if updated_at:
         lines.append(f"Updated: `{updated_at}`")
 
@@ -243,14 +247,5 @@ def _window_label(window_minutes: int) -> str:
 
 
 def _format_unix_timestamp(value: Any) -> str:
-    """Format unix timestamp as local wall-clock text."""
-    try:
-        ts = int(value)
-    except (TypeError, ValueError):
-        return ""
-    if ts <= 0:
-        return ""
-    try:
-        return datetime.fromtimestamp(ts).strftime("%Y-%m-%d %H:%M")
-    except (OverflowError, OSError, ValueError):
-        return ""
+    """Format unix timestamp as Beijing wall-clock text."""
+    return format_unix_timestamp_beijing(value)

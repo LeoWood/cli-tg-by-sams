@@ -1,3 +1,5 @@
+> ⚠️ **归档说明**：本文档为历史设计/阶段性记录，可能与当前实现不一致。请以 README.md、AGENTS.md、docs/development.md、docs/configuration.md 为准。
+
 # TODO-9: 部署与文档
 
 ## 目标
@@ -256,10 +258,10 @@ spec:
 ```markdown
 # Claude Code Telegram Bot
 
-[![Tests](https://github.com/yourusername/claude-code-telegram/workflows/Tests/badge.svg)](https://github.com/yourusername/claude-code-telegram/actions)
-[![Coverage](https://codecov.io/gh/yourusername/claude-code-telegram/branch/main/graph/badge.svg)](https://codecov.io/gh/yourusername/claude-code-telegram)
+[![Tests](https://github.com/codingSamss/cli-tg/workflows/Tests/badge.svg)](https://github.com/codingSamss/cli-tg/actions)
+[![Coverage](https://codecov.io/gh/codingSamss/cli-tg/branch/main/graph/badge.svg)](https://codecov.io/gh/codingSamss/cli-tg)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
-[![Python 3.9+](https://img.shields.io/badge/python-3.9+-blue.svg)](https://www.python.org/downloads/)
+[![Python 3.10+](https://img.shields.io/badge/python-3.9+-blue.svg)](https://www.python.org/downloads/)
 [![Code style: black](https://img.shields.io/badge/code%20style-black-000000.svg)](https://github.com/psf/black)
 
 通过 Telegram 远程运行 Claude Code，提供类终端界面。
@@ -280,7 +282,7 @@ spec:
 
 ### 1. 前置条件
 
-- Python 3.9+
+- Python 3.10+
 - 已安装 Claude Code CLI
 - Telegram Bot Token（从 [@BotFather](https://t.me/botfather) 获取）
 - Linux/macOS（支持 Windows WSL）
@@ -289,8 +291,8 @@ spec:
 
 ```bash
 # 克隆仓库
-git clone https://github.com/yourusername/claude-code-telegram.git
-cd claude-code-telegram
+git clone https://github.com/codingSamss/cli-tg.git
+cd cli-tg
 
 # 安装依赖
 pip install -r requirements/base.txt
@@ -396,7 +398,7 @@ poetry run claude-telegram-bot --debug
 ### 项目结构
 
 ```
-claude-code-telegram/
+cli-tg/
 ├── src/               # 源代码
 ├── tests/             # 测试套件
 ├── docs/              # 文档
@@ -480,7 +482,7 @@ kubectl apply -f k8s/
 
 ## 支持
 
-- Issues: [GitHub Issues](https://github.com/yourusername/claude-code-telegram/issues)
+- Issues: [GitHub Issues](https://github.com/codingSamss/cli-tg/issues)
 
 ---
 
@@ -501,7 +503,7 @@ kubectl apply -f k8s/
 
 ### 报告 Bug
 
-1. 检查 [已有 issues](https://github.com/yourusername/claude-code-telegram/issues)
+1. 检查 [已有 issues](https://github.com/codingSamss/cli-tg/issues)
 2. 创建新 issue，包含：
    - 清晰的标题和描述
    - 复现步骤
@@ -510,7 +512,7 @@ kubectl apply -f k8s/
 
 ### 功能建议
 
-1. 检查 [已有提案](https://github.com/yourusername/claude-code-telegram/discussions)
+1. 检查 [已有提案](https://github.com/codingSamss/cli-tg/discussions)
 2. 发起讨论，包含：
    - 使用场景描述
    - 建议的实现方案
@@ -523,8 +525,8 @@ kubectl apply -f k8s/
 1. Fork 仓库
 2. 克隆你的 fork：
    ```bash
-   git clone https://github.com/yourusername/claude-code-telegram.git
-   cd claude-code-telegram
+   git clone https://github.com/codingSamss/cli-tg.git
+   cd cli-tg
    ```
 
 3. 创建虚拟环境：
@@ -618,7 +620,7 @@ kubectl apply -f k8s/
 
 ## 获取帮助
 
-- [Discussions](https://github.com/yourusername/claude-code-telegram/discussions)
+- [Discussions](https://github.com/codingSamss/cli-tg/discussions)
 
 感谢你的贡献！
 ```

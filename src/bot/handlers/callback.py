@@ -18,6 +18,7 @@ from ...services import ApprovalService
 from ...services.session_interaction_service import SessionInteractionService
 from ...services.session_lifecycle_service import SessionLifecycleService
 from ...services.session_service import SessionService
+from ...utils.beijing_time import format_datetime_beijing
 from ..features.session_export import ExportFormat
 from ..utils.cli_engine import (
     DEFAULT_CLI_ENGINE,
@@ -247,7 +248,7 @@ def _format_relative_time(target: datetime | None) -> str:
         return f"{delta_sec // 3600}小时前"
     if delta_sec < 86400 * 7:
         return f"{delta_sec // 86400}天前"
-    return target.strftime("%m-%d %H:%M")
+    return format_datetime_beijing(target, fmt="%m-%d %H:%M")
 
 
 def _candidate_preview(candidate, *, max_len: int) -> str:
@@ -2096,7 +2097,7 @@ async def handle_export_callback(
                 f"📤 **Session Export Complete**\n\n"
                 f"Format: {exported_session.format.value.upper()}\n"
                 f"Size: {exported_session.size_bytes:,} bytes\n"
-                f"Created: {exported_session.created_at.strftime('%Y-%m-%d %H:%M:%S')}"
+                f"Created: {format_datetime_beijing(exported_session.created_at)}"
             ),
             parse_mode="Markdown",
         )
