@@ -3,12 +3,15 @@
 import argparse
 import asyncio
 import logging
+import os
 import re
 import shutil
 import signal
 import sys
+import time
+from logging.handlers import RotatingFileHandler
 from pathlib import Path
-from typing import Any, Dict
+from typing import Any, Dict, Optional
 
 import structlog
 
@@ -22,8 +25,6 @@ from src.claude import (
 )
 from src.claude.permissions import PermissionManager
 from src.claude.sdk_integration import ClaudeSDKManager
-from src.config.features import FeatureFlags
-from src.config.loader import load_config
 from src.config.settings import Settings
 from src.exceptions import ConfigurationError
 from src.security.audit import AuditLogger, SQLiteAuditStorage
@@ -51,6 +52,9 @@ _TELEGRAM_BOT_TOKEN_IN_URL_RE = re.compile(
     r"(https?://api\.telegram\.org/bot)([^/\s]+)"
 )
 _TELEGRAM_BOT_TOKEN_RAW_RE = re.compile(r"\b\d{6,}:[A-Za-z0-9_-]{20,}\b")
+_DEFAULT_LOG_FILE = Path("logs/bot.log")
+_LOG_FILE_MAX_BYTES = 10 * 1024 * 1024
+_LOG_FILE_BACKUP_COUNT = 5
 
 
 def redact_sensitive_text(text: str) -> str:
@@ -73,6 +77,54 @@ class SensitiveLogFilter(logging.Filter):
         return True
 
 
+def _resolve_log_file_path() -> Optional[Path]:
+    """Resolve target file path for rotating logs."""
+    raw_path = os.getenv("CLITG_LOG_FILE", str(_DEFAULT_LOG_FILE)).strip()
+    if not raw_path:
+        return None
+    return Path(raw_path).expanduser()
+
+
+def _configure_rotating_file_logging(
+    level: int, sensitive_filter: logging.Filter
+) -> None:
+    """Attach rotating file handler for persistent diagnostics."""
+    log_path = _resolve_log_file_path()
+    if log_path is None:
+        return
+
+    root_logger = logging.getLogger()
+
+    try:
+        resolved_target = log_path.resolve(strict=False)
+        for handler in root_logger.handlers:
+            base_filename = getattr(handler, "baseFilename", None)
+            if not isinstance(base_filename, str):
+                continue
+            if Path(base_filename).resolve(strict=False) == resolved_target:
+                return
+
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        file_handler = RotatingFileHandler(
+            filename=log_path,
+            maxBytes=_LOG_FILE_MAX_BYTES,
+            backupCount=_LOG_FILE_BACKUP_COUNT,
+            encoding="utf-8",
+        )
+        file_handler.setLevel(level)
+        file_handler.setFormatter(logging.Formatter("%(message)s"))
+        file_handler.addFilter(sensitive_filter)
+        root_logger.addHandler(file_handler)
+        root_logger.info("File logging enabled: %s", str(log_path))
+    except Exception as exc:
+        root_logger.warning(
+            "Failed to configure rotating file logging: path=%s error=%s type=%s",
+            str(log_path),
+            str(exc),
+            type(exc).__name__,
+        )
+
+
 def setup_logging(debug: bool = False) -> None:
     """Configure structured logging."""
     level = logging.DEBUG if debug else logging.INFO
@@ -88,6 +140,7 @@ def setup_logging(debug: bool = False) -> None:
     root_logger = logging.getLogger()
     for handler in root_logger.handlers:
         handler.addFilter(sensitive_filter)
+    _configure_rotating_file_logging(level, sensitive_filter)
 
     # Configure structlog
     structlog.configure(
@@ -153,7 +206,8 @@ async def create_application(config: Settings) -> Dict[str, Any]:
     # Fall back to allowing all users in development mode
     if not providers and config.development_mode:
         logger.warning(
-            "No auth providers configured - creating development-only allow-all provider"
+            "No auth providers configured - "
+            "creating development-only allow-all provider"
         )
         providers.append(WhitelistAuthProvider([], allow_all_dev=True))
     elif not providers:
@@ -228,7 +282,8 @@ async def create_application(config: Settings) -> Dict[str, Any]:
             logger.info("Codex CLI adapter enabled", codex_cli_path=codex_cli_path)
         else:
             logger.warning(
-                "ENABLE_CODEX_CLI is true but codex binary not found; skip codex adapter"
+                "ENABLE_CODEX_CLI is true but codex binary not found; "
+                "skip codex adapter"
             )
 
     # Initialize cc-switch provider manager
@@ -279,12 +334,25 @@ async def run_application(app: Dict[str, Any]) -> None:
         "claude": claude_integration
     }
     storage: Storage = app["storage"]
+    process_started_monotonic = time.monotonic()
 
     # Set up signal handlers for graceful shutdown
     shutdown_event = asyncio.Event()
 
     def signal_handler(signum, frame):
-        logger.info("Shutdown signal received", signal=signum)
+        signal_name = (
+            signal.Signals(signum).name
+            if signum in {signal.SIGINT, signal.SIGTERM}
+            else f"SIG_{signum}"
+        )
+        logger.info(
+            "Shutdown signal received",
+            signal=signum,
+            signal_name=signal_name,
+            pid=os.getpid(),
+            ppid=os.getppid(),
+            uptime_seconds=round(time.monotonic() - process_started_monotonic, 1),
+        )
         shutdown_event.set()
 
     signal.signal(signal.SIGINT, signal_handler)
@@ -352,6 +420,13 @@ async def main() -> None:
 
     logger = structlog.get_logger()
     logger.info("Starting CLITG", version=__version__)
+    logger.info(
+        "Process context",
+        pid=os.getpid(),
+        ppid=os.getppid(),
+        cwd=str(Path.cwd()),
+        python_executable=sys.executable,
+    )
 
     try:
         # Load configuration

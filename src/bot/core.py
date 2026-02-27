@@ -40,6 +40,9 @@ logger = structlog.get_logger()
 _POLLING_WATCHDOG_INTERVAL_SECONDS = 2.0
 _POLLING_RECOVERY_ERROR_THRESHOLD = 3
 _POLLING_RESTART_COOLDOWN_SECONDS = 8.0
+_POLLING_WATCHDOG_HEARTBEAT_INTERVAL_SECONDS = 60.0
+_POLLING_HEALTH_PROBE_INTERVAL_SECONDS = 300.0
+_POLLING_WATCHDOG_DELAY_WARNING_SECONDS = 15.0
 
 
 class ClaudeCodeBot:
@@ -58,6 +61,13 @@ class ClaudeCodeBot:
         self._last_polling_error_log: float = 0.0
         self._polling_restart_requested: bool = False
         self._last_polling_restart_monotonic: float = 0.0
+        self._started_monotonic: float = 0.0
+        self._last_watchdog_tick_monotonic: float = 0.0
+        self._last_watchdog_heartbeat_log_monotonic: float = 0.0
+        self._last_health_probe_monotonic: float = 0.0
+        self._watchdog_tick_count: int = 0
+        self._last_update_monotonic: float = 0.0
+        self._last_update_id: Optional[int] = None
         # Update dedupe and persisted offset tracking
         self._update_dedupe_cache = UpdateDedupeCache(ttl_seconds=300, max_size=5000)
         self._update_offset_store: Optional[UpdateOffsetStore] = None
@@ -251,7 +261,8 @@ class ClaudeCodeBot:
             last_update_id = store.load()
         except Exception as exc:
             logger.warning(
-                "Failed to load Telegram update offset, starting without persisted offset",
+                "Failed to load Telegram update offset, "
+                "starting without persisted offset",
                 state_file=str(state_file),
                 error=str(exc),
             )
@@ -290,6 +301,10 @@ class ClaudeCodeBot:
         if self._update_dedupe_cache.check_and_mark(update_id):
             logger.debug("Skipping duplicate Telegram update", update_id=update_id)
             raise ApplicationHandlerStop
+
+        now = asyncio.get_running_loop().time()
+        self._last_update_monotonic = now
+        self._last_update_id = update_id
 
         if self._update_offset_store is not None:
             try:
@@ -360,7 +375,8 @@ class ClaudeCodeBot:
                 context.bot_data[key] = value
             context.bot_data["settings"] = self.settings
 
-            # Create a dummy handler that does nothing (middleware will handle everything)
+            # Create a dummy handler that does nothing.
+            # Middleware performs all pre-handler checks itself.
             async def dummy_handler(event, data):
                 return None
 
@@ -456,7 +472,8 @@ class ClaudeCodeBot:
             content = gitignore.read_text(encoding="utf-8")
             if ".claude-images" not in content:
                 logger.warning(
-                    ".claude-images/ not in .gitignore, uploaded images may be committed",
+                    ".claude-images/ not in .gitignore, "
+                    "uploaded images may be committed",
                     gitignore=str(gitignore),
                 )
         except OSError:
@@ -468,6 +485,67 @@ class ClaudeCodeBot:
         self._polling_error_window_start = 0.0
         self._last_polling_error_log = 0.0
         self._polling_restart_requested = False
+
+    def _emit_polling_watchdog_heartbeat(
+        self, *, now: float, updater_running: bool
+    ) -> None:
+        """Emit periodic watchdog heartbeat logs for runtime diagnosis."""
+        if (
+            now - self._last_watchdog_heartbeat_log_monotonic
+            < _POLLING_WATCHDOG_HEARTBEAT_INTERVAL_SECONDS
+        ):
+            return
+
+        self._last_watchdog_heartbeat_log_monotonic = now
+        uptime_seconds = (
+            round(now - self._started_monotonic, 1)
+            if self._started_monotonic > 0
+            else None
+        )
+        last_update_age_seconds = (
+            round(now - self._last_update_monotonic, 1)
+            if self._last_update_monotonic > 0
+            else None
+        )
+        logger.info(
+            "Polling watchdog heartbeat",
+            updater_running=updater_running,
+            polling_restart_requested=self._polling_restart_requested,
+            polling_error_count=self._polling_error_count,
+            watchdog_tick_count=self._watchdog_tick_count,
+            last_update_id=self._last_update_id,
+            last_update_age_seconds=last_update_age_seconds,
+            uptime_seconds=uptime_seconds,
+        )
+
+    async def _run_polling_health_probe(self, *, now: float) -> None:
+        """Periodically probe Telegram API and emit explicit health logs."""
+        if (
+            now - self._last_health_probe_monotonic
+            < _POLLING_HEALTH_PROBE_INTERVAL_SECONDS
+        ):
+            return
+        self._last_health_probe_monotonic = now
+
+        if not self.app:
+            return
+        bot = getattr(self.app, "bot", None)
+        if bot is None:
+            return
+
+        try:
+            me = await bot.get_me()
+            logger.info(
+                "Polling health probe succeeded",
+                bot_id=getattr(me, "id", None),
+                bot_username=getattr(me, "username", None),
+            )
+        except Exception as exc:
+            logger.warning(
+                "Polling health probe failed",
+                error=str(exc),
+                error_type=type(exc).__name__,
+            )
 
     async def _start_polling(self) -> None:
         """Start Telegram polling with shared options."""
@@ -492,7 +570,9 @@ class ClaudeCodeBot:
 
         updater = getattr(self.app, "updater", None)
         if updater is None:
-            logger.error("Cannot restart polling: updater is unavailable", reason=reason)
+            logger.error(
+                "Cannot restart polling: updater is unavailable", reason=reason
+            )
             return False
 
         now = asyncio.get_running_loop().time()
@@ -508,7 +588,14 @@ class ClaudeCodeBot:
             return False
 
         self._last_polling_restart_monotonic = now
-        logger.warning("Attempting polling self-recovery", reason=reason)
+        logger.warning(
+            "Attempting polling self-recovery",
+            reason=reason,
+            updater_running=updater.running,
+            polling_error_count=self._polling_error_count,
+            polling_restart_requested=self._polling_restart_requested,
+            last_update_id=self._last_update_id,
+        )
 
         try:
             if updater.running:
@@ -525,7 +612,12 @@ class ClaudeCodeBot:
             return False
 
         self._reset_polling_recovery_state()
-        logger.info("Polling self-recovery succeeded", reason=reason)
+        logger.info(
+            "Polling self-recovery succeeded",
+            reason=reason,
+            updater_running=updater.running,
+            last_update_id=self._last_update_id,
+        )
         return True
 
     async def _polling_watchdog_tick(self) -> None:
@@ -533,9 +625,45 @@ class ClaudeCodeBot:
         if getattr(self.settings, "webhook_url", None) or not self.app:
             return
 
+        now = asyncio.get_running_loop().time()
+        tick_delay_seconds: Optional[float] = None
+        if self._last_watchdog_tick_monotonic > 0:
+            tick_delay_seconds = now - self._last_watchdog_tick_monotonic
+            if tick_delay_seconds > _POLLING_WATCHDOG_DELAY_WARNING_SECONDS:
+                logger.warning(
+                    "Polling watchdog tick delayed",
+                    observed_delay_seconds=round(tick_delay_seconds, 1),
+                    expected_interval_seconds=_POLLING_WATCHDOG_INTERVAL_SECONDS,
+                )
+        self._last_watchdog_tick_monotonic = now
+        self._watchdog_tick_count += 1
+
         updater = getattr(self.app, "updater", None)
         if updater is None:
             return
+
+        updater_running = bool(updater.running)
+        self._emit_polling_watchdog_heartbeat(
+            now=now,
+            updater_running=updater_running,
+        )
+        await self._run_polling_health_probe(now=now)
+
+        if (
+            tick_delay_seconds
+            and tick_delay_seconds > _POLLING_WATCHDOG_DELAY_WARNING_SECONDS
+        ):
+            logger.info(
+                "Watchdog delay context",
+                polling_restart_requested=self._polling_restart_requested,
+                polling_error_count=self._polling_error_count,
+                last_update_id=self._last_update_id,
+                last_update_age_seconds=(
+                    round(now - self._last_update_monotonic, 1)
+                    if self._last_update_monotonic > 0
+                    else None
+                ),
+            )
 
         if not updater.running:
             await self._restart_polling(reason="updater_not_running")
@@ -558,6 +686,14 @@ class ClaudeCodeBot:
 
         try:
             self.is_running = True
+            now = asyncio.get_running_loop().time()
+            self._started_monotonic = now
+            self._last_watchdog_tick_monotonic = now
+            self._last_watchdog_heartbeat_log_monotonic = 0.0
+            self._last_health_probe_monotonic = 0.0
+            self._watchdog_tick_count = 0
+            self._last_update_monotonic = 0.0
+            self._last_update_id = None
 
             if self.settings.webhook_url:
                 # Webhook mode
@@ -592,7 +728,21 @@ class ClaudeCodeBot:
             logger.warning("Bot is not running")
             return
 
-        logger.info("Stopping bot")
+        now = asyncio.get_running_loop().time()
+        logger.info(
+            "Stopping bot",
+            uptime_seconds=(
+                round(now - self._started_monotonic, 1)
+                if self._started_monotonic > 0
+                else None
+            ),
+            last_update_id=self._last_update_id,
+            last_update_age_seconds=(
+                round(now - self._last_update_monotonic, 1)
+                if self._last_update_monotonic > 0
+                else None
+            ),
+        )
 
         try:
             self.is_running = False  # Stop the main loop first
@@ -717,11 +867,21 @@ class ClaudeCodeBot:
         )
 
         error_messages = {
-            AuthenticationError: "🔒 Authentication required. Please contact the administrator.",
-            SecurityError: "🛡️ Security violation detected. This incident has been logged.",
-            RateLimitExceeded: "⏱️ Rate limit exceeded. Please wait before sending more messages.",
-            ConfigurationError: "⚙️ Configuration error. Please contact the administrator.",
-            asyncio.TimeoutError: "⏰ Operation timed out. Please try again with a simpler request.",
+            AuthenticationError: (
+                "🔒 Authentication required. Please contact the administrator."
+            ),
+            SecurityError: (
+                "🛡️ Security violation detected. This incident has been logged."
+            ),
+            RateLimitExceeded: (
+                "⏱️ Rate limit exceeded. Please wait before sending more messages."
+            ),
+            ConfigurationError: (
+                "⚙️ Configuration error. Please contact the administrator."
+            ),
+            asyncio.TimeoutError: (
+                "⏰ Operation timed out. Please try again with a simpler request."
+            ),
         }
 
         error_type = type(error)

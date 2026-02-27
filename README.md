@@ -189,6 +189,12 @@ poetry run python -m src.main
 | `/export` | 导出当前会话 | 全部 |
 | `/cancel` | 取消当前运行中的任务 | 全部 |
 
+### 会话导出说明
+
+- `/export` 支持 `Markdown / JSON / HTML` 三种格式
+- JSON 导出包含会话元数据（`project_path`、`created_at`、`last_used`、`total_cost`、`total_turns`）和消息字段（`prompt`、`response`、`error`、`cost`、`duration_ms`）
+- HTML 导出会对消息内容做转义，避免原始 HTML/脚本内容直接渲染
+
 ### 使用方式
 
 - 直接发送文本消息 = 向当前引擎（Claude/Codex）下达指令
@@ -227,6 +233,16 @@ poetry run python -m src.main
 | Bot 无响应 | Token 错误或进程未启动 | 检查 `TELEGRAM_BOT_TOKEN` 和进程状态 |
 | `Claude process error: exit code 1` | 常见于引擎/模型不匹配 | 先 `/engine claude`，再 `/model` 选 Claude 模型或执行 `/model default` |
 | `invalid claude code request` | SDK 显式 setting sources 与网关不兼容 | 保持 `CLAUDE_SETTING_SOURCES` 为空；若需要强制来源再设为 `user,project,local` |
+
+### 诊断日志（定位“进程在线但 TG 无响应”）
+
+- 默认会写入滚动日志到 `logs/bot.log`（单文件 10MB，保留 5 个历史文件）
+- 可通过环境变量覆盖日志路径：`CLITG_LOG_FILE=/path/to/custom.log`
+- 轮询模式会周期写入 watchdog 心跳与健康探针日志，建议重点检索：
+  - `Polling watchdog heartbeat`
+  - `Polling health probe succeeded` / `Polling health probe failed`
+  - `Attempting polling self-recovery` / `Polling self-recovery failed`
+  - `Shutdown signal received`
 
 ## 开发命令
 
