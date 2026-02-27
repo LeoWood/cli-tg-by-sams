@@ -17,6 +17,8 @@ def test_build_bot_commands_for_claude_hides_codexdiag():
     names = [cmd.command for cmd in commands]
     assert "context" in names
     assert "model" in names
+    assert "restartbot" in names
+    assert "opsstatus" in names
     assert "codexdiag" not in names
     assert "status" not in names
 
@@ -28,6 +30,8 @@ def test_build_bot_commands_for_codex_includes_read_only_model():
     assert "context" not in names
     assert "codexdiag" in names
     assert "model" in names
+    assert "restartbot" in names
+    assert "opsstatus" in names
     assert "status" in names
 
 

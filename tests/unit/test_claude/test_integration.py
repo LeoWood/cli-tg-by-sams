@@ -233,6 +233,61 @@ def test_build_command_for_codex_resume_without_prompt_uses_default(
     ]
 
 
+def test_build_command_for_codex_exec_without_prompt_uses_default(tmp_path, monkeypatch):
+    """Codex exec should carry a fallback prompt when prompt is empty."""
+    manager = _build_manager(tmp_path)
+    monkeypatch.setattr(
+        "src.claude.sdk_integration.find_claude_cli",
+        lambda _: "/usr/local/bin/codex",
+    )
+
+    cmd = manager._build_command(
+        prompt="",
+        session_id=None,
+        continue_session=False,
+    )
+
+    assert cmd == [
+        "/usr/local/bin/codex",
+        "exec",
+        "--json",
+        "--skip-git-repo-check",
+        "-c",
+        "mcp_servers={}",
+        "Please continue where we left off",
+    ]
+
+
+def test_build_command_for_codex_exec_with_images_and_blank_prompt_uses_image_default(
+    tmp_path, monkeypatch
+):
+    """Codex image exec should use image-focused fallback when prompt is blank."""
+    manager = _build_manager(tmp_path)
+    monkeypatch.setattr(
+        "src.claude.sdk_integration.find_claude_cli",
+        lambda _: "/usr/local/bin/codex",
+    )
+
+    cmd = manager._build_command(
+        prompt="   \n\t",
+        session_id=None,
+        continue_session=False,
+        images=[{"file_path": "/tmp/a.png"}],
+    )
+
+    assert cmd == [
+        "/usr/local/bin/codex",
+        "exec",
+        "--json",
+        "--skip-git-repo-check",
+        "-c",
+        "mcp_servers={}",
+        "--image",
+        "/tmp/a.png",
+        "Please analyze the attached image(s) and describe what you see.",
+    ]
+
+
 def test_parse_result_supports_codex_turn_completed(tmp_path):
     """Codex turn.completed event should map to unified response fields."""
     manager = _build_manager(tmp_path)

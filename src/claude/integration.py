@@ -339,6 +339,11 @@ class ClaudeProcessManager:
     ) -> List[str]:
         """Build Codex CLI command."""
         cmd = [cli_path, "exec", "--json", "--skip-git-repo-check"]
+        normalized_prompt = str(prompt or "").strip()
+        default_text_prompt = "Please continue where we left off"
+        default_image_prompt = (
+            "Please analyze the attached image(s) and describe what you see."
+        )
 
         # Codex reads MCP servers from ~/.codex/config.toml by default.
         # Keep MCP disabled unless explicitly requested by config.
@@ -364,12 +369,16 @@ class ClaudeProcessManager:
                 cmd.append("--last")
             for image_path in image_paths:
                 cmd.extend(["--image", image_path])
-            cmd.append(prompt.strip() or "Please continue where we left off")
+            cmd.append(normalized_prompt or default_text_prompt)
         else:
             for image_path in image_paths:
                 cmd.extend(["--image", image_path])
-            if prompt:
-                cmd.append(prompt)
+            if normalized_prompt:
+                cmd.append(normalized_prompt)
+            elif image_paths:
+                cmd.append(default_image_prompt)
+            else:
+                cmd.append(default_text_prompt)
 
         logger.debug("Built Codex CLI command", command=cmd)
         return cmd

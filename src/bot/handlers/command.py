@@ -1,7 +1,9 @@
 """Command handlers for bot operations."""
 
 import asyncio
+import shutil
 import sys
+import uuid
 from pathlib import Path
 from typing import Any
 
@@ -42,6 +44,40 @@ from .message import build_permission_handler
 logger = structlog.get_logger()
 _PARSE_MODE_UNSET = object()
 _CHAT_ACTION_HEARTBEAT_INTERVAL_SECONDS = 4.0
+_SUBPROCESS_DEFAULT_TIMEOUT_SECONDS = 8.0
+_OPSSTATUS_RESTART_TAIL_LINES = 20
+
+
+def _get_project_root() -> Path:
+    """Return repository root path."""
+    return Path(__file__).resolve().parents[3]
+
+
+async def _run_command_capture(
+    *args: str,
+    cwd: Path | None = None,
+    timeout_seconds: float = _SUBPROCESS_DEFAULT_TIMEOUT_SECONDS,
+) -> tuple[int, str, str]:
+    """Run subprocess and capture output with timeout protection."""
+    process = await asyncio.create_subprocess_exec(
+        *args,
+        cwd=str(cwd) if isinstance(cwd, Path) else None,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
+    try:
+        stdout_raw, stderr_raw = await asyncio.wait_for(
+            process.communicate(),
+            timeout=timeout_seconds,
+        )
+    except asyncio.TimeoutError:
+        process.kill()
+        await process.communicate()
+        return 124, "", f"timeout after {timeout_seconds:.1f}s"
+
+    stdout_text = stdout_raw.decode("utf-8", errors="replace").strip()
+    stderr_text = stderr_raw.decode("utf-8", errors="replace").strip()
+    return int(process.returncode or 0), stdout_text, stderr_text
 
 
 async def _reply_update_message_resilient(
@@ -406,6 +442,8 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         f"• `/engine [claude|codex]` - Switch CLI engine\n"
         f"• `/actions` - Show quick actions\n"
         f"• `/git` - Git repository commands\n"
+        f"• `/restartbot` - Restart bot service (admin)\n"
+        f"• `/opsstatus` - Show bot runtime ops status\n"
         f"{diagnostics_line}\n"
         f"**Quick Start:**\n"
         f"1. Use `/projects` to see available projects\n"
@@ -494,6 +532,8 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         f"{status_alias_line}\n"
         "• `/engine [claude|codex]` - Switch active CLI engine\n"
         "• `/provider` - Switch API provider (cc-switch)\n"
+        "• `/restartbot` - Restart bot service (admin)\n"
+        "• `/opsstatus` - Show bot runtime ops status\n"
         f"{model_line}"
         "• `/export` - Export session history\n"
         "• `/actions` - Show context-aware quick actions\n"
@@ -695,9 +735,7 @@ async def switch_provider(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
     # Permission check: restrict to allowed users
     if settings.allowed_users and user_id not in settings.allowed_users:
-        await _reply_update_message_resilient(
-            update, context, "无权限执行供应商切换。"
-        )
+        await _reply_update_message_resilient(update, context, "无权限执行供应商切换。")
         return
 
     cc_switch: CCSwitchManager | None = context.bot_data.get("cc_switch_manager")
@@ -754,7 +792,10 @@ async def switch_provider(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
 
 async def new_session(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Handle /new command - explicitly starts a fresh session, clearing previous context."""
+    """Handle /new command.
+
+    Explicitly starts a fresh session and clears previous context.
+    """
     settings: Settings = context.bot_data["settings"]
     _, scope_state = get_scope_state_from_update(
         user_data=context.user_data,
@@ -1166,7 +1207,10 @@ async def change_directory(update: Update, context: ContextTypes.DEFAULT_TYPE) -
                     resolved_path.relative_to(settings.approved_directory)
                 except ValueError:
                     await _reply_update_message_resilient(
-                        update, context, "❌ **Access Denied**\n\nPath outside approved directory.", parse_mode="Markdown"
+                        update,
+                        context,
+                        "❌ **Access Denied**\n\nPath outside approved directory.",
+                        parse_mode="Markdown",
                     )
                     return
 
@@ -1375,7 +1419,9 @@ async def session_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             session_service=session_service,
             include_resumable=view_spec.include_resumable,
             include_event_summary=view_spec.include_event_summary,
-            allow_precise_context_probe=engine_capabilities.supports_precise_context_probe,
+            allow_precise_context_probe=(
+                engine_capabilities.supports_precise_context_probe
+            ),
         )
         render_result = session_interaction.build_context_render_result(
             snapshot=snapshot,
@@ -1410,7 +1456,6 @@ async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
 async def export_session(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Handle /export command."""
-    user_id = update.effective_user.id
     settings: Settings = context.bot_data["settings"]
     _, scope_state = get_scope_state_from_update(
         user_data=context.user_data,
@@ -1634,7 +1679,9 @@ async def git_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
                 update,
                 context,
                 f"📂 **Not a Git Repository**\n\n"
-                f"Current directory `{current_dir.relative_to(settings.approved_directory)}/` is not a git repository.\n\n"
+                "Current directory "
+                f"`{current_dir.relative_to(settings.approved_directory)}/` "
+                "is not a git repository.\n\n"
                 f"**Options:**\n"
                 f"• Navigate to a git repository with `/cd`\n"
                 f"• Initialize a new repository (ask Claude to help)\n"
@@ -1647,7 +1694,7 @@ async def git_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 
         # Format status message
         relative_path = current_dir.relative_to(settings.approved_directory)
-        status_message = f"🔗 **Git Repository Status**\n\n"
+        status_message = "🔗 **Git Repository Status**\n\n"
         status_message += f"📂 Directory: `{relative_path}/`\n"
         status_message += f"🌿 Branch: `{git_status.branch}`\n"
 
@@ -1658,7 +1705,7 @@ async def git_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 
         # Show file changes
         if not git_status.is_clean:
-            status_message += f"\n**Changes:**\n"
+            status_message += "\n**Changes:**\n"
             if git_status.modified:
                 status_message += f"📝 Modified: {len(git_status.modified)} files\n"
             if git_status.added:
@@ -1736,6 +1783,299 @@ async def cancel_task(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         )
 
 
+async def restart_bot_command(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> None:
+    """Handle /restartbot command for controlled remote restart."""
+    user_id = update.effective_user.id
+    chat_id = getattr(update.effective_chat, "id", None)
+    settings: Settings = context.bot_data["settings"]
+    scope_key, scope_state = get_scope_state_from_update(
+        user_data=context.user_data,
+        update=update,
+        default_directory=settings.approved_directory,
+    )
+    audit_logger: AuditLogger = context.bot_data.get("audit_logger")
+
+    request_id = uuid.uuid4().hex[:12]
+    project_root = _get_project_root()
+    restart_script = project_root / "scripts" / "restart-from-telegram.sh"
+
+    logger.info(
+        "Remote restart requested",
+        request_id=request_id,
+        user_id=user_id,
+        chat_id=chat_id,
+        scope_key=scope_key,
+        active_engine=get_active_cli_engine(scope_state),
+        current_directory=str(
+            scope_state.get("current_directory", settings.approved_directory)
+        ),
+    )
+
+    if shutil.which("tmux") is None:
+        logger.error(
+            "Remote restart rejected: tmux missing",
+            request_id=request_id,
+            user_id=user_id,
+        )
+        await _reply_update_message_resilient(
+            update,
+            context,
+            "❌ 无法执行重启：未检测到 `tmux`，请先在主机安装后重试。",
+            parse_mode="Markdown",
+        )
+        if audit_logger:
+            await audit_logger.log_command(
+                user_id=user_id,
+                command="restartbot",
+                args=[request_id],
+                success=False,
+            )
+        return
+
+    if not restart_script.exists():
+        logger.error(
+            "Remote restart rejected: dispatcher script missing",
+            request_id=request_id,
+            user_id=user_id,
+            script=str(restart_script),
+        )
+        await _reply_update_message_resilient(
+            update,
+            context,
+            "❌ 无法执行重启：缺少脚本 `scripts/restart-from-telegram.sh`。",
+            parse_mode="Markdown",
+        )
+        if audit_logger:
+            await audit_logger.log_command(
+                user_id=user_id,
+                command="restartbot",
+                args=[request_id],
+                success=False,
+            )
+        return
+
+    await _reply_update_message_resilient(
+        update,
+        context,
+        "♻️ 已收到重启请求。\n"
+        f"request_id: `{request_id}`\n"
+        "服务将在约 2 秒内重启，期间会短暂断开。",
+        parse_mode="Markdown",
+    )
+
+    try:
+        dispatcher = await asyncio.create_subprocess_exec(
+            "bash",
+            str(restart_script),
+            request_id,
+            str(user_id),
+            str(chat_id if isinstance(chat_id, int) else 0),
+            cwd=str(project_root),
+            stdout=asyncio.subprocess.DEVNULL,
+            stderr=asyncio.subprocess.DEVNULL,
+            start_new_session=True,
+        )
+        logger.info(
+            "Remote restart dispatcher started",
+            request_id=request_id,
+            dispatcher_pid=dispatcher.pid,
+            user_id=user_id,
+            chat_id=chat_id,
+        )
+        if audit_logger:
+            await audit_logger.log_command(
+                user_id=user_id,
+                command="restartbot",
+                args=[request_id],
+                success=True,
+            )
+    except Exception as exc:
+        logger.error(
+            "Failed to start remote restart dispatcher",
+            request_id=request_id,
+            user_id=user_id,
+            error=str(exc),
+            error_type=type(exc).__name__,
+        )
+        if audit_logger:
+            await audit_logger.log_command(
+                user_id=user_id,
+                command="restartbot",
+                args=[request_id],
+                success=False,
+            )
+        await _reply_update_message_resilient(
+            update,
+            context,
+            "❌ 重启调度失败，请稍后重试或在主机执行 `./scripts/tmux-bot.sh restart`。",
+            parse_mode="Markdown",
+        )
+
+
+async def ops_status_command(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> None:
+    """Handle /opsstatus command to report bot runtime operational status."""
+    user_id = update.effective_user.id
+    chat_id = getattr(update.effective_chat, "id", None)
+    settings: Settings = context.bot_data["settings"]
+    scope_key, scope_state = get_scope_state_from_update(
+        user_data=context.user_data,
+        update=update,
+        default_directory=settings.approved_directory,
+    )
+    audit_logger: AuditLogger = context.bot_data.get("audit_logger")
+
+    request_id = uuid.uuid4().hex[:12]
+    project_root = _get_project_root()
+    tmux_script = project_root / "scripts" / "tmux-bot.sh"
+    restart_events_file = project_root / "logs" / "restart-events.log"
+
+    logger.info(
+        "Ops status requested",
+        request_id=request_id,
+        user_id=user_id,
+        chat_id=chat_id,
+        scope_key=scope_key,
+        active_engine=get_active_cli_engine(scope_state),
+        current_directory=str(
+            scope_state.get("current_directory", settings.approved_directory)
+        ),
+    )
+
+    try:
+        if tmux_script.exists():
+            tmux_rc, tmux_out, tmux_err = await _run_command_capture(
+                "bash",
+                str(tmux_script),
+                "status",
+                cwd=project_root,
+            )
+        else:
+            tmux_rc, tmux_out, tmux_err = (
+                127,
+                "",
+                f"script not found: {tmux_script}",
+            )
+
+        ps_rc, ps_out, ps_err = await _run_command_capture(
+            "ps",
+            "-Ao",
+            "pid,ppid,command",
+        )
+        process_lines: list[str] = []
+        if ps_rc == 0:
+            for raw_line in ps_out.splitlines():
+                line = raw_line.strip()
+                if not line:
+                    continue
+                if (
+                    "cli-tg-bot" in line
+                    or "claude-telegram-bot" in line
+                    or "python -m src.main" in line
+                ):
+                    process_lines.append(line)
+
+        process_count = len(process_lines)
+        process_preview = process_lines[:20] or ["(no matching bot process)"]
+
+        if restart_events_file.exists():
+            restart_events = restart_events_file.read_text(
+                encoding="utf-8",
+                errors="replace",
+            ).splitlines()
+            restart_tail = restart_events[-_OPSSTATUS_RESTART_TAIL_LINES:]
+            if not restart_tail:
+                restart_tail = ["(restart events log is empty)"]
+        else:
+            restart_tail = [f"(file not found: {restart_events_file})"]
+
+        healthy = tmux_rc == 0 and process_count == 1
+
+        logger.info(
+            "Ops status snapshot generated",
+            request_id=request_id,
+            user_id=user_id,
+            chat_id=chat_id,
+            healthy=healthy,
+            tmux_status_rc=tmux_rc,
+            process_count=process_count,
+            restart_events_shown=len(restart_tail),
+        )
+
+        report_lines = [
+            f"opsstatus request_id={request_id}",
+            f"healthy={'yes' if healthy else 'no'}",
+            "",
+            f"tmux_status_rc={tmux_rc}",
+            "tmux_status_stdout:",
+            tmux_out or "(empty)",
+        ]
+        if tmux_err:
+            report_lines.extend(["", "tmux_status_stderr:", tmux_err])
+
+        report_lines.extend(
+            [
+                "",
+                f"ps_status_rc={ps_rc}",
+                f"bot_process_count={process_count}",
+                "bot_processes:",
+                *process_preview,
+            ]
+        )
+        if ps_err:
+            report_lines.extend(["", "ps_stderr:", ps_err])
+
+        report_lines.extend(
+            [
+                "",
+                f"restart_events_tail(last={_OPSSTATUS_RESTART_TAIL_LINES}):",
+                *restart_tail,
+            ]
+        )
+
+        report = "\n".join(report_lines)
+        chunks = _split_text_chunks(report, max_chars=3400)
+        for idx, chunk in enumerate(chunks):
+            if idx == 0:
+                await _reply_update_message_resilient(update, context, chunk)
+            else:
+                await _reply_update_message_resilient(
+                    update, context, f"[{idx + 1}/{len(chunks)}]\n{chunk}"
+                )
+
+        if audit_logger:
+            await audit_logger.log_command(
+                user_id=user_id,
+                command="opsstatus",
+                args=[request_id],
+                success=healthy,
+            )
+    except Exception as exc:
+        logger.error(
+            "Failed to generate ops status",
+            request_id=request_id,
+            user_id=user_id,
+            chat_id=chat_id,
+            error=str(exc),
+            error_type=type(exc).__name__,
+        )
+        await _reply_update_message_resilient(
+            update,
+            context,
+            "❌ 获取运维状态失败，请稍后重试。",
+        )
+        if audit_logger:
+            await audit_logger.log_command(
+                user_id=user_id,
+                command="opsstatus",
+                args=[request_id],
+                success=False,
+            )
+
+
 def _split_text_chunks(text: str, max_chars: int = 3500) -> list[str]:
     """Split long text into Telegram-safe chunks while preserving line boundaries."""
     stripped = text.strip()
@@ -1811,8 +2151,15 @@ async def codex_diag_command(
 
     if explicit_session_id:
         import re
-        if not re.fullmatch(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}", explicit_session_id, re.IGNORECASE):
-            await _reply_update_message_resilient(update, context, "❌ 无效的 session ID 格式")
+
+        if not re.fullmatch(
+            r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}",
+            explicit_session_id,
+            re.IGNORECASE,
+        ):
+            await _reply_update_message_resilient(
+                update, context, "❌ 无效的 session ID 格式"
+            )
             return
 
     script_path = (

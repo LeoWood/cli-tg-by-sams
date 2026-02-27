@@ -182,6 +182,8 @@ class ClaudeCodeBot:
             ("actions", command.quick_actions),
             ("git", command.git_command),
             ("cancel", command.cancel_task),
+            ("restartbot", command.restart_bot_command),
+            ("opsstatus", command.ops_status_command),
             ("resume", command.resume_command),
             ("model", command.model_command),
             ("codexdiag", command.codex_diag_command),
