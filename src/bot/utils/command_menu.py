@@ -24,13 +24,13 @@ class MenuCommandSpec:
 
 COMMAND_MENU_SPECS: tuple[MenuCommandSpec, ...] = (
     MenuCommandSpec("new", "Clear context and start fresh session"),
+    MenuCommandSpec("restartbot", "Restart bot service (admin)"),
+    MenuCommandSpec("opsstatus", "Show bot runtime ops status"),
     MenuCommandSpec("resume", "Resume a desktop session"),
     MenuCommandSpec("context", "Show session context (Claude)"),
     MenuCommandSpec("status", "Show session status (Codex)"),
     MenuCommandSpec("engine", "Switch CLI engine (claude/codex)"),
     MenuCommandSpec("cancel", "Cancel the current running task"),
-    MenuCommandSpec("restartbot", "Restart bot service (admin)"),
-    MenuCommandSpec("opsstatus", "Show bot runtime ops status"),
     MenuCommandSpec("model", "View or set model"),
     MenuCommandSpec("codexdiag", "Diagnose Codex MCP status (Codex)"),
     MenuCommandSpec("projects", "Show all projects"),

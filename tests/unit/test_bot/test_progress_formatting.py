@@ -60,7 +60,7 @@ async def test_init_progress_text_does_not_show_stale_model_name():
         },
     )
     text = await _format_progress_update(update)
-    assert text == "🚀 *Starting Claude* with 2 tools available"
+    assert text == "🚀 *Claude is preparing your request* with 2 tools available"
 
 
 @pytest.mark.asyncio
@@ -410,6 +410,9 @@ def test_build_context_tag_renders_codex_badge():
 
     assert "⬜ `Codex CLI`" in tag
     assert "`demo-project`" in tag
+    project_line = tag.splitlines()[1]
+    assert project_line.startswith("📁 *Project:* `")
+    assert project_line.endswith("/demo-project`")
 
 
 def test_build_context_tag_renders_claude_badge():
@@ -423,6 +426,9 @@ def test_build_context_tag_renders_claude_badge():
 
     assert "🟧 `Claude CLI`" in tag
     assert "`claude-project`" in tag
+    project_line = tag.splitlines()[1]
+    assert project_line.startswith("📁 *Project:* `")
+    assert project_line.endswith("/claude-project`")
 
 
 def test_build_context_tag_shows_rate_limit_summary():
@@ -458,9 +464,10 @@ def test_build_context_tag_shows_session_context_summary():
     )
 
     lines = tag.splitlines()
-    assert len(lines) == 3
-    assert lines[1].startswith("🔋 Session context")
-    assert lines[2].startswith("🔋")
+    assert len(lines) == 4
+    assert lines[1].startswith("📁 *Project:*")
+    assert lines[2].startswith("🔋 Session context")
+    assert lines[3].startswith("🔋")
 
 
 def test_build_session_context_summary_prefers_explicit_remaining_tokens():
@@ -482,12 +489,13 @@ def test_build_collapsed_thinking_summary_keeps_model_and_context():
     """Collapsed thinking summary should keep model line and append context info."""
     collapsed = _build_collapsed_thinking_summary(
         all_progress_lines=[
-            "🚀 *Starting Codex* with 15 tools available",
+            "🚀 *Codex is preparing your request* with 15 tools available",
             "🧠 *Using model:* o4-mini",
             "🔧 Read: `src/main.py`",
         ],
         context_tag=(
             "⬜ `Codex CLI` | `cli-tg` | `019c6252`\n"
+            "📁 *Project:* `/tmp/cli-tg`\n"
             "🔋 Session context: `86.2%` remaining\n"
             "🔋 5h window: 97.0% remaining\n"
             "   7d window: 99.0% remaining"
@@ -496,6 +504,7 @@ def test_build_collapsed_thinking_summary_keeps_model_and_context():
 
     lines = collapsed.splitlines()
     assert lines[0] == "⬜ `Codex CLI` | `cli-tg` | `019c6252`"
+    assert "📁 *Project:* `/tmp/cli-tg`" in lines
     assert "🔋 Session context: `86.2%` remaining" in lines
     assert "🧠 *Using model:* o4-mini" in lines
     assert "🔋 5h window: 97.0% remaining" not in collapsed
@@ -507,12 +516,15 @@ def test_build_collapsed_thinking_summary_falls_back_when_no_model_line():
     collapsed = _build_collapsed_thinking_summary(
         all_progress_lines=["🔧 Read: `src/main.py`"],
         context_tag=(
-            "🟧 `Claude CLI` | `cli-tg` | `019c6252`\n" "🔋 5h window: 87.5% remaining"
+            "🟧 `Claude CLI` | `cli-tg` | `019c6252`\n"
+            "📁 *Project:* `/tmp/cli-tg`\n"
+            "🔋 5h window: 87.5% remaining"
         ),
     )
 
     assert "🧠 *Using model:*" not in collapsed
     assert "🟧 `Claude CLI` | `cli-tg` | `019c6252`" in collapsed
+    assert "📁 *Project:* `/tmp/cli-tg`" in collapsed
     assert "🔋 5h window: 87.5% remaining" not in collapsed
     assert "💭 Thinking done" not in collapsed
 
@@ -521,12 +533,16 @@ def test_build_collapsed_thinking_summary_uses_fallback_model_when_missing():
     """Collapsed summary should use provided fallback model when stream has no model line."""
     collapsed = _build_collapsed_thinking_summary(
         all_progress_lines=["🔧 Read: `src/main.py`"],
-        context_tag="⬜ `Codex CLI` | `cli-tg` | `019c6252`",
+        context_tag=(
+            "⬜ `Codex CLI` | `cli-tg` | `019c6252`\n"
+            "📁 *Project:* `/tmp/cli-tg`"
+        ),
         fallback_model="gpt-5.3-codex",
     )
 
     lines = collapsed.splitlines()
     assert lines[0] == "⬜ `Codex CLI` | `cli-tg` | `019c6252`"
+    assert "📁 *Project:* `/tmp/cli-tg`" in lines
     assert "🧠 *Using model:* gpt-5.3-codex" in lines
 
 

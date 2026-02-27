@@ -1210,7 +1210,10 @@ async def _format_progress_update(update_obj) -> Optional[str]:
             # Avoid showing potentially stale requested/default model names here.
             # Actual model should be shown only after resolution.
             engine_label = _stream_engine_label(update_obj)
-            return f"🚀 *Starting {engine_label}* with {tools_count} tools available"
+            return (
+                f"🚀 *{engine_label} is preparing your request* "
+                f"with {tools_count} tools available"
+            )
         if (
             update_obj.metadata
             and update_obj.metadata.get("subtype") == "model_resolved"
@@ -1357,12 +1360,21 @@ def _build_context_tag(
 ) -> str:
     """Build a compact context tag line for display in thinking summary or reply header.
 
-    Format: engine_badge | project_name | sid_short
+    Format:
+    - line1: engine_badge | project_name | sid_short
+    - line2: explicit project cwd
     """
-    current_dir = scope_state.get("current_directory", approved_directory)
+    approved_root = Path(approved_directory).expanduser().resolve()
+    current_dir_raw = scope_state.get("current_directory", approved_root)
+    try:
+        current_dir = Path(current_dir_raw).expanduser().resolve()
+    except (TypeError, ValueError, OSError):
+        current_dir = approved_root
+
     project_name = current_dir.name if current_dir and current_dir.name else "~"
     sid_short = (session_id or "no-session")[:8]
     lines = [f"{_engine_badge(active_engine)} | `{project_name}` | `{sid_short}`"]
+    lines.append(f"📁 *Project:* `{_escape_md(str(current_dir))}`")
     if session_context_summary:
         lines.append(session_context_summary)
     if rate_limit_summary:
@@ -1514,7 +1526,7 @@ def _build_collapsed_thinking_summary(
     """Build final collapsed thinking summary text with model and compact context."""
 
     def _compact_context_tag(raw: str) -> str:
-        """Keep only session identity line + session context usage for collapsed UI."""
+        """Keep identity line + project line + session context usage for collapsed UI."""
         context_lines = [
             line.strip() for line in str(raw or "").splitlines() if line.strip()
         ]
@@ -1522,6 +1534,10 @@ def _build_collapsed_thinking_summary(
             return ""
 
         compact_lines: list[str] = [context_lines[0]]
+        for line in context_lines[1:]:
+            if "Project:" in line:
+                compact_lines.append(line)
+                break
         for line in context_lines[1:]:
             if "Session context:" in line:
                 compact_lines.append(line)

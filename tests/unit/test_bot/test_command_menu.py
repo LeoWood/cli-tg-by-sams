@@ -15,6 +15,7 @@ def test_build_bot_commands_for_claude_hides_codexdiag():
     """Claude menu should include model and hide codex diagnostics."""
     commands = build_bot_commands_for_engine("claude")
     names = [cmd.command for cmd in commands]
+    assert names[1:3] == ["restartbot", "opsstatus"]
     assert "context" in names
     assert "model" in names
     assert "restartbot" in names
@@ -27,6 +28,7 @@ def test_build_bot_commands_for_codex_includes_read_only_model():
     """Codex menu should include model(read-only), status and codex diagnostics."""
     commands = build_bot_commands_for_engine("codex")
     names = [cmd.command for cmd in commands]
+    assert names[1:3] == ["restartbot", "opsstatus"]
     assert "context" not in names
     assert "codexdiag" in names
     assert "model" in names
