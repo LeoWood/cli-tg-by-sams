@@ -1,4 +1,4 @@
-.PHONY: install dev test lint format clean help run
+.PHONY: install dev test lint format clean help run run-debug run-local bot-stop bot-status bot-logs bot-attach
 
 # Default target
 help:
@@ -9,7 +9,13 @@ help:
 	@echo "  lint       - Run linting checks"
 	@echo "  format     - Format code"
 	@echo "  clean      - Clean up generated files"
-	@echo "  run        - Run the bot"
+	@echo "  run        - Restart bot in tmux session (fixed entry, single instance)"
+	@echo "  run-debug  - Restart bot in tmux session with --debug"
+	@echo "  run-local  - Run bot in current foreground shell"
+	@echo "  bot-stop   - Stop tmux bot session and residual bot processes"
+	@echo "  bot-status - Show tmux/process status (expects exactly one bot process)"
+	@echo "  bot-logs   - Tail recent tmux bot logs"
+	@echo "  bot-attach - Attach to tmux bot session"
 
 install:
 	poetry install --no-dev
@@ -38,8 +44,23 @@ clean:
 	rm -rf .coverage htmlcov/ .pytest_cache/ dist/ build/
 
 run:
-	poetry run claude-telegram-bot
+	./scripts/tmux-bot.sh restart
 
 # For debugging
 run-debug:
-	poetry run claude-telegram-bot --debug
+	BOT_DEBUG=1 ./scripts/tmux-bot.sh restart
+
+run-local:
+	poetry run cli-tg-bot
+
+bot-stop:
+	./scripts/tmux-bot.sh stop
+
+bot-status:
+	./scripts/tmux-bot.sh status
+
+bot-logs:
+	./scripts/tmux-bot.sh logs
+
+bot-attach:
+	./scripts/tmux-bot.sh attach

@@ -42,7 +42,7 @@ async def test_restart_polling_stops_then_starts_updater() -> None:
     updater.stop.assert_awaited_once()
     updater.start_polling.assert_awaited_once()
     kwargs = updater.start_polling.await_args.kwargs
-    assert kwargs["drop_pending_updates"] is True
+    assert kwargs["drop_pending_updates"] is False
     assert kwargs["bootstrap_retries"] == 10
     assert kwargs["error_callback"] == bot._polling_error_callback
     assert bot._polling_restart_requested is False
@@ -100,3 +100,22 @@ async def test_watchdog_restarts_when_error_flag_set() -> None:
     await bot._polling_watchdog_tick()
 
     bot._restart_polling.assert_awaited_once_with(reason="network_error_threshold")
+
+
+@pytest.mark.asyncio
+async def test_watchdog_restarts_when_update_progress_stalls() -> None:
+    """Watchdog should self-heal when no updates are processed for too long."""
+    bot = ClaudeCodeBot(
+        settings=SimpleNamespace(webhook_url=None),
+        dependencies={},
+    )
+    bot.app = SimpleNamespace(updater=SimpleNamespace(running=True))
+    bot._polling_restart_requested = False
+    bot._last_update_progress_monotonic = (
+        asyncio.get_running_loop().time() - core_module._POLLING_UPDATE_STALL_SECONDS - 1
+    )
+    bot._restart_polling = AsyncMock(return_value=True)  # type: ignore[method-assign]
+
+    await bot._polling_watchdog_tick()
+
+    bot._restart_polling.assert_awaited_once_with(reason="update_stall_watchdog")

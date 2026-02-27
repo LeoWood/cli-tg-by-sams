@@ -8,6 +8,7 @@ Features:
 """
 
 import asyncio
+import time
 from pathlib import Path
 from typing import Any, Callable, Dict, Optional
 
@@ -40,6 +41,7 @@ logger = structlog.get_logger()
 _POLLING_WATCHDOG_INTERVAL_SECONDS = 2.0
 _POLLING_RECOVERY_ERROR_THRESHOLD = 3
 _POLLING_RESTART_COOLDOWN_SECONDS = 8.0
+_POLLING_UPDATE_STALL_SECONDS = 1800.0
 _POLLING_WATCHDOG_HEARTBEAT_INTERVAL_SECONDS = 60.0
 _POLLING_HEALTH_PROBE_INTERVAL_SECONDS = 300.0
 _POLLING_WATCHDOG_DELAY_WARNING_SECONDS = 15.0
@@ -67,6 +69,7 @@ class ClaudeCodeBot:
         self._last_health_probe_monotonic: float = 0.0
         self._watchdog_tick_count: int = 0
         self._last_update_monotonic: float = 0.0
+        self._last_update_progress_monotonic: float = 0.0
         self._last_update_id: Optional[int] = None
         # Update dedupe and persisted offset tracking
         self._update_dedupe_cache = UpdateDedupeCache(ttl_seconds=300, max_size=5000)
@@ -283,6 +286,8 @@ class ClaudeCodeBot:
         self, update: Update, context: ContextTypes.DEFAULT_TYPE
     ) -> None:
         """Drop stale/duplicate updates before entering business handlers."""
+        self._last_update_progress_monotonic = time.monotonic()
+
         update_id = getattr(update, "update_id", None)
         if not isinstance(update_id, int):
             return
@@ -334,12 +339,15 @@ class ClaudeCodeBot:
     def _add_middleware(self) -> None:
         """Add middleware to application."""
         from .middleware.auth import auth_middleware
-        from .middleware.rate_limit import rate_limit_middleware
         from .middleware.security import security_middleware
+
+        app = self.app
+        if app is None:
+            raise ClaudeCodeTelegramError("Telegram application is not initialized")
 
         # Middleware runs in order of group numbers (lower = earlier)
         # Security middleware first (validate inputs)
-        self.app.add_handler(
+        app.add_handler(
             MessageHandler(
                 filters.ALL, self._create_middleware_handler(security_middleware)
             ),
@@ -347,19 +355,11 @@ class ClaudeCodeBot:
         )
 
         # Authentication second
-        self.app.add_handler(
+        app.add_handler(
             MessageHandler(
                 filters.ALL, self._create_middleware_handler(auth_middleware)
             ),
             group=-2,
-        )
-
-        # Rate limiting third
-        self.app.add_handler(
-            MessageHandler(
-                filters.ALL, self._create_middleware_handler(rate_limit_middleware)
-            ),
-            group=-1,
         )
 
         logger.info("Middleware added to bot")
@@ -485,6 +485,7 @@ class ClaudeCodeBot:
         self._polling_error_window_start = 0.0
         self._last_polling_error_log = 0.0
         self._polling_restart_requested = False
+        self._last_update_progress_monotonic = time.monotonic()
 
     def _emit_polling_watchdog_heartbeat(
         self, *, now: float, updater_running: bool
@@ -558,7 +559,7 @@ class ClaudeCodeBot:
 
         await updater.start_polling(
             allowed_updates=Update.ALL_TYPES,
-            drop_pending_updates=True,
+            drop_pending_updates=False,
             bootstrap_retries=10,
             error_callback=self._polling_error_callback,
         )
@@ -671,6 +672,20 @@ class ClaudeCodeBot:
 
         if self._polling_restart_requested:
             await self._restart_polling(reason="network_error_threshold")
+            return
+
+        now = time.monotonic()
+        if self._last_update_progress_monotonic <= 0:
+            self._last_update_progress_monotonic = now
+            return
+
+        if now - self._last_update_progress_monotonic >= _POLLING_UPDATE_STALL_SECONDS:
+            logger.warning(
+                "Polling watchdog detected stalled update progression",
+                stall_seconds=round(now - self._last_update_progress_monotonic, 2),
+                threshold_seconds=_POLLING_UPDATE_STALL_SECONDS,
+            )
+            await self._restart_polling(reason="update_stall_watchdog")
 
     async def start(self) -> None:
         """Start the bot."""
@@ -702,7 +717,7 @@ class ClaudeCodeBot:
                     port=self.settings.webhook_port,
                     url_path=self.settings.webhook_path,
                     webhook_url=self.settings.webhook_url,
-                    drop_pending_updates=True,
+                    drop_pending_updates=False,
                     allowed_updates=Update.ALL_TYPES,
                 )
             else:
