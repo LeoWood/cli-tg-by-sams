@@ -4,7 +4,11 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
-from src.claude.exceptions import ClaudeProcessError, ClaudeTimeoutError
+from src.claude.exceptions import (
+    ClaudeProcessError,
+    ClaudeTimeoutError,
+    ClaudeToolValidationError,
+)
 from src.claude.facade import ClaudeIntegration
 from src.claude.integration import ClaudeResponse, StreamUpdate
 from src.config.settings import Settings
@@ -400,6 +404,70 @@ class TestClaudeIntegrationFacade:
         assert "Tool Validation Failed" in result.content
         assert result.is_error is True
         assert result.error_type == "tool_validation_failed"
+
+    async def test_bash_tool_validation_failure_fails_fast(self, tmp_path):
+        """Blocked bash commands should raise immediately to stop execution."""
+        config = _build_config(tmp_path, use_sdk=False)
+        session = MagicMock(
+            session_id="session-local",
+            is_new_session=False,
+            source="bot",
+        )
+        session_manager = MagicMock()
+        session_manager.get_or_create_session = AsyncMock(return_value=session)
+        session_manager.update_session = AsyncMock()
+        session_manager.remove_session = AsyncMock()
+
+        tool_monitor = MagicMock()
+        tool_monitor.validate_tool_call = AsyncMock(
+            return_value=(
+                False,
+                "Operational command blocked in remote Telegram session: "
+                "make run/run-debug/run-local. Use /restartbot for restart "
+                "or /opsstatus for diagnostics.",
+            )
+        )
+
+        facade = ClaudeIntegration(
+            config=config,
+            process_manager=MagicMock(),
+            sdk_manager=None,
+            session_manager=session_manager,
+            tool_monitor=tool_monitor,
+            permission_manager=MagicMock(),
+        )
+
+        async def _fake_execute(**kwargs):
+            await kwargs["stream_callback"](
+                StreamUpdate(
+                    type="progress",
+                    tool_calls=[
+                        {
+                            "name": "Bash",
+                            "input": {"command": "make run"},
+                        }
+                    ],
+                )
+            )
+            return ClaudeResponse(
+                content="should-not-return",
+                session_id="session-local",
+                cost=0.0,
+                duration_ms=1,
+                num_turns=1,
+            )
+
+        facade._execute_with_fallback = AsyncMock(side_effect=_fake_execute)
+
+        with pytest.raises(ClaudeToolValidationError):
+            await facade.run_command(
+                prompt="restart",
+                working_directory=tmp_path,
+                user_id=1003,
+                session_id="session-local",
+            )
+
+        session_manager.update_session.assert_not_awaited()
 
     async def test_get_precise_context_usage_probes_codex_status(self, tmp_path):
         """Codex subprocess should probe `/status` and parse context usage."""

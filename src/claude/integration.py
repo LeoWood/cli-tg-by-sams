@@ -25,6 +25,7 @@ from .exceptions import (
     ClaudeMCPError,
     ClaudeParsingError,
     ClaudeProcessError,
+    ClaudeToolValidationError,
     ClaudeTimeoutError,
 )
 
@@ -463,6 +464,15 @@ class ClaudeProcessManager:
                 if update and stream_callback:
                     try:
                         await stream_callback(update)
+                    except ClaudeToolValidationError:
+                        logger.warning(
+                            "Stream callback requested process abort due to tool policy",
+                            update_type=update.type,
+                        )
+                        if process.returncode is None:
+                            process.kill()
+                            await process.wait()
+                        raise
                     except Exception as e:
                         logger.warning(
                             "Stream callback failed",
@@ -845,10 +855,14 @@ class ClaudeProcessManager:
             )
         if item_type == "command_execution":
             status = item.get("status") or "unknown"
-            command = item.get("command") or ""
+            command = str(item.get("command") or "").strip()
+            tool_calls: Optional[List[Dict[str, Any]]] = None
+            if command:
+                tool_calls = [{"name": "Bash", "input": {"command": command}}]
             return StreamUpdate(
                 type="progress",
-                content=str(command).strip() or None,
+                content=command or None,
+                tool_calls=tool_calls,
                 metadata={
                     "subtype": msg_type,
                     "item_type": item_type,

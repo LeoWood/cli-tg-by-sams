@@ -22,6 +22,24 @@ logger = structlog.get_logger()
 class ToolMonitor:
     """Monitor and validate Claude's tool usage."""
 
+    _OPERATIONAL_COMMAND_PATTERNS: List[Tuple[str, str]] = [
+        (r"\bmake\s+run(?:-debug|-local)?\b", "make run/run-debug/run-local"),
+        (r"\bmake\s+bot-stop\b", "make bot-stop"),
+        (
+            r"(?:^|[\s'\"`])(?:\.\/)?scripts\/tmux-bot\.sh\s+(?:restart|start|stop)\b",
+            "scripts/tmux-bot.sh restart/start/stop",
+        ),
+        (
+            r"(?:^|[\s'\"`])(?:\.\/)?scripts\/restart-bot\.sh(?:\s|$)",
+            "scripts/restart-bot.sh",
+        ),
+        (r"\btmux\s+kill-session\b", "tmux kill-session"),
+        (
+            r"\bpkill\s+-f\b.*\b(?:cli-tg|cli-tg-bot|claude-telegram-bot)\b",
+            "pkill -f cli-tg*",
+        ),
+    ]
+
     def __init__(
         self, config: Settings, security_validator: Optional[SecurityValidator] = None
     ):
@@ -30,6 +48,15 @@ class ToolMonitor:
         self.security_validator = security_validator
         self.tool_usage: Dict[str, int] = defaultdict(int)
         self.security_violations: List[Dict[str, Any]] = []
+
+    @classmethod
+    def _match_operational_command_block(cls, command: str) -> Optional[str]:
+        """Return blocked operational command label when matched."""
+        lowered = command.lower()
+        for pattern, label in cls._OPERATIONAL_COMMAND_PATTERNS:
+            if re.search(pattern, lowered):
+                return label
+        return None
 
     async def validate_tool_call(
         self,
@@ -104,6 +131,24 @@ class ToolMonitor:
         if tool_name in ["bash", "shell", "Bash"]:
             command = tool_input.get("command", "")
             cmd_lower = command.lower()
+
+            blocked_label = self._match_operational_command_block(command)
+            if blocked_label:
+                violation = {
+                    "type": "blocked_operational_command",
+                    "tool_name": tool_name,
+                    "command": command,
+                    "pattern": blocked_label,
+                    "user_id": user_id,
+                    "working_directory": str(working_directory),
+                }
+                self.security_violations.append(violation)
+                logger.warning("Operational command blocked", **violation)
+                return (
+                    False,
+                    "Operational command blocked in remote Telegram session: "
+                    f"{blocked_label}. Use /restartbot for restart or /opsstatus for diagnostics.",
+                )
 
             # Truly dangerous patterns (regex for precision)
             dangerous_regex_patterns = [

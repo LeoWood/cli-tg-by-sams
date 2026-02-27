@@ -233,7 +233,9 @@ def test_build_command_for_codex_resume_without_prompt_uses_default(
     ]
 
 
-def test_build_command_for_codex_exec_without_prompt_uses_default(tmp_path, monkeypatch):
+def test_build_command_for_codex_exec_without_prompt_uses_default(
+    tmp_path, monkeypatch
+):
     """Codex exec should carry a fallback prompt when prompt is empty."""
     manager = _build_manager(tmp_path)
     monkeypatch.setattr(
@@ -384,6 +386,9 @@ def test_parse_stream_message_codex_command_execution_keeps_status_metadata(tmp_
     assert update is not None
     assert update.type == "progress"
     assert update.content == "/bin/zsh -lc 'pwd'"
+    assert update.tool_calls == [
+        {"name": "Bash", "input": {"command": "/bin/zsh -lc 'pwd'"}}
+    ]
     assert update.metadata and update.metadata.get("status") == "in_progress"
     assert update.metadata and update.metadata.get("engine") == "codex"
 

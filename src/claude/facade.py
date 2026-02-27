@@ -135,8 +135,16 @@ class ClaudeIntegration:
                             user_id=user_id,
                         )
 
-                        # For critical tools, we should fail fast
-                        if tool_name in ["Task", "Read", "Write", "Edit"]:
+                        # For critical or shell tools, fail fast to stop execution.
+                        if tool_name in [
+                            "Task",
+                            "Read",
+                            "Write",
+                            "Edit",
+                            "bash",
+                            "shell",
+                            "Bash",
+                        ]:
                             # Create comprehensive error message
                             admin_instructions = self._get_admin_instructions(
                                 list(blocked_tools)
