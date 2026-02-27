@@ -41,10 +41,18 @@ logger = structlog.get_logger()
 _POLLING_WATCHDOG_INTERVAL_SECONDS = 2.0
 _POLLING_RECOVERY_ERROR_THRESHOLD = 3
 _POLLING_RESTART_COOLDOWN_SECONDS = 8.0
-_POLLING_UPDATE_STALL_SECONDS = 1800.0
 _POLLING_WATCHDOG_HEARTBEAT_INTERVAL_SECONDS = 60.0
 _POLLING_HEALTH_PROBE_INTERVAL_SECONDS = 300.0
 _POLLING_WATCHDOG_DELAY_WARNING_SECONDS = 15.0
+_DEFAULT_TELEGRAM_CONNECT_TIMEOUT_SECONDS = 30.0
+_DEFAULT_TELEGRAM_READ_TIMEOUT_SECONDS = 30.0
+_DEFAULT_TELEGRAM_WRITE_TIMEOUT_SECONDS = 30.0
+_DEFAULT_TELEGRAM_POOL_TIMEOUT_SECONDS = 30.0
+_DEFAULT_TELEGRAM_CONNECTION_POOL_SIZE = 64
+_DEFAULT_TELEGRAM_GET_UPDATES_READ_TIMEOUT_SECONDS = 50.0
+_DEFAULT_TELEGRAM_GET_UPDATES_POOL_TIMEOUT_SECONDS = 30.0
+_DEFAULT_TELEGRAM_GET_UPDATES_CONNECTION_POOL_SIZE = 16
+_DEFAULT_POLLING_UPDATE_STALL_SECONDS = 0.0
 
 
 class ClaudeCodeBot:
@@ -76,6 +84,32 @@ class ClaudeCodeBot:
         self._update_offset_store: Optional[UpdateOffsetStore] = None
         self._startup_min_update_id: Optional[int] = None
 
+    def _get_float_setting(self, name: str, default: float, *, minimum: float) -> float:
+        """Read numeric setting with defensive fallback for tests/runtime."""
+        raw_value = getattr(self.settings, name, default)
+        try:
+            value = float(raw_value)
+        except (TypeError, ValueError):
+            return default
+        return value if value >= minimum else default
+
+    def _get_int_setting(self, name: str, default: int, *, minimum: int) -> int:
+        """Read integer setting with defensive fallback for tests/runtime."""
+        raw_value = getattr(self.settings, name, default)
+        try:
+            value = int(raw_value)
+        except (TypeError, ValueError):
+            return default
+        return value if value >= minimum else default
+
+    def _get_polling_update_stall_seconds(self) -> float:
+        """Return configured stall threshold; 0 means disabled."""
+        return self._get_float_setting(
+            "polling_update_stall_seconds",
+            _DEFAULT_POLLING_UPDATE_STALL_SECONDS,
+            minimum=0.0,
+        )
+
     async def initialize(self) -> None:
         """Initialize bot application."""
         logger.info("Initializing Telegram bot")
@@ -85,10 +119,68 @@ class ClaudeCodeBot:
         builder.token(self.settings.telegram_token_str)
 
         # Configure connection settings
-        builder.connect_timeout(30)
-        builder.read_timeout(30)
-        builder.write_timeout(30)
-        builder.pool_timeout(30)
+        connect_timeout_seconds = self._get_float_setting(
+            "telegram_connect_timeout_seconds",
+            _DEFAULT_TELEGRAM_CONNECT_TIMEOUT_SECONDS,
+            minimum=1.0,
+        )
+        read_timeout_seconds = self._get_float_setting(
+            "telegram_read_timeout_seconds",
+            _DEFAULT_TELEGRAM_READ_TIMEOUT_SECONDS,
+            minimum=1.0,
+        )
+        write_timeout_seconds = self._get_float_setting(
+            "telegram_write_timeout_seconds",
+            _DEFAULT_TELEGRAM_WRITE_TIMEOUT_SECONDS,
+            minimum=1.0,
+        )
+        pool_timeout_seconds = self._get_float_setting(
+            "telegram_pool_timeout_seconds",
+            _DEFAULT_TELEGRAM_POOL_TIMEOUT_SECONDS,
+            minimum=1.0,
+        )
+        connection_pool_size = self._get_int_setting(
+            "telegram_connection_pool_size",
+            _DEFAULT_TELEGRAM_CONNECTION_POOL_SIZE,
+            minimum=8,
+        )
+        get_updates_read_timeout_seconds = self._get_float_setting(
+            "telegram_get_updates_read_timeout_seconds",
+            _DEFAULT_TELEGRAM_GET_UPDATES_READ_TIMEOUT_SECONDS,
+            minimum=5.0,
+        )
+        get_updates_pool_timeout_seconds = self._get_float_setting(
+            "telegram_get_updates_pool_timeout_seconds",
+            _DEFAULT_TELEGRAM_GET_UPDATES_POOL_TIMEOUT_SECONDS,
+            minimum=1.0,
+        )
+        get_updates_connection_pool_size = self._get_int_setting(
+            "telegram_get_updates_connection_pool_size",
+            _DEFAULT_TELEGRAM_GET_UPDATES_CONNECTION_POOL_SIZE,
+            minimum=2,
+        )
+        stall_threshold_seconds = self._get_polling_update_stall_seconds()
+
+        builder.connect_timeout(connect_timeout_seconds)
+        builder.read_timeout(read_timeout_seconds)
+        builder.write_timeout(write_timeout_seconds)
+        builder.pool_timeout(pool_timeout_seconds)
+        builder.connection_pool_size(connection_pool_size)
+        builder.get_updates_read_timeout(get_updates_read_timeout_seconds)
+        builder.get_updates_pool_timeout(get_updates_pool_timeout_seconds)
+        builder.get_updates_connection_pool_size(get_updates_connection_pool_size)
+        logger.info(
+            "Configured Telegram transport options",
+            connect_timeout_seconds=connect_timeout_seconds,
+            read_timeout_seconds=read_timeout_seconds,
+            write_timeout_seconds=write_timeout_seconds,
+            pool_timeout_seconds=pool_timeout_seconds,
+            connection_pool_size=connection_pool_size,
+            get_updates_read_timeout_seconds=get_updates_read_timeout_seconds,
+            get_updates_pool_timeout_seconds=get_updates_pool_timeout_seconds,
+            get_updates_connection_pool_size=get_updates_connection_pool_size,
+            polling_update_stall_seconds=stall_threshold_seconds,
+        )
 
         # Enable concurrent update processing so that permission button
         # callbacks can be handled while a Claude request is waiting for
@@ -676,16 +768,23 @@ class ClaudeCodeBot:
             await self._restart_polling(reason="network_error_threshold")
             return
 
+        stall_threshold_seconds = self._get_polling_update_stall_seconds()
+        if stall_threshold_seconds <= 0:
+            return
+
+        if self._last_update_id is None:
+            return
+
         now = time.monotonic()
         if self._last_update_progress_monotonic <= 0:
             self._last_update_progress_monotonic = now
             return
 
-        if now - self._last_update_progress_monotonic >= _POLLING_UPDATE_STALL_SECONDS:
+        if now - self._last_update_progress_monotonic >= stall_threshold_seconds:
             logger.warning(
                 "Polling watchdog detected stalled update progression",
                 stall_seconds=round(now - self._last_update_progress_monotonic, 2),
-                threshold_seconds=_POLLING_UPDATE_STALL_SECONDS,
+                threshold_seconds=stall_threshold_seconds,
             )
             await self._restart_polling(reason="update_stall_watchdog")
 

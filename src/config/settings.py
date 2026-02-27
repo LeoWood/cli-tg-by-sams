@@ -194,6 +194,63 @@ class Settings(BaseSettings):
         ge=5,
         le=300,
     )
+    telegram_connect_timeout_seconds: float = Field(
+        30.0,
+        description="Telegram API connect timeout (seconds)",
+        ge=1.0,
+        le=300.0,
+    )
+    telegram_read_timeout_seconds: float = Field(
+        30.0,
+        description="Telegram API read timeout (seconds)",
+        ge=1.0,
+        le=300.0,
+    )
+    telegram_write_timeout_seconds: float = Field(
+        30.0,
+        description="Telegram API write timeout (seconds)",
+        ge=1.0,
+        le=300.0,
+    )
+    telegram_pool_timeout_seconds: float = Field(
+        30.0,
+        description="Telegram API connection pool wait timeout (seconds)",
+        ge=1.0,
+        le=300.0,
+    )
+    telegram_connection_pool_size: int = Field(
+        64,
+        description="Telegram API connection pool size for general requests",
+        ge=8,
+        le=512,
+    )
+    telegram_get_updates_read_timeout_seconds: float = Field(
+        50.0,
+        description="getUpdates long-poll read timeout (seconds)",
+        ge=5.0,
+        le=300.0,
+    )
+    telegram_get_updates_pool_timeout_seconds: float = Field(
+        30.0,
+        description="getUpdates pool wait timeout (seconds)",
+        ge=1.0,
+        le=300.0,
+    )
+    telegram_get_updates_connection_pool_size: int = Field(
+        16,
+        description="Dedicated connection pool size for getUpdates",
+        ge=2,
+        le=128,
+    )
+    polling_update_stall_seconds: float = Field(
+        0.0,
+        description=(
+            "Polling stall watchdog threshold in seconds; "
+            "set 0 to disable update-stall auto restart"
+        ),
+        ge=0.0,
+        le=86400.0,
+    )
 
     # Monitoring
     log_level: str = Field("INFO", description="Logging level")
