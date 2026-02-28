@@ -8,6 +8,7 @@ import pytest
 
 from src.bot.handlers.message import (
     _compose_prompt_with_reaction_feedback,
+    _compose_prompt_with_telegram_remote_context,
     _set_message_reaction_safe,
     handle_message_reaction,
     handle_reaction_update_fallback,
@@ -178,6 +179,16 @@ def test_compose_prompt_with_reaction_feedback_injects_hint():
     )
     assert enriched != prompt
     assert "不满意" in enriched
+    assert prompt in enriched
+
+
+def test_compose_prompt_with_telegram_remote_context_injects_hint():
+    """Prompt composer should always include Telegram remote context hint."""
+    prompt = "请帮我导出结果文件"
+    enriched = _compose_prompt_with_telegram_remote_context(prompt)
+
+    assert enriched != prompt
+    assert "Telegram 与用户远程协作" in enriched
     assert prompt in enriched
 
 

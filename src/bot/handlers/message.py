@@ -56,14 +56,40 @@ _MEDIA_GROUP_WINDOW_SECONDS = 1.0
 _AGGREGATION_STATE_TTL_SECONDS = 30
 _CHAT_ACTION_HEARTBEAT_INTERVAL_SECONDS = 4.0
 _AUTO_IMAGE_ATTACHMENTS_LIMIT = 3
+_AUTO_FILE_ATTACHMENTS_LIMIT = 3
 _AUTO_IMAGE_MAX_FILE_SIZE_BYTES = 50 * 1024 * 1024  # Telegram bot document limit
 _AUTO_IMAGE_SUFFIXES = {".png", ".jpg", ".jpeg", ".webp", ".gif", ".bmp"}
+_AUTO_FILE_SUFFIXES = {
+    ".txt",
+    ".md",
+    ".pdf",
+    ".doc",
+    ".docx",
+    ".xls",
+    ".xlsx",
+    ".csv",
+    ".tsv",
+    ".json",
+    ".yaml",
+    ".yml",
+    ".toml",
+    ".xml",
+    ".html",
+    ".htm",
+    ".sql",
+    ".log",
+    ".zip",
+    ".tar",
+    ".gz",
+    ".tgz",
+    ".7z",
+}
 _AUTO_IMAGE_PATH_PATTERN = re.compile(
     r"(?P<path>(?:~|/|\.{1,2}/)?[^\s`\"'<>|]+?\.(?:png|jpe?g|webp|gif|bmp))",
     re.IGNORECASE,
 )
-_AUTO_IMAGE_LINE_HINT_PATTERN = re.compile(
-    r"(?:文件路径|路径|path)\s*[:：]\s*(?P<path>[^\s`\"'<>|]+)",
+_AUTO_PATH_LINE_HINT_PATTERN = re.compile(
+    r"(?:文件路径|路径|file\s*path|path)\s*[:：]\s*(?P<path>[^\s`\"'<>|]+)",
     re.IGNORECASE,
 )
 _IMAGE_GEN_GENERATE_COMMAND_PATTERN = re.compile(
@@ -97,6 +123,12 @@ _NEGATIVE_REACTION_TOKENS = {
 _BOT_REACTION_PROCESSING = "👀"
 _BOT_REACTION_SUCCESS = "👍"
 _BOT_REACTION_FAILED = "👎"
+_TELEGRAM_REMOTE_CONTEXT_HINT = (
+    "系统提示：你正在通过 Telegram 与用户远程协作，"
+    "用户不在当前机器终端。"
+    "如果需要向用户交付图片或文件，请在可访问目录内生成文件，"
+    "并在回复中明确给出“文件路径：<path>”。"
+)
 
 
 def _escape_md(text: str) -> str:
@@ -156,7 +188,7 @@ def _collect_candidate_image_paths_from_text(content: str) -> list[str]:
     """Extract candidate image paths from assistant free-form text."""
     candidates: list[str] = []
     for line in str(content or "").splitlines():
-        line_match = _AUTO_IMAGE_LINE_HINT_PATTERN.search(line)
+        line_match = _AUTO_PATH_LINE_HINT_PATTERN.search(line)
         if line_match:
             candidate = _clean_path_candidate(line_match.group("path"))
             if candidate:
@@ -180,6 +212,65 @@ def _collect_candidate_image_paths_from_tools(tools_used: Any) -> list[str]:
         if tool_input is None:
             continue
         candidates.extend(_iter_tool_path_hints(tool_input))
+    return candidates
+
+
+def _collect_candidate_file_paths_from_text(content: str) -> list[str]:
+    """Extract candidate non-image file paths from assistant free-form text."""
+    candidates: list[str] = []
+    for line in str(content or "").splitlines():
+        line_match = _AUTO_PATH_LINE_HINT_PATTERN.search(line)
+        if line_match:
+            candidate = _clean_path_candidate(line_match.group("path"))
+            if candidate:
+                candidates.append(candidate)
+    return candidates
+
+
+def _iter_tool_output_path_hints(payload: Any) -> list[str]:
+    """Recursively collect output-path-like values from tool payloads."""
+    results: list[str] = []
+    if isinstance(payload, str):
+        cleaned = _clean_path_candidate(payload)
+        if cleaned:
+            results.append(cleaned)
+        return results
+    if isinstance(payload, list):
+        for item in payload:
+            results.extend(_iter_tool_output_path_hints(item))
+        return results
+    if not isinstance(payload, dict):
+        return results
+
+    output_keys = {
+        "output_path",
+        "save_path",
+        "result_path",
+        "export_path",
+        "target_path",
+    }
+    for key, value in payload.items():
+        normalized_key = str(key or "").strip().lower()
+        if normalized_key in output_keys:
+            results.extend(_iter_tool_output_path_hints(value))
+            continue
+        if isinstance(value, (dict, list)):
+            results.extend(_iter_tool_output_path_hints(value))
+    return results
+
+
+def _collect_candidate_file_paths_from_tools(tools_used: Any) -> list[str]:
+    """Extract candidate non-image file paths from structured tool usage records."""
+    if not isinstance(tools_used, list):
+        return []
+    candidates: list[str] = []
+    for tool in tools_used:
+        if not isinstance(tool, dict):
+            continue
+        tool_input = tool.get("input")
+        if tool_input is None:
+            continue
+        candidates.extend(_iter_tool_output_path_hints(tool_input))
     return candidates
 
 
@@ -302,6 +393,66 @@ def _resolve_image_paths_for_delivery(
     return resolved
 
 
+def _resolve_file_paths_for_delivery(
+    candidates: list[str],
+    *,
+    working_directory: Path,
+    approved_directory: Path,
+    limit: int = _AUTO_FILE_ATTACHMENTS_LIMIT,
+) -> list[Path]:
+    """Resolve, validate and deduplicate file paths before Telegram delivery."""
+    approved_root = Path(approved_directory).expanduser().resolve()
+    work_root = Path(working_directory).expanduser().resolve()
+    resolved: list[Path] = []
+    seen: set[str] = set()
+
+    for raw_candidate in candidates:
+        if len(resolved) >= limit:
+            break
+        normalized = _clean_path_candidate(raw_candidate)
+        if not normalized:
+            continue
+
+        candidate_path = Path(normalized).expanduser()
+        if not candidate_path.is_absolute():
+            candidate_path = (work_root / candidate_path).resolve()
+        else:
+            candidate_path = candidate_path.resolve()
+
+        path_str = str(candidate_path)
+        if path_str in seen:
+            continue
+        seen.add(path_str)
+
+        suffix = candidate_path.suffix.lower()
+        if suffix not in _AUTO_FILE_SUFFIXES or suffix in _AUTO_IMAGE_SUFFIXES:
+            continue
+        if not candidate_path.exists() or not candidate_path.is_file():
+            continue
+        if not candidate_path.is_relative_to(approved_root):
+            logger.warning(
+                "Skip auto file delivery outside approved directory",
+                path=path_str,
+                approved_directory=str(approved_root),
+            )
+            continue
+        try:
+            size_bytes = candidate_path.stat().st_size
+        except OSError:
+            continue
+        if size_bytes > _AUTO_IMAGE_MAX_FILE_SIZE_BYTES:
+            logger.warning(
+                "Skip auto file delivery because file is too large",
+                path=path_str,
+                size_bytes=size_bytes,
+                max_size_bytes=_AUTO_IMAGE_MAX_FILE_SIZE_BYTES,
+            )
+            continue
+        resolved.append(candidate_path)
+
+    return resolved
+
+
 def _extract_generated_image_paths(
     *,
     claude_response: Any | None,
@@ -326,6 +477,36 @@ def _extract_generated_image_paths(
     )
 
     return _resolve_image_paths_for_delivery(
+        [*content_candidates, *tool_candidates],
+        working_directory=current_dir,
+        approved_directory=Path(approved_directory),
+    )
+
+
+def _extract_generated_file_paths(
+    *,
+    claude_response: Any | None,
+    scope_state: dict[str, Any],
+    approved_directory: Path,
+) -> list[Path]:
+    """Collect generated non-image files from response content + tool traces."""
+    if claude_response is None:
+        return []
+
+    current_dir_raw = scope_state.get("current_directory", approved_directory)
+    try:
+        current_dir = Path(current_dir_raw)
+    except TypeError:
+        current_dir = Path(approved_directory)
+
+    content_candidates = _collect_candidate_file_paths_from_text(
+        str(getattr(claude_response, "content", "") or "")
+    )
+    tool_candidates = _collect_candidate_file_paths_from_tools(
+        getattr(claude_response, "tools_used", None)
+    )
+
+    return _resolve_file_paths_for_delivery(
         [*content_candidates, *tool_candidates],
         working_directory=current_dir,
         approved_directory=Path(approved_directory),
@@ -380,6 +561,58 @@ async def _send_generated_images_from_response(
     if sent_count:
         logger.info(
             "Auto-delivered generated images to Telegram",
+            sent_count=sent_count,
+            user_id=getattr(getattr(update, "effective_user", None), "id", None),
+        )
+    return sent_count
+
+
+async def _send_generated_files_from_response(
+    *,
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    claude_response: Any | None,
+    scope_state: dict[str, Any],
+    reply_to_message_id: Optional[int] = None,
+) -> int:
+    """Auto-send generated non-image files back to Telegram when detectable."""
+    telegram_message = getattr(update, "message", None)
+    if telegram_message is None:
+        return 0
+    reply_document = getattr(telegram_message, "reply_document", None)
+    if not callable(reply_document):
+        return 0
+
+    settings: Settings = context.bot_data["settings"]
+    file_paths = _extract_generated_file_paths(
+        claude_response=claude_response,
+        scope_state=scope_state,
+        approved_directory=settings.approved_directory,
+    )
+    if not file_paths:
+        return 0
+
+    sent_count = 0
+    for idx, file_path in enumerate(file_paths):
+        try:
+            with file_path.open("rb") as payload:
+                await reply_document(
+                    document=payload,
+                    filename=file_path.name,
+                    caption=(f"📎 已回传文件：{file_path.name}" if idx == 0 else None),
+                    reply_to_message_id=reply_to_message_id if idx == 0 else None,
+                )
+            sent_count += 1
+        except Exception as e:
+            logger.warning(
+                "Failed to send generated file back to Telegram",
+                path=str(file_path),
+                error=str(e),
+            )
+
+    if sent_count:
+        logger.info(
+            "Auto-delivered generated files to Telegram",
             sent_count=sent_count,
             user_id=getattr(getattr(update, "effective_user", None), "id", None),
         )
@@ -1812,6 +2045,14 @@ def _compose_prompt_with_reaction_feedback(
     return message_text
 
 
+def _compose_prompt_with_telegram_remote_context(message_text: str) -> str:
+    """Inject remote Telegram context so CLI understands file delivery constraints."""
+    prompt = str(message_text or "")
+    if _TELEGRAM_REMOTE_CONTEXT_HINT in prompt:
+        return prompt
+    return f"{_TELEGRAM_REMOTE_CONTEXT_HINT}\n\n{prompt}"
+
+
 async def handle_text_message(
     update: Update, context: ContextTypes.DEFAULT_TYPE
 ) -> None:
@@ -2156,6 +2397,7 @@ async def handle_text_message(
         model_prompt = _compose_prompt_with_reaction_feedback(
             message_text, reaction_feedback
         )
+        model_prompt = _compose_prompt_with_telegram_remote_context(model_prompt)
         if reaction_feedback:
             logger.info(
                 "Applying pending reaction feedback to model prompt",
@@ -2481,6 +2723,13 @@ async def handle_text_message(
                 scope_state=scope_state,
                 reply_to_message_id=input_message_id,
             )
+            await _send_generated_files_from_response(
+                update=update,
+                context=context,
+                claude_response=claude_response,
+                scope_state=scope_state,
+                reply_to_message_id=input_message_id,
+            )
 
         # Update session info
         scope_state["last_message"] = message_text
@@ -2771,6 +3020,8 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             ),
         )
 
+        prompt = _compose_prompt_with_telegram_remote_context(prompt)
+
         # Process with Claude
         blocked_local_image_fallback = False
         try:
@@ -2857,6 +3108,13 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
             if not blocked_local_image_fallback:
                 await _send_generated_images_from_response(
+                    update=update,
+                    context=context,
+                    claude_response=claude_response,
+                    scope_state=scope_state,
+                    reply_to_message_id=update.message.message_id,
+                )
+                await _send_generated_files_from_response(
                     update=update,
                     context=context,
                     claude_response=claude_response,
@@ -3253,6 +3511,7 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
                         f"Please analyze these {len(processed_images)} images in order "
                         "and provide one consolidated response."
                     )
+            model_prompt = _compose_prompt_with_telegram_remote_context(model_prompt)
 
             # Get current directory and session
             current_dir = Path(
@@ -3545,6 +3804,13 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
                 if not blocked_local_image_fallback:
                     await _send_generated_images_from_response(
+                        update=update,
+                        context=context,
+                        claude_response=claude_response,
+                        scope_state=scope_state,
+                        reply_to_message_id=reply_target_message_id,
+                    )
+                    await _send_generated_files_from_response(
                         update=update,
                         context=context,
                         claude_response=claude_response,

@@ -7,7 +7,9 @@ from unittest.mock import AsyncMock
 import pytest
 
 from src.bot.handlers.message import (
+    _extract_generated_file_paths,
     _extract_generated_image_paths,
+    _send_generated_files_from_response,
     _send_generated_images_from_response,
 )
 from src.config.settings import Settings
@@ -109,3 +111,69 @@ async def test_send_generated_images_from_response_replies_with_document(tmp_pat
     assert kwargs["filename"] == "duck.png"
     assert kwargs["caption"] == "🖼 已回传生成图片：duck.png"
     assert kwargs["reply_to_message_id"] == 7788
+
+
+def test_extract_generated_file_paths_collects_non_image_files(tmp_path):
+    """Should extract valid non-image file paths from content and tool payload."""
+    approved = tmp_path / "approved"
+    approved.mkdir()
+    current_dir = approved / "workspace"
+    current_dir.mkdir()
+
+    report = current_dir / "report.pdf"
+    log_file = current_dir / "logs" / "run.log"
+    log_file.parent.mkdir(parents=True, exist_ok=True)
+    report.write_bytes(b"%PDF-1.4\n" + b"0" * 64)
+    log_file.write_text("ok", encoding="utf-8")
+
+    response = SimpleNamespace(
+        content=f"文件路径：{report}",
+        tools_used=[{"name": "Write", "input": {"output_path": str(log_file)}}],
+    )
+
+    resolved = _extract_generated_file_paths(
+        claude_response=response,
+        scope_state={"current_directory": current_dir},
+        approved_directory=approved,
+    )
+
+    assert resolved == [report, log_file]
+
+
+@pytest.mark.asyncio
+async def test_send_generated_files_from_response_replies_with_document(tmp_path):
+    """Should send detected non-image file back to Telegram as document."""
+    approved = tmp_path / "approved"
+    approved.mkdir()
+    current_dir = approved / "workspace"
+    current_dir.mkdir()
+    report = current_dir / "report.pdf"
+    report.write_bytes(b"%PDF-1.4\n" + b"1" * 128)
+
+    response = SimpleNamespace(
+        content=f"文件路径：{report}",
+        tools_used=[],
+    )
+
+    reply_document = AsyncMock()
+    message = SimpleNamespace(reply_document=reply_document)
+    update = SimpleNamespace(
+        message=message,
+        effective_user=SimpleNamespace(id=1002),
+        effective_chat=SimpleNamespace(type="private"),
+    )
+    context = SimpleNamespace(bot_data={"settings": _build_settings(approved)})
+
+    sent = await _send_generated_files_from_response(
+        update=update,
+        context=context,
+        claude_response=response,
+        scope_state={"current_directory": current_dir},
+        reply_to_message_id=9901,
+    )
+
+    assert sent == 1
+    kwargs = reply_document.await_args.kwargs
+    assert kwargs["filename"] == "report.pdf"
+    assert kwargs["caption"] == "📎 已回传文件：report.pdf"
+    assert kwargs["reply_to_message_id"] == 9901
