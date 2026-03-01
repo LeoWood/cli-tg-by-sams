@@ -174,7 +174,7 @@ poetry run python -m src.main
 | `/start` | 显示欢迎页与快捷入口 | 全部 |
 | `/help` | 查看完整命令说明 | 全部 |
 | `/engine [claude\|codex]` | 切换 CLI 引擎（也可不带参数走按钮） | 全部 |
-| `/resume` | 恢复桌面端最近会话 | 全部 |
+| `/resume` | 恢复最近会话（默认按当前目录直达） | 全部 |
 | `/new` | 清除当前绑定并新建会话 | 全部 |
 | `/continue [message]` | 显式续接当前会话 | 全部 |
 | `/end` | 结束当前会话 | 全部 |
@@ -188,11 +188,11 @@ poetry run python -m src.main
 | `/pwd` | 查看当前目录 | 全部 |
 | `/projects` | 显示可用项目 | 全部 |
 | `/git` | Git 仓库信息与操作入口 | 全部 |
-| `/actions` | 快捷动作菜单 | 全部 |
+| `/actions` | 快捷动作菜单（含 `Resume` 入口） | 全部 |
 | `/export` | 导出当前会话 | 全部 |
 | `/cancel` | 取消当前运行中的任务 | 全部 |
 | `/provider` | Claude 通道切换（cc-switch） | Claude |
-| `/restartbot` | 远程重启 bot（管理员） | 全部 |
+| `/restartbot` | 远程重启 bot（管理员，重启前会先刷新会话持久化） | 全部 |
 | `/opsstatus` | 查看运行态诊断信息（管理员） | 全部 |
 
 ### 会话导出说明
@@ -208,6 +208,15 @@ poetry run python -m src.main
 - 发送图片 = 引擎分析截图/图表（能力取决于当前引擎与模式）
 - 会话按“用户 + 会话作用域（私聊/群聊话题）+ 目录”维护
 - 引擎切换后会清理旧会话绑定，并引导你重新选择目录与可恢复会话
+
+### 快捷动作菜单（当前）
+
+- `Projects`：选择项目目录
+- `Files`：浏览当前目录文件
+- `Status`：查看当前会话与引擎状态
+- `New`：创建新会话
+- `Resume`：直接恢复当前目录可续接会话（不再强制先选目录）
+- `Help`：打开帮助信息
 
 ## 安全模型
 
@@ -237,6 +246,8 @@ poetry run python -m src.main
 | `Authentication failed` | User ID 不在白名单 | 检查 `ALLOWED_USERS` |
 | `Rate limit exceeded` | 请求过于频繁 | 调整 `RATE_LIMIT_*` 配置 |
 | Bot 无响应 | Token 错误或进程未启动 | 检查 `TELEGRAM_BOT_TOKEN` 和进程状态 |
+| `Action Blocked by Security Policy` | 远程 TG 会话中触发了受限运维命令 | 重启用 `/restartbot`，诊断用 `/opsstatus` |
+| `Tool Access Blocked` | 请求依赖了白名单外工具 | 调整 `CLAUDE_ALLOWED_TOOLS` 或改写任务 |
 | `Claude process error: exit code 1` | 常见于引擎/模型不匹配 | 先 `/engine claude`，再 `/model` 选 Claude 模型或执行 `/model default` |
 | `invalid claude code request` | SDK 显式 setting sources 与网关不兼容 | 保持 `CLAUDE_SETTING_SOURCES` 为空；若需要强制来源再设为 `user,project,local` |
 
@@ -269,3 +280,4 @@ make format       # 自动格式化代码
 - [claude-agent-sdk](https://pypi.org/project/claude-agent-sdk/)
 - [Telegram Bot API](https://core.telegram.org/bots/api)
 - [Poetry 文档](https://python-poetry.org/docs/)
+- [iCloud 远程重启 cli-tg（launchd 监听）文档](docs/icloud-remote-restart-cli-tg-launchd.md)
