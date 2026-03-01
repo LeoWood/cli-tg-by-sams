@@ -153,6 +153,7 @@ class ClaudeIntegration:
                                 list(blocked_tools),
                                 self.config.claude_allowed_tools or [],
                                 admin_instructions,
+                                validation_errors=validation_errors,
                             )
 
                             raise ClaudeToolValidationError(
@@ -1129,36 +1130,86 @@ class ClaudeIntegration:
         blocked_tools: List[str],
         allowed_tools: List[str],
         admin_instructions: str,
+        *,
+        validation_errors: Optional[List[str]] = None,
     ) -> str:
         """Create a comprehensive error message for tool validation failures."""
+        validation_errors = validation_errors or []
         tool_list = ", ".join(f"`{tool}`" for tool in blocked_tools)
         allowed_list = (
             ", ".join(f"`{tool}`" for tool in allowed_tools)
             if allowed_tools
             else "None"
         )
+        primary_error = validation_errors[0] if validation_errors else ""
+        is_operational_block = "Operational command blocked" in primary_error
+        is_dangerous_command = "Dangerous command pattern detected" in primary_error
 
-        message = [
-            "🚫 **Tool Access Blocked**",
-            "",
-            f"Claude tried to use tools that are not currently allowed:",
-            f"{tool_list}",
-            "",
-            "**Why this happened:**",
-            "• Claude needs these tools to complete your request",
-            "• These tools are not in the allowed tools list",
-            "• This is a security feature to control what Claude can do",
-            "",
-            "**What you can do:**",
-            "• Contact the administrator to request access to these tools",
-            "• Try rephrasing your request to use different approaches",
-            "• Use simpler requests that don't require these tools",
-            "",
-            "**Currently allowed tools:**",
-            f"{allowed_list}",
-            "",
-            admin_instructions,
-        ]
+        if blocked_tools:
+            message = [
+                "🚫 **Tool Access Blocked**",
+                "",
+                "The execution engine tried to use tools that are not currently allowed:",
+                f"{tool_list}",
+                "",
+                "**Why this happened:**",
+                "• The request needs tools outside the configured allowlist",
+                "• This is a security feature to control what the engine can do",
+                "",
+                "**What you can do:**",
+                "• Contact the administrator to request access to these tools",
+                "• Try rephrasing your request to use different approaches",
+                "• Use simpler requests that don't require these tools",
+                "",
+                "**Currently allowed tools:**",
+                f"{allowed_list}",
+                "",
+                admin_instructions,
+            ]
+        else:
+            title = "🚫 **Action Blocked by Security Policy**"
+            if is_dangerous_command:
+                title = "🚫 **Dangerous Command Blocked**"
+
+            message = [
+                title,
+                "",
+                "The execution engine attempted an action that is blocked in remote Telegram sessions.",
+            ]
+
+            if primary_error:
+                message.extend(
+                    [
+                        "",
+                        "**Blocked reason:**",
+                        f"`{self._escape_markdown_text(primary_error)}`",
+                    ]
+                )
+
+            message.extend(
+                [
+                    "",
+                    "**What you can do:**",
+                ]
+            )
+
+            if is_operational_block:
+                message.extend(
+                    [
+                        "• Use `/restartbot` for restart",
+                        "• Use `/opsstatus` for diagnostics",
+                    ]
+                )
+            else:
+                message.append(
+                    "• Contact the administrator if this operation should be allowed"
+                )
+
+            message.extend(
+                [
+                    "• Rephrase the request to avoid restricted operations",
+                ]
+            )
 
         return "\n".join(message)
 

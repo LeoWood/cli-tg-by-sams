@@ -50,3 +50,26 @@ async def test_validate_tool_call_allows_regular_shell_commands(tmp_path: Path):
 
     assert valid is True
     assert error is None
+
+
+@pytest.mark.asyncio
+async def test_validate_tool_call_does_not_block_keyword_in_search_pattern(
+    tmp_path: Path,
+):
+    """Search patterns mentioning `make run` should not be treated as restart ops."""
+    monitor = ToolMonitor(_build_config(tmp_path))
+
+    valid, error = await monitor.validate_tool_call(
+        "Bash",
+        {
+            "command": (
+                "/bin/zsh -lc 'rg -n "
+                '"restart|restartbot|resume|make run|tmux-bot|status" README.md\''
+            )
+        },
+        tmp_path,
+        user_id=12345,
+    )
+
+    assert valid is True
+    assert error is None

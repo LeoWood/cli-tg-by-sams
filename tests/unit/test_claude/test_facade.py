@@ -459,7 +459,7 @@ class TestClaudeIntegrationFacade:
 
         facade._execute_with_fallback = AsyncMock(side_effect=_fake_execute)
 
-        with pytest.raises(ClaudeToolValidationError):
+        with pytest.raises(ClaudeToolValidationError) as exc_info:
             await facade.run_command(
                 prompt="restart",
                 working_directory=tmp_path,
@@ -467,6 +467,8 @@ class TestClaudeIntegrationFacade:
                 session_id="session-local",
             )
 
+        assert "Action Blocked by Security Policy" in str(exc_info.value)
+        assert "execution engine attempted an action" in str(exc_info.value)
         session_manager.update_session.assert_not_awaited()
 
     async def test_get_precise_context_usage_probes_codex_status(self, tmp_path):
