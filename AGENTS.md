@@ -18,18 +18,19 @@
 - `make test`：运行 `pytest`
 - `make lint`：`black --check` + `isort --check-only` + `flake8` + `mypy`
 - `make format`：自动格式化 `src/`、`tests/`
-- `make run`：通过 `scripts/tmux-bot.sh restart` 重启并校验单实例
-- `make run-debug`：调试模式重启（`BOT_DEBUG=1`）
+- `make run`：通过 `scripts/tmux-bot.sh restart-detached` 后台触发重启（默认推荐）
+- `make run-debug`：调试模式后台重启（`BOT_DEBUG=1`）
 - `make run-local`：前台直接运行 bot（不走 tmux）
 - `make bot-stop|bot-status|bot-logs|bot-attach`：运维辅助命令
 
 ## 运行与重启流程（当前实现）
 默认使用 `tmux` 托管进程，不建议手写 `tmux new-session` 命令。
 
-1. 标准重启：`./scripts/tmux-bot.sh restart`（或 `make run`）。
-2. 停止服务：`./scripts/tmux-bot.sh stop`（或 `make bot-stop`）。
-3. 查看状态：`./scripts/tmux-bot.sh status`（或 `make bot-status`）。
-4. 查看日志：`./scripts/tmux-bot.sh logs`（或 `make bot-logs`）。
+1. 标准重启（默认推荐，后台触发）：`./scripts/tmux-bot.sh restart-detached`（或 `make run`）。
+2. 同步重启（需要立即拿到启动校验结果）：`./scripts/tmux-bot.sh restart`。
+3. 停止服务：`./scripts/tmux-bot.sh stop`（或 `make bot-stop`）。
+4. 查看状态：`./scripts/tmux-bot.sh status`（或 `make bot-status`）。
+5. 查看日志：`./scripts/tmux-bot.sh logs`（或 `make bot-logs`）。
 
 实现细节（以脚本为准）：
 - 会先清理旧 tmux session 与残留 bot 进程，再启动新实例。
@@ -42,6 +43,7 @@
 
 注意：
 - 仅在用户明确要求“重启”时执行重启操作。
+- 通过 Telegram 远程协作时，若用户仅要求“重启”，默认只执行单条命令 `./scripts/tmux-bot.sh restart`；除非用户明确要求，否则不附带 `status/logs` 检测。
 - 不要在文档中硬编码机器本地绝对路径或固定 bot 用户名。
 
 ## 代码风格与命名约定

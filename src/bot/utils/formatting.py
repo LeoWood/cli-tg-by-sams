@@ -809,7 +809,7 @@ class ResponseFormatter:
             ],
             [
                 InlineKeyboardButton("🆕 New", callback_data="action:new_session"),
-                InlineKeyboardButton("🌿 Git", callback_data="git:status"),
+                InlineKeyboardButton("🔁 Resume", callback_data="action:resume"),
                 InlineKeyboardButton("❓ Help", callback_data="action:help"),
             ],
         ]

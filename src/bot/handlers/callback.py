@@ -703,6 +703,7 @@ async def handle_action_callback(
         "help": _handle_help_action,
         "show_projects": _handle_show_projects_action,
         "new_session": _handle_new_session_action,
+        "resume": _handle_resume_action,
         "continue": _handle_continue_action,
         "end_session": _handle_end_session_action,
         "context": _handle_status_action,
@@ -1053,6 +1054,60 @@ async def _handle_continue_action(query, context: ContextTypes.DEFAULT_TYPE) -> 
                 await typing_heartbeat_task
             except asyncio.CancelledError:
                 pass
+
+
+async def _handle_resume_action(query, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle resume action by directly targeting current directory."""
+    user_id = query.from_user.id
+    settings: Settings = context.bot_data["settings"]
+    _, scope_state = _get_scope_state_for_query(query, context)
+    active_engine = get_active_cli_engine(scope_state)
+
+    scanner = _get_or_create_resume_scanner(
+        context=context,
+        settings=settings,
+        engine=active_engine,
+    )
+    token_mgr = _get_or_create_resume_token_manager(context)
+
+    try:
+        current_dir_raw = scope_state.get("current_directory")
+        approved_root = settings.approved_directory.resolve()
+        if current_dir_raw is None:
+            current_dir = approved_root
+        else:
+            try:
+                current_dir = Path(current_dir_raw).resolve()
+            except (OSError, TypeError, ValueError):
+                current_dir = approved_root
+
+        if not current_dir.is_relative_to(approved_root):
+            current_dir = approved_root
+
+        project_token = token_mgr.issue(
+            kind="p",
+            user_id=user_id,
+            payload={
+                "cwd": str(current_dir),
+                "engine": active_engine,
+            },
+        )
+
+        await _resume_select_project(
+            query,
+            user_id,
+            project_token,
+            token_mgr,
+            scanner,
+            settings,
+            context,
+            engine=active_engine,
+        )
+    except Exception as exc:
+        logger.error("Error in resume action", error=str(exc), user_id=user_id)
+        await _edit_query_message_resilient(
+            query, f"Failed to scan desktop sessions: {exc}"
+        )
 
 
 async def _handle_status_action(query, context: ContextTypes.DEFAULT_TYPE) -> None:

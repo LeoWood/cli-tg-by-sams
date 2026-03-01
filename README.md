@@ -143,10 +143,10 @@ codex login status
 ### Step 8: 启动
 
 ```bash
-# 普通启动（通过 tmux 托管，自动重启并校验单实例）
+# 普通启动（通过 tmux 托管，后台触发重启，推荐）
 make run
 
-# Debug 日志启动（tmux 托管）
+# Debug 日志启动（tmux 托管，后台触发重启）
 make run-debug
 
 # 前台直接运行（不经过 tmux）
@@ -255,8 +255,8 @@ poetry run python -m src.main
 ```bash
 make dev          # 安装所有依赖 (含开发依赖)
 make install      # 仅安装生产依赖
-make run          # tmux 托管重启（单实例校验）
-make run-debug    # tmux 托管 Debug 重启
+make run          # tmux 托管后台重启（默认推荐）
+make run-debug    # tmux 托管 Debug 后台重启
 make run-local    # 当前终端前台运行
 make test         # 运行测试 + 覆盖率
 make lint         # Black + isort + flake8 + mypy

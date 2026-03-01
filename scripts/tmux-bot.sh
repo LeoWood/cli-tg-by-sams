@@ -6,6 +6,7 @@ SESSION_NAME="${BOT_TMUX_SESSION:-cli_tg_bot}"
 PROJECT_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 STARTUP_WAIT_SECONDS="${BOT_STARTUP_WAIT_SECONDS:-3}"
 LOG_TAIL_LINES="${BOT_LOG_TAIL_LINES:-120}"
+DETACHED_RESTART_LOG="${BOT_DETACHED_RESTART_LOG:-$PROJECT_ROOT/logs/restart-detached.log}"
 
 log() {
   printf '[tmux-bot] %s\n' "$*"
@@ -110,6 +111,14 @@ attach_bot() {
   tmux attach -t "$SESSION_NAME"
 }
 
+restart_bot_detached() {
+  mkdir -p "$(dirname "$DETACHED_RESTART_LOG")"
+  nohup "$0" restart >"$DETACHED_RESTART_LOG" 2>&1 < /dev/null &
+  local dispatcher_pid="$!"
+  log "detached restart scheduled (dispatcher pid: $dispatcher_pid)"
+  log "detached restart log: $DETACHED_RESTART_LOG"
+}
+
 case "$ACTION" in
   start)
     start_bot
@@ -121,6 +130,9 @@ case "$ACTION" in
     stop_bot
     start_bot
     ;;
+  restart-detached)
+    restart_bot_detached
+    ;;
   status)
     status_bot
     ;;
@@ -131,8 +143,7 @@ case "$ACTION" in
     attach_bot
     ;;
   *)
-    log "unknown action '$ACTION'. usage: $0 {start|stop|restart|status|logs|attach}"
+    log "unknown action '$ACTION'. usage: $0 {start|stop|restart|restart-detached|status|logs|attach}"
     exit 1
     ;;
 esac
-

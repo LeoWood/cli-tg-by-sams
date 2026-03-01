@@ -9,11 +9,13 @@ import pytest
 from src.bot.handlers.command import restart_bot_command
 
 
-def _build_update(user_id: int, chat_id: int) -> SimpleNamespace:
+def _build_update(
+    user_id: int, chat_id: int, message_thread_id: int | None = None
+) -> SimpleNamespace:
     """Build minimal Telegram update stub."""
     message = SimpleNamespace(
         message_id=42,
-        message_thread_id=None,
+        message_thread_id=message_thread_id,
         reply_text=AsyncMock(),
     )
     return SimpleNamespace(
@@ -67,6 +69,7 @@ async def test_restartbot_schedules_detached_dispatcher(tmp_path, monkeypatch):
     assert create_call.args[2] == "123456781234"
     assert create_call.args[3] == str(user_id)
     assert create_call.args[4] == str(chat_id)
+    assert create_call.args[5] == "0"
     assert create_call.kwargs["start_new_session"] is True
     assert create_call.kwargs["cwd"].endswith("cli-tg-by-sams")
 
@@ -108,3 +111,90 @@ async def test_restartbot_rejects_when_tmux_missing(tmp_path, monkeypatch):
     audit_logger.log_command.assert_awaited_once()
     assert audit_logger.log_command.await_args.kwargs["command"] == "restartbot"
     assert audit_logger.log_command.await_args.kwargs["success"] is False
+
+
+@pytest.mark.asyncio
+async def test_restartbot_passes_message_thread_id_to_dispatcher(tmp_path, monkeypatch):
+    """`/restartbot` should pass Telegram topic thread id to dispatcher script."""
+    user_id = 9501
+    chat_id = -1009501
+    thread_id = 77
+    update = _build_update(
+        user_id=user_id,
+        chat_id=chat_id,
+        message_thread_id=thread_id,
+    )
+    audit_logger = SimpleNamespace(log_command=AsyncMock())
+    context = SimpleNamespace(
+        bot_data={
+            "settings": SimpleNamespace(approved_directory=tmp_path),
+            "audit_logger": audit_logger,
+        },
+        user_data={},
+    )
+
+    dispatcher = SimpleNamespace(pid=8899)
+    create_exec = AsyncMock(return_value=dispatcher)
+    monkeypatch.setattr(
+        "src.bot.handlers.command.asyncio.create_subprocess_exec",
+        create_exec,
+    )
+    monkeypatch.setattr(
+        "src.bot.handlers.command.shutil.which",
+        lambda cmd: "/usr/bin/tmux" if cmd == "tmux" else None,
+    )
+
+    await restart_bot_command(update, context)
+
+    create_call = create_exec.await_args
+    assert create_call.args[3] == str(user_id)
+    assert create_call.args[4] == str(chat_id)
+    assert create_call.args[5] == str(thread_id)
+
+
+@pytest.mark.asyncio
+async def test_restartbot_flushes_persistence_before_dispatch(tmp_path, monkeypatch):
+    """`/restartbot` should flush PTB persistence before spawning dispatcher."""
+    user_id = 9601
+    chat_id = 9701
+    update = _build_update(user_id=user_id, chat_id=chat_id)
+    audit_logger = SimpleNamespace(log_command=AsyncMock())
+    event_order: list[str] = []
+
+    async def _flush_persistence():
+        event_order.append("flush")
+
+    application = SimpleNamespace(update_persistence=AsyncMock(side_effect=_flush_persistence))
+    context = SimpleNamespace(
+        bot_data={
+            "settings": SimpleNamespace(approved_directory=tmp_path),
+            "audit_logger": audit_logger,
+        },
+        user_data={},
+        application=application,
+    )
+
+    dispatcher = SimpleNamespace(pid=9988)
+
+    async def _spawn_dispatcher(*args, **kwargs):
+        event_order.append("spawn")
+        return dispatcher
+
+    create_exec = AsyncMock(side_effect=_spawn_dispatcher)
+    monkeypatch.setattr(
+        "src.bot.handlers.command.asyncio.create_subprocess_exec",
+        create_exec,
+    )
+    monkeypatch.setattr(
+        "src.bot.handlers.command.shutil.which",
+        lambda cmd: "/usr/bin/tmux" if cmd == "tmux" else None,
+    )
+
+    await restart_bot_command(update, context)
+
+    application.update_persistence.assert_awaited_once()
+    create_exec.assert_awaited_once()
+    assert event_order[:2] == ["flush", "spawn"]
+
+    reply_call = update.message.reply_text.await_args
+    assert "已完成会话状态持久化" in reply_call.args[0]

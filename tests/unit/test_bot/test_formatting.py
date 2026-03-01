@@ -362,10 +362,17 @@ class TestResponseFormatter:
         assert keyboard is not None
         assert len(keyboard.inline_keyboard) > 0
 
+        button_pairs = [
+            (button.text, button.callback_data)
+            for row in keyboard.inline_keyboard
+            for button in row
+        ]
+        assert ("🔁 Resume", "action:resume") in button_pairs
+
         # Check that buttons have callback data
         for row in keyboard.inline_keyboard:
             for button in row:
-                assert button.callback_data.startswith(("action:", "git:"))
+                assert button.callback_data.startswith("action:")
 
     def test_confirmation_keyboard(self, formatter):
         """Test confirmation keyboard creation."""

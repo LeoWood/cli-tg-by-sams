@@ -3,7 +3,7 @@
 import asyncio
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, Mock
 
 import pytest
 
@@ -494,6 +494,55 @@ async def test_execute_command_emits_codex_init_update(tmp_path, monkeypatch):
     assert updates[0].metadata["subtype"] == "init"
     assert updates[0].metadata["engine"] == "codex"
     assert updates[0].metadata["model"] == "gpt-5"
+
+
+@pytest.mark.asyncio
+async def test_execute_command_codex_exec_with_images_writes_prompt_to_stdin(
+    tmp_path, monkeypatch
+):
+    """Codex exec + images should force stdin prompt mode for non-TTY subprocesses."""
+    manager = _build_manager(tmp_path)
+    monkeypatch.setattr(
+        "src.claude.sdk_integration.find_claude_cli",
+        lambda _: "/usr/local/bin/codex",
+    )
+
+    captured = {}
+    fake_stdin = SimpleNamespace(write=Mock(), drain=AsyncMock(), close=Mock())
+
+    async def _fake_start_process(cmd, _cwd, *, stdin_payload=None):
+        captured["cmd"] = cmd
+        captured["stdin_payload"] = stdin_payload
+        return SimpleNamespace(stdin=fake_stdin)
+
+    async def _fake_handle_process_output(*_args, **_kwargs):
+        return SimpleNamespace(
+            content="ok",
+            session_id="sid-1",
+            cost=0.0,
+            duration_ms=1,
+            num_turns=1,
+            is_error=False,
+            error_type=None,
+            tools_used=[],
+            model_usage=None,
+        )
+
+    monkeypatch.setattr(manager, "_start_process", _fake_start_process)
+    monkeypatch.setattr(manager, "_handle_process_output", _fake_handle_process_output)
+
+    await manager.execute_command(
+        prompt="请分析这张图",
+        working_directory=tmp_path,
+        images=[{"file_path": "/tmp/a.png"}],
+    )
+
+    assert captured["stdin_payload"] == "请分析这张图"
+    assert captured["cmd"][-1] == "-"
+    fake_stdin.write.assert_any_call("请分析这张图".encode("utf-8"))
+    fake_stdin.write.assert_any_call(b"\n")
+    fake_stdin.drain.assert_awaited_once()
+    fake_stdin.close.assert_called_once()
 
 
 def test_parse_stream_message_supports_codex_turn_context_model(tmp_path):

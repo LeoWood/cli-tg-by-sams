@@ -244,6 +244,37 @@ def test_log_level_validation():
         assert settings.log_level == "DEBUG"
 
 
+def test_telegram_user_data_persistence_path_default_value(tmp_path):
+    """Default Telegram user_data persistence path should be enabled."""
+    projects = tmp_path / "projects"
+    projects.mkdir()
+
+    settings = Settings(
+        telegram_bot_token="test_token",
+        telegram_bot_username="test_bot",
+        approved_directory=str(projects),
+    )
+
+    assert settings.telegram_user_data_persistence_path == Path(
+        "data/telegram-user-data.pkl"
+    )
+
+
+def test_telegram_user_data_persistence_path_empty_disables(tmp_path):
+    """Empty path should disable Telegram user_data persistence."""
+    projects = tmp_path / "projects"
+    projects.mkdir()
+
+    settings = Settings(
+        telegram_bot_token="test_token",
+        telegram_bot_username="test_bot",
+        approved_directory=str(projects),
+        telegram_user_data_persistence_path="  ",
+    )
+
+    assert settings.telegram_user_data_persistence_path is None
+
+
 def test_computed_properties(tmp_path):
     """Test computed properties."""
     test_dir = tmp_path / "projects"

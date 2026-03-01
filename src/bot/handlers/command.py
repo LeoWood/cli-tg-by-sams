@@ -53,6 +53,42 @@ def _get_project_root() -> Path:
     return Path(__file__).resolve().parents[3]
 
 
+async def _flush_user_data_persistence_before_restart(
+    context: ContextTypes.DEFAULT_TYPE,
+    *,
+    request_id: str,
+    user_id: int,
+) -> bool:
+    """Force user_data persistence flush before restart dispatch."""
+    application = getattr(context, "application", None)
+    update_persistence = getattr(application, "update_persistence", None)
+    if not callable(update_persistence):
+        logger.warning(
+            "Skip Telegram persistence flush: update_persistence unavailable",
+            request_id=request_id,
+            user_id=user_id,
+        )
+        return False
+
+    try:
+        await update_persistence()
+        logger.info(
+            "Flushed Telegram user_data persistence before restart",
+            request_id=request_id,
+            user_id=user_id,
+        )
+        return True
+    except Exception as exc:
+        logger.warning(
+            "Failed to flush Telegram user_data persistence before restart",
+            request_id=request_id,
+            user_id=user_id,
+            error=str(exc),
+            error_type=type(exc).__name__,
+        )
+        return False
+
+
 async def _run_command_capture(
     *args: str,
     cwd: Path | None = None,
@@ -1789,6 +1825,7 @@ async def restart_bot_command(
     """Handle /restartbot command for controlled remote restart."""
     user_id = update.effective_user.id
     chat_id = getattr(update.effective_chat, "id", None)
+    message_thread_id = getattr(update.effective_message, "message_thread_id", None)
     settings: Settings = context.bot_data["settings"]
     scope_key, scope_state = get_scope_state_from_update(
         user_data=context.user_data,
@@ -1806,6 +1843,7 @@ async def restart_bot_command(
         request_id=request_id,
         user_id=user_id,
         chat_id=chat_id,
+        message_thread_id=message_thread_id,
         scope_key=scope_key,
         active_engine=get_active_cli_engine(scope_state),
         current_directory=str(
@@ -1856,12 +1894,24 @@ async def restart_bot_command(
             )
         return
 
+    persistence_flushed = await _flush_user_data_persistence_before_restart(
+        context,
+        request_id=request_id,
+        user_id=user_id,
+    )
+
+    persistence_hint = (
+        "\n已完成会话状态持久化。"
+        if persistence_flushed
+        else "\n⚠️ 未确认会话状态持久化，重启后可用 `/resume` 恢复。"
+    )
     await _reply_update_message_resilient(
         update,
         context,
         "♻️ 已收到重启请求。\n"
         f"request_id: `{request_id}`\n"
-        "服务将在约 2 秒内重启，期间会短暂断开。",
+        "服务将在约 2 秒内重启，期间会短暂断开。"
+        f"{persistence_hint}",
         parse_mode="Markdown",
     )
 
@@ -1872,6 +1922,7 @@ async def restart_bot_command(
             request_id,
             str(user_id),
             str(chat_id if isinstance(chat_id, int) else 0),
+            str(message_thread_id if isinstance(message_thread_id, int) else 0),
             cwd=str(project_root),
             stdout=asyncio.subprocess.DEVNULL,
             stderr=asyncio.subprocess.DEVNULL,
@@ -1883,6 +1934,7 @@ async def restart_bot_command(
             dispatcher_pid=dispatcher.pid,
             user_id=user_id,
             chat_id=chat_id,
+            message_thread_id=message_thread_id,
         )
         if audit_logger:
             await audit_logger.log_command(
@@ -1909,7 +1961,8 @@ async def restart_bot_command(
         await _reply_update_message_resilient(
             update,
             context,
-            "❌ 重启调度失败，请稍后重试或在主机执行 `./scripts/tmux-bot.sh restart`。",
+            "❌ 重启调度失败，请稍后重试或在主机执行 "
+            "`./scripts/tmux-bot.sh restart-detached`。",
             parse_mode="Markdown",
         )
 

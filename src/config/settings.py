@@ -242,6 +242,13 @@ class Settings(BaseSettings):
         ge=2,
         le=128,
     )
+    telegram_user_data_persistence_path: Optional[Path] = Field(
+        Path("data/telegram-user-data.pkl"),
+        description=(
+            "Pickle file path for Telegram user_data persistence; "
+            "set empty value to disable"
+        ),
+    )
     polling_update_stall_seconds: float = Field(
         0.0,
         description=(
@@ -309,6 +316,21 @@ class Settings(BaseSettings):
             sources = [str(item).strip() for item in v if str(item).strip()]
             return sources or None
         return v  # type: ignore[no-any-return]
+
+    @field_validator("telegram_user_data_persistence_path", mode="before")
+    @classmethod
+    def parse_telegram_user_data_persistence_path(cls, v: Any) -> Optional[Path]:
+        """Allow empty string to disable Telegram user_data persistence."""
+        if v is None:
+            return None
+        if isinstance(v, str):
+            normalized = v.strip()
+            if not normalized:
+                return None
+            return Path(normalized)
+        if isinstance(v, Path):
+            return v
+        return Path(str(v))
 
     @field_validator("approved_directory")
     @classmethod

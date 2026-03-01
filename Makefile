@@ -9,8 +9,8 @@ help:
 	@echo "  lint       - Run linting checks"
 	@echo "  format     - Format code"
 	@echo "  clean      - Clean up generated files"
-	@echo "  run        - Restart bot in tmux session (fixed entry, single instance)"
-	@echo "  run-debug  - Restart bot in tmux session with --debug"
+	@echo "  run        - Detached restart in tmux session (recommended default)"
+	@echo "  run-debug  - Detached restart in tmux session with --debug"
 	@echo "  run-local  - Run bot in current foreground shell"
 	@echo "  bot-stop   - Stop tmux bot session and residual bot processes"
 	@echo "  bot-status - Show tmux/process status (expects exactly one bot process)"
@@ -44,11 +44,11 @@ clean:
 	rm -rf .coverage htmlcov/ .pytest_cache/ dist/ build/
 
 run:
-	./scripts/tmux-bot.sh restart
+	./scripts/tmux-bot.sh restart-detached
 
 # For debugging
 run-debug:
-	BOT_DEBUG=1 ./scripts/tmux-bot.sh restart
+	BOT_DEBUG=1 ./scripts/tmux-bot.sh restart-detached
 
 run-local:
 	poetry run cli-tg-bot

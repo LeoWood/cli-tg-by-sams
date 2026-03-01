@@ -8,9 +8,10 @@ Features:
 """
 
 import asyncio
+import pickle
 import time
 from pathlib import Path
-from typing import Any, Callable, Dict, Optional
+from typing import Any, Callable, Dict, List, MutableMapping, Optional, Tuple
 
 import structlog
 from telegram import Update
@@ -20,6 +21,8 @@ from telegram.ext import (
     CallbackQueryHandler,
     CommandHandler,
     ContextTypes,
+    PersistenceInput,
+    PicklePersistence,
     MessageHandler,
     MessageReactionHandler,
     TypeHandler,
@@ -32,6 +35,7 @@ from ..exceptions import ClaudeCodeTelegramError
 from .features.registry import FeatureRegistry
 from .utils.cli_engine import get_default_cli_engine
 from .utils.command_menu import build_bot_commands_for_engine
+from .utils.scope_state import SCOPE_STATE_CONTAINER_KEY
 from .utils.telegram_send import send_message_resilient
 from .utils.update_dedupe import UpdateDedupeCache
 from .utils.update_offset_store import UpdateOffsetStore
@@ -53,6 +57,12 @@ _DEFAULT_TELEGRAM_GET_UPDATES_READ_TIMEOUT_SECONDS = 50.0
 _DEFAULT_TELEGRAM_GET_UPDATES_POOL_TIMEOUT_SECONDS = 30.0
 _DEFAULT_TELEGRAM_GET_UPDATES_CONNECTION_POOL_SIZE = 16
 _DEFAULT_POLLING_UPDATE_STALL_SECONDS = 0.0
+_DEFAULT_TELEGRAM_USER_DATA_PERSISTENCE_PATH = Path("data/telegram-user-data.pkl")
+_USER_DATA_PERSISTENCE_UPDATE_INTERVAL_SECONDS = 10.0
+_STARTUP_RECOVERY_BROADCAST_TEXT = (
+    "♻️ Bot 服务已恢复在线（全局重启完成）。\n"
+    "你可以继续在当前会话发送消息。"
+)
 
 
 class ClaudeCodeBot:
@@ -109,6 +119,59 @@ class ClaudeCodeBot:
             _DEFAULT_POLLING_UPDATE_STALL_SECONDS,
             minimum=0.0,
         )
+
+    def _resolve_user_data_persistence_path(self) -> Optional[Path]:
+        """Resolve Telegram user_data persistence file path from settings."""
+        raw_value = getattr(
+            self.settings,
+            "telegram_user_data_persistence_path",
+            _DEFAULT_TELEGRAM_USER_DATA_PERSISTENCE_PATH,
+        )
+        if raw_value is None:
+            return None
+        text = str(raw_value).strip()
+        if not text:
+            return None
+        return Path(text).expanduser()
+
+    def _build_user_data_persistence(self) -> Optional[PicklePersistence]:
+        """Create PTB persistence for scoped user_data state."""
+        path = self._resolve_user_data_persistence_path()
+        if path is None:
+            logger.info("Telegram user_data persistence disabled")
+            return None
+
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+        except OSError as exc:
+            logger.warning(
+                "Failed to prepare Telegram persistence directory",
+                path=str(path),
+                error=str(exc),
+            )
+            return None
+
+        try:
+            persistence = PicklePersistence(
+                filepath=path,
+                store_data=PersistenceInput(
+                    user_data=True,
+                    chat_data=False,
+                    bot_data=False,
+                    callback_data=False,
+                ),
+                update_interval=_USER_DATA_PERSISTENCE_UPDATE_INTERVAL_SECONDS,
+            )
+        except Exception as exc:
+            logger.warning(
+                "Failed to initialize Telegram user_data persistence",
+                path=str(path),
+                error=str(exc),
+            )
+            return None
+
+        logger.info("Telegram user_data persistence enabled", path=str(path))
+        return persistence
 
     async def initialize(self) -> None:
         """Initialize bot application."""
@@ -169,6 +232,11 @@ class ClaudeCodeBot:
         builder.get_updates_read_timeout(get_updates_read_timeout_seconds)
         builder.get_updates_pool_timeout(get_updates_pool_timeout_seconds)
         builder.get_updates_connection_pool_size(get_updates_connection_pool_size)
+
+        persistence = self._build_user_data_persistence()
+        if persistence is not None:
+            builder.persistence(persistence)
+
         logger.info(
             "Configured Telegram transport options",
             connect_timeout_seconds=connect_timeout_seconds,
@@ -658,6 +726,110 @@ class ClaudeCodeBot:
             error_callback=self._polling_error_callback,
         )
 
+    def _collect_startup_notification_targets(
+        self,
+    ) -> List[Tuple[int, Optional[int]]]:
+        """Collect unique chat/topic targets from app memory and persistence file."""
+        app = self.app
+        targets: set[Tuple[int, int]] = set()
+
+        def _collect_from_user_data_map(user_data_map: Any) -> None:
+            if not isinstance(user_data_map, MutableMapping):
+                return
+            for scoped_user_data in user_data_map.values():
+                if not isinstance(scoped_user_data, dict):
+                    continue
+                scope_map = scoped_user_data.get(SCOPE_STATE_CONTAINER_KEY)
+                if not isinstance(scope_map, dict):
+                    continue
+                for raw_scope_key in scope_map.keys():
+                    scope_key = str(raw_scope_key)
+                    parts = scope_key.split(":")
+                    if len(parts) != 3:
+                        continue
+                    try:
+                        chat_id = int(parts[1])
+                        thread_id = int(parts[2])
+                    except (TypeError, ValueError):
+                        continue
+                    if chat_id == 0:
+                        continue
+                    targets.add((chat_id, thread_id if thread_id > 1 else 0))
+
+        if app is not None:
+            _collect_from_user_data_map(getattr(app, "user_data", None))
+
+        persisted_user_data = self._load_user_data_from_persistence_file()
+        _collect_from_user_data_map(persisted_user_data)
+
+        ordered_targets = sorted(targets, key=lambda item: (item[0], item[1]))
+        return [
+            (chat_id, thread_id if thread_id > 1 else None)
+            for chat_id, thread_id in ordered_targets
+        ]
+
+    def _load_user_data_from_persistence_file(self) -> Optional[Dict[Any, Any]]:
+        """Best-effort load PTB persisted user_data from pickle file."""
+        path = self._resolve_user_data_persistence_path()
+        if path is None or not path.exists():
+            return None
+
+        try:
+            with path.open("rb") as f:
+                payload = pickle.load(f)
+        except Exception as exc:
+            logger.warning(
+                "Failed to load Telegram user_data persistence file",
+                path=str(path),
+                error=str(exc),
+            )
+            return None
+
+        if not isinstance(payload, dict):
+            return None
+        user_data = payload.get("user_data")
+        if not isinstance(user_data, dict):
+            return None
+        return user_data
+
+    async def _broadcast_startup_recovery_notification(self) -> None:
+        """Broadcast startup recovery notification to all known chat scopes."""
+        app = self.app
+        if app is None:
+            return
+
+        targets = self._collect_startup_notification_targets()
+        if not targets:
+            logger.info("Startup recovery broadcast skipped: no known targets")
+            return
+
+        sent = 0
+        failed = 0
+        for chat_id, thread_id in targets:
+            try:
+                await send_message_resilient(
+                    bot=app.bot,
+                    chat_id=chat_id,
+                    text=_STARTUP_RECOVERY_BROADCAST_TEXT,
+                    message_thread_id=thread_id,
+                )
+                sent += 1
+            except Exception as exc:
+                failed += 1
+                logger.warning(
+                    "Failed to send startup recovery broadcast",
+                    chat_id=chat_id,
+                    message_thread_id=thread_id,
+                    error=str(exc),
+                )
+
+        logger.info(
+            "Startup recovery broadcast completed",
+            target_count=len(targets),
+            sent=sent,
+            failed=failed,
+        )
+
     async def _restart_polling(self, *, reason: str) -> bool:
         """Restart polling loop after network/proxy disruptions."""
         if not self.app:
@@ -827,6 +999,7 @@ class ClaudeCodeBot:
                 await self.app.start()
                 await self._start_polling()
                 self._reset_polling_recovery_state()
+                await self._broadcast_startup_recovery_notification()
 
                 # Keep running until manually stopped
                 while self.is_running:

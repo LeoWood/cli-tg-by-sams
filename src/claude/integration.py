@@ -128,6 +128,18 @@ class ClaudeProcessManager:
         )
         cli_kind = self._detect_cli_kind(cmd[0])
         cli_display_name = "Codex CLI" if cli_kind == "codex" else "Claude Code"
+        stdin_payload: Optional[str] = None
+        if cli_kind == "codex" and images and not continue_session:
+            # Codex exec with --image can ignore argv prompt in non-TTY subprocess mode.
+            # Force explicit stdin prompt mode to keep image analysis reliable.
+            normalized_prompt = str(prompt or "").strip()
+            if not normalized_prompt:
+                normalized_prompt = (
+                    "Please analyze the attached image(s) and describe what you see."
+                )
+            stdin_payload = normalized_prompt
+            if cmd:
+                cmd[-1] = "-"
 
         # Create process ID for tracking
         process_id = str(uuid.uuid4())
@@ -148,8 +160,22 @@ class ClaudeProcessManager:
                 )
 
             # Start process
-            process = await self._start_process(cmd, working_directory)
+            process = await self._start_process(
+                cmd, working_directory, stdin_payload=stdin_payload
+            )
             self.active_processes[process_id] = process
+            if stdin_payload is not None and process.stdin is not None:
+                try:
+                    process.stdin.write(stdin_payload.encode("utf-8"))
+                    if not stdin_payload.endswith("\n"):
+                        process.stdin.write(b"\n")
+                    await process.stdin.drain()
+                    process.stdin.close()
+                except Exception as e:
+                    logger.warning(
+                        "Failed to write Codex image prompt to stdin",
+                        error=str(e),
+                    )
 
             # Handle output with timeout
             result = await asyncio.wait_for(
@@ -409,13 +435,22 @@ class ClaudeProcessManager:
                 paths.append(file_path)
         return paths
 
-    async def _start_process(self, cmd: List[str], cwd: Path) -> Process:
+    async def _start_process(
+        self,
+        cmd: List[str],
+        cwd: Path,
+        *,
+        stdin_payload: Optional[str] = None,
+    ) -> Process:
         """Start Claude Code subprocess."""
         env = os.environ.copy()
         # Avoid nested Claude session detection when bot is launched from CLAUDECODE env.
         env.pop("CLAUDECODE", None)
         return await asyncio.create_subprocess_exec(
             *cmd,
+            stdin=(
+                asyncio.subprocess.PIPE if stdin_payload is not None else None
+            ),
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
             cwd=str(cwd),
