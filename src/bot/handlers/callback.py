@@ -673,7 +673,7 @@ async def handle_cd_callback(
             query,
             f"✅ **Directory Changed**\n\n"
             f"📂 Current directory: `{relative_path}/`\n\n"
-            f"🔄 Claude session cleared. You can now start coding in this directory!",
+            f"🔄 Session cleared. You can now start coding in this directory!",
             parse_mode="Markdown",
             reply_markup=reply_markup,
         )
@@ -1568,10 +1568,14 @@ async def _handle_start_coding_action(
     query, context: ContextTypes.DEFAULT_TYPE
 ) -> None:
     """Handle start coding action."""
+    _, scope_state = _get_scope_state_for_query(query, context)
+    active_engine = str(scope_state.get("cli_engine") or ENGINE_CODEX).strip().lower()
+    engine_label = "Codex" if active_engine == ENGINE_CODEX else "Claude"
+
     await _edit_query_message_resilient(
         query,
         "🚀 **Ready to Code!**\n\n"
-        "Send me any message to start coding with Claude:\n\n"
+        f"Send me any message to start coding with {engine_label}:\n\n"
         "**Examples:**\n"
         '• _"Create a Python script that..."_\n'
         '• _"Help me debug this code..."_\n'
@@ -1610,7 +1614,7 @@ async def _handle_quick_actions_action(
         query,
         "🛠️ **Quick Actions**\n\n"
         "Choose a common development task:\n\n"
-        "_Note: These will be fully functional once Claude Code integration is complete._",
+        "_Note: Availability depends on current engine and tool permissions._",
         parse_mode="Markdown",
         reply_markup=reply_markup,
     )

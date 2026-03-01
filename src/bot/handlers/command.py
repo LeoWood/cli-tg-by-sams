@@ -1649,7 +1649,7 @@ async def quick_actions(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
                 "**Try:**\n"
                 "• Navigating to a project directory with `/cd`\n"
                 "• Creating some code files\n"
-                "• Starting a Claude session with `/new`",
+                "• Starting a new session with `/new`",
             )
             return
 
@@ -1720,8 +1720,8 @@ async def git_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
                 "is not a git repository.\n\n"
                 f"**Options:**\n"
                 f"• Navigate to a git repository with `/cd`\n"
-                f"• Initialize a new repository (ask Claude to help)\n"
-                f"• Clone an existing repository (ask Claude to help)",
+                f"• Initialize a new repository (ask the assistant to help)\n"
+                f"• Clone an existing repository (ask the assistant to help)",
             )
             return
 
