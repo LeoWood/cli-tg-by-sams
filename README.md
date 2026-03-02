@@ -2,7 +2,7 @@
 
 通过 IM 远程操控 CLI 编码智能体，支持多引擎切换、多会话、工具权限审批、流式输出。
 
-基于 Python，当前集成 Telegram + Claude/Codex 双引擎。Long Polling 模式，无需公网 IP 或反向代理，启动即用。
+基于 Python，当前集成 Telegram + Codex/Claude 双引擎（Codex 为主，Claude 备选）。Long Polling 模式，无需公网 IP 或反向代理，启动即用。
 
 ## 架构概览
 
@@ -16,21 +16,21 @@ IM 平台 API
 本地 Python Bot 进程
     |  引擎抽象层 (SDK / CLI 子进程)
     v
-CLI 编码智能体 (Claude / Codex / ...)
+CLI 编码智能体 (Codex / Claude / ...)
     |  结果解析 + SQLite 存储
     v
 IM 回复用户
 ```
 
-Bot 使用 Long Polling 模式主动拉取消息，不需要公网 IP 或反向代理。引擎集成采用双后端架构：SDK 为主、CLI 子进程兜底，失败时自动切换。
+Bot 使用 Long Polling 模式主动拉取消息，不需要公网 IP 或反向代理。默认优先 Codex 引擎；Claude 可按需切换作为备选。
 
 ## 前置要求
 
 - Python 3.10+ (推荐 3.11)
 - [Poetry](https://python-poetry.org/) 包管理器
-- Claude Code CLI (已登录认证；当前启动流程仍会初始化 Claude 集成)
-- Codex CLI (已安装并登录，用于 Codex 引擎)
+- Codex CLI (已安装并登录，默认主引擎)
 - Telegram 账号
+- Claude Code CLI (可选，仅在切换 Claude 引擎时需要)
 
 ## 部署步骤
 
@@ -43,7 +43,7 @@ brew install python@3.11
 # Poetry
 curl -sSL https://install.python-poetry.org | python3 -
 
-# Node.js (CLI fallback 模式需要)
+# 可选：仅在使用 Claude CLI 备选引擎时需要
 brew install node
 ```
 
@@ -79,21 +79,22 @@ APPROVED_DIRECTORY=/path/to/your/projects
 # === 安全 ===
 ALLOWED_USERS=<你的 Telegram User ID>
 
-# === CLI 引擎集成（推荐：Codex 为主）===
-USE_SDK=false
-CLAUDE_CLI_PATH=./claude-wrapper.sh
-CLAUDE_MAX_TURNS=50
-CLAUDE_TIMEOUT_SECONDS=600
-
-# 启用 Codex 引擎适配（当前版本默认优先 Codex）
+# === Codex 主引擎（推荐默认）===
 ENABLE_CODEX_CLI=true
 CODEX_CLI_PATH=/opt/homebrew/bin/codex
 
 # 建议默认 false，避免 MCP 启动卡顿；需要 MCP 工具时再临时打开
 CODEX_ENABLE_MCP=false
+
+# === Claude 备选（可选）===
+USE_SDK=false
+CLAUDE_CLI_PATH=./claude-wrapper.sh
+CLAUDE_MAX_TURNS=50
+CLAUDE_TIMEOUT_SECONDS=600
 ```
 
 完整配置项参考 `.env.example`。
+如果暂时只用 Codex，可先不配置 Claude 相关项。
 
 如果你安装了 Poetry 但 `poetry` 命令不可用，请先把 Poetry 加入 PATH：
 
@@ -102,32 +103,7 @@ echo 'export PATH="$HOME/.local/bin:$PATH"' >> ~/.zshrc
 source ~/.zshrc
 ```
 
-### Step 5: 配置 claude-wrapper.sh
-
-如果使用 CLI 子进程模式 (`USE_SDK=false`)，建议从模板复制：
-
-```bash
-cp claude-wrapper.example.sh claude-wrapper.sh
-chmod +x claude-wrapper.sh
-```
-
-然后按你的本机环境修改 `claude-wrapper.sh`（例如代理地址、CLI 路径）。  
-本地 `claude-wrapper.sh` 保持在 `.gitignore` 中，避免把机器相关配置提交到仓库。
-
-### Step 6: 确保 Claude CLI 已认证（切换到 Claude 引擎时需要）
-
-```bash
-# 安装 Claude Code CLI
-npm install -g @anthropic-ai/claude-code
-
-# 登录认证
-claude auth login
-
-# 验证状态
-claude auth status
-```
-
-### Step 7: 确保 Codex CLI 已认证（Codex 默认引擎）
+### Step 5: 确保 Codex CLI 已认证（主引擎）
 
 ```bash
 # 验证 Codex CLI 可执行
@@ -140,7 +116,7 @@ codex login
 codex login status
 ```
 
-### Step 8: 启动
+### Step 6: 启动
 
 ```bash
 # 普通启动（通过 tmux 托管，后台触发重启，推荐）
@@ -160,10 +136,26 @@ poetry run python -m src.main
 首次建议执行：
 
 ```text
-/engine
 /engine codex
 /status
 ```
+
+### Step 7: （可选）启用 Claude 备选引擎
+
+仅在你需要切换到 Claude 时再做这一节：
+
+```bash
+# 1) 配置 wrapper
+cp claude-wrapper.example.sh claude-wrapper.sh
+chmod +x claude-wrapper.sh
+
+# 2) 安装并认证 Claude CLI
+npm install -g @anthropic-ai/claude-code
+claude auth login
+claude auth status
+```
+
+完成后可在 Telegram 里执行 `/engine claude` 切换。
 
 ## 日常使用
 
@@ -260,6 +252,15 @@ poetry run python -m src.main
   - `Polling health probe succeeded` / `Polling health probe failed`
   - `Attempting polling self-recovery` / `Polling self-recovery failed`
   - `Shutdown signal received`
+
+### 服务宕机/短线自救（iCloud + iOS 快捷指令）
+
+当你不在电脑前、Bot 又恰好宕机或短线时，可用 iCloud 命令投递触发远程重启：
+
+1. 先按文档完成一次性配置：`launchd` 监听 iCloud 命令目录，并执行 `./scripts/tmux-bot.sh restart`（见 [iCloud 远程重启 cli-tg（launchd 监听）](docs/icloud-remote-restart-cli-tg-launchd.md)）。
+2. 在 iPhone「快捷指令」创建“重启 cli-tg”，将 `restart-cli-tg.txt` 保存到 iCloud 的 `RemoteCmd/inbox`（使用子路径）。
+3. 需要恢复服务时，手机点一次快捷指令即可触发重启。
+4. 回到 Mac 可用 `make bot-status` 与日志确认恢复结果。
 
 ## 开发命令
 
