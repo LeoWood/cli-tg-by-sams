@@ -1179,6 +1179,71 @@ async def test_resume_command_uses_codex_scanner_when_engine_is_codex(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_resume_command_prefers_current_project_sessions(tmp_path):
+    """`/resume` should open current-project sessions before project picker."""
+    approved = tmp_path / "approved"
+    approved.mkdir()
+    project = approved / "proj-current"
+    project.mkdir()
+    other_project = approved / "proj-other"
+    other_project.mkdir()
+    user_id = 3002
+    scope_key = _scope_key(user_id, user_id)
+    codex_scanner = SimpleNamespace(
+        list_projects=AsyncMock(
+            return_value=[other_project.resolve(), project.resolve()]
+        ),
+        list_sessions=AsyncMock(
+            return_value=[
+                SimpleNamespace(
+                    session_id="019c-current-session",
+                    first_message="resume here",
+                    last_user_message="continue this task",
+                    is_probably_active=False,
+                )
+            ]
+        ),
+    )
+    update = SimpleNamespace(
+        effective_user=SimpleNamespace(id=user_id),
+        effective_chat=SimpleNamespace(id=user_id),
+        effective_message=SimpleNamespace(message_thread_id=None),
+        message=SimpleNamespace(reply_text=AsyncMock()),
+    )
+    context = SimpleNamespace(
+        args=[],
+        bot_data={
+            "settings": _build_settings(approved),
+            "codex_desktop_scanner": codex_scanner,
+            "resume_token_manager": ResumeTokenManager(),
+        },
+        user_data={
+            "scope_state": {
+                scope_key: {
+                    ENGINE_STATE_KEY: "codex",
+                    "current_directory": project,
+                }
+            }
+        },
+    )
+
+    await resume_command(update, context)
+
+    codex_scanner.list_projects.assert_awaited_once()
+    codex_scanner.list_sessions.assert_awaited_once_with(project_cwd=project.resolve())
+    rendered = update.message.reply_text.await_args.args[0]
+    assert "已优先定位当前目录" in rendered
+    keyboard = update.message.reply_text.await_args.kwargs[
+        "reply_markup"
+    ].inline_keyboard
+    callback_ids = [btn.callback_data for row in keyboard for btn in row]
+    assert any(callback.startswith("resume:s:") for callback in callback_ids)
+    assert any(callback.startswith("resume:n:") for callback in callback_ids)
+    assert f"resume:show_recent:{ENGINE_CODEX}" in callback_ids
+    assert not any(callback.startswith("resume:p:") for callback in callback_ids)
+
+
+@pytest.mark.asyncio
 async def test_do_adopt_session_uses_engine_specific_integration(tmp_path):
     """Resume adopt should use selected engine integration and switch scope engine."""
     approved = tmp_path / "approved"

@@ -2423,6 +2423,143 @@ def _escape_markdown(text: str) -> str:
     return text
 
 
+def _resolve_resume_current_project(path_like: Any) -> Path | None:
+    """Resolve current scoped directory for /resume current-project preference."""
+    if path_like is None:
+        return None
+    try:
+        return Path(path_like).resolve()
+    except (OSError, TypeError, ValueError):
+        return None
+
+
+def _resume_candidate_preview(candidate: Any, *, max_len: int = 20) -> str:
+    """Build compact session preview text from scanner candidate."""
+    text = str(getattr(candidate, "last_user_message", "") or "").strip()
+    if not text:
+        text = str(getattr(candidate, "first_message", "") or "").strip()
+    if not text:
+        return "no preview"
+    compact = " ".join(text.split())
+    if len(compact) > max_len:
+        return compact[: max_len - 1] + "…"
+    return compact
+
+
+def _build_resume_candidate_button_label(candidate: Any) -> str:
+    """Build concise inline button label for resumable session."""
+    sid_short = str(getattr(candidate, "session_id", "") or "")[:8] or "unknown"
+    active = bool(getattr(candidate, "is_probably_active", False))
+    status_icon = "🟢" if active else "⚪"
+    preview = _resume_candidate_preview(candidate, max_len=14)
+    label = f"{status_icon} {sid_short} · {preview}"
+    if len(label) > 58:
+        return label[:55] + "..."
+    return label
+
+
+def _build_resume_candidate_preview_line(candidate: Any) -> str:
+    """Build markdown-safe one-line session preview for body text."""
+    sid_short = str(getattr(candidate, "session_id", "") or "")[:8] or "unknown"
+    active = bool(getattr(candidate, "is_probably_active", False))
+    status = "活跃中" if active else "可恢复"
+    preview = _escape_markdown(_resume_candidate_preview(candidate, max_len=56))
+    return f"• `{sid_short}` · {status} · {preview}"
+
+
+async def _reply_resume_sessions_for_project(
+    *,
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    user_id: int,
+    settings: Settings,
+    scanner: Any,
+    token_mgr: Any,
+    active_engine: str,
+    project_cwd: Path,
+) -> bool:
+    """Render direct session selector for current project in /resume flow."""
+    candidates = await scanner.list_sessions(project_cwd=project_cwd)
+    if not candidates:
+        return False
+
+    session_preview_lines: list[str] = []
+    keyboard: list[list[InlineKeyboardButton]] = []
+
+    new_session_token = token_mgr.issue(
+        kind="n",
+        user_id=user_id,
+        payload={
+            "cwd": str(project_cwd),
+            "engine": active_engine,
+        },
+    )
+
+    for candidate in candidates[:10]:
+        session_id = str(getattr(candidate, "session_id", "") or "").strip()
+        if not session_id:
+            continue
+        session_preview_lines.append(_build_resume_candidate_preview_line(candidate))
+        session_token = token_mgr.issue(
+            kind="s",
+            user_id=user_id,
+            payload={
+                "cwd": str(project_cwd),
+                "session_id": session_id,
+                "is_active": bool(getattr(candidate, "is_probably_active", False)),
+                "engine": active_engine,
+            },
+        )
+        keyboard.append(
+            [
+                InlineKeyboardButton(
+                    _build_resume_candidate_button_label(candidate),
+                    callback_data=f"resume:s:{session_token}",
+                )
+            ]
+        )
+
+    if not keyboard:
+        return False
+
+    keyboard.append(
+        [
+            InlineKeyboardButton(
+                "🆕 Start New Session Here",
+                callback_data=f"resume:n:{new_session_token}",
+            )
+        ]
+    )
+    keyboard.append(
+        [
+            InlineKeyboardButton(
+                "📋 Browse Other Projects",
+                callback_data=f"resume:show_recent:{active_engine}",
+            )
+        ]
+    )
+    keyboard.append([InlineKeyboardButton("❌ Cancel", callback_data="resume:cancel")])
+
+    try:
+        rel = project_cwd.relative_to(settings.approved_directory)
+        project_label = f"{rel}/"
+    except ValueError:
+        project_label = f"{project_cwd.name}/"
+
+    await _reply_update_message_resilient(
+        update,
+        context,
+        "**Resume Desktop Session**\n\n"
+        f"已优先定位当前目录：`{_escape_markdown(project_label)}`\n\n"
+        "Session previews:\n"
+        f"{chr(10).join(session_preview_lines)}\n\n"
+        "Select a session to resume, or start a new one in this directory:",
+        parse_mode="Markdown",
+        reply_markup=InlineKeyboardMarkup(keyboard),
+    )
+    return True
+
+
 async def model_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Handle /model command - show inline keyboard to select Claude model."""
     settings: Settings = context.bot_data["settings"]
@@ -2682,6 +2819,21 @@ async def resume_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
                 parse_mode="Markdown",
             )
             return
+
+        current_project = _resolve_resume_current_project(current_dir)
+        if current_project and any(project == current_project for project in projects):
+            handled = await _reply_resume_sessions_for_project(
+                update=update,
+                context=context,
+                user_id=user_id,
+                settings=settings,
+                scanner=scanner,
+                token_mgr=token_mgr,
+                active_engine=active_engine,
+                project_cwd=current_project,
+            )
+            if handled:
+                return
 
         message_text, keyboard = build_resume_project_selector(
             projects=projects,
