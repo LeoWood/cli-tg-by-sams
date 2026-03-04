@@ -264,6 +264,15 @@ class Settings(BaseSettings):
         ge=0.0,
         le=86400.0,
     )
+    polling_pending_update_stall_seconds: float = Field(
+        120.0,
+        description=(
+            "Polling pending-update stall threshold in seconds; "
+            "auto restart when Telegram queue has pending updates but bot consumes none"
+        ),
+        ge=0.0,
+        le=86400.0,
+    )
 
     # Monitoring
     log_level: str = Field("INFO", description="Logging level")

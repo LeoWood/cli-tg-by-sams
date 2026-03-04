@@ -10,6 +10,7 @@ Features:
 import asyncio
 import pickle
 import time
+from collections import deque
 from pathlib import Path
 from typing import Any, Callable, Dict, List, MutableMapping, Optional, Tuple
 
@@ -21,10 +22,10 @@ from telegram.ext import (
     CallbackQueryHandler,
     CommandHandler,
     ContextTypes,
-    PersistenceInput,
-    PicklePersistence,
     MessageHandler,
     MessageReactionHandler,
+    PersistenceInput,
+    PicklePersistence,
     TypeHandler,
     filters,
 )
@@ -46,8 +47,13 @@ logger = structlog.get_logger()
 _POLLING_WATCHDOG_INTERVAL_SECONDS = 2.0
 _POLLING_RECOVERY_ERROR_THRESHOLD = 3
 _POLLING_RESTART_COOLDOWN_SECONDS = 8.0
+_POLLING_RECOVERY_MAX_RESTARTS_PER_WINDOW = 5
+_POLLING_RECOVERY_WINDOW_SECONDS = 600.0
+_POLLING_RECOVERY_CIRCUIT_OPEN_SECONDS = 600.0
+_POLLING_RECOVERY_CIRCUIT_LOG_INTERVAL_SECONDS = 60.0
+_POLLING_ESCALATED_RESTART_COOLDOWN_SECONDS = 600.0
 _POLLING_WATCHDOG_HEARTBEAT_INTERVAL_SECONDS = 60.0
-_POLLING_HEALTH_PROBE_INTERVAL_SECONDS = 300.0
+_POLLING_HEALTH_PROBE_INTERVAL_SECONDS = 60.0
 _POLLING_WATCHDOG_DELAY_WARNING_SECONDS = 15.0
 _DEFAULT_TELEGRAM_CONNECT_TIMEOUT_SECONDS = 30.0
 _DEFAULT_TELEGRAM_READ_TIMEOUT_SECONDS = 30.0
@@ -58,6 +64,7 @@ _DEFAULT_TELEGRAM_GET_UPDATES_READ_TIMEOUT_SECONDS = 50.0
 _DEFAULT_TELEGRAM_GET_UPDATES_POOL_TIMEOUT_SECONDS = 30.0
 _DEFAULT_TELEGRAM_GET_UPDATES_CONNECTION_POOL_SIZE = 16
 _DEFAULT_POLLING_UPDATE_STALL_SECONDS = 0.0
+_DEFAULT_POLLING_PENDING_UPDATE_STALL_SECONDS = 120.0
 _DEFAULT_TELEGRAM_USER_DATA_PERSISTENCE_PATH = Path("data/telegram-user-data.pkl")
 _USER_DATA_PERSISTENCE_UPDATE_INTERVAL_SECONDS = 10.0
 _STARTUP_RECOVERY_BROADCAST_TEXT = (
@@ -81,6 +88,10 @@ class ClaudeCodeBot:
         self._last_polling_error_log: float = 0.0
         self._polling_restart_requested: bool = False
         self._last_polling_restart_monotonic: float = 0.0
+        self._polling_restart_attempts_monotonic: deque[float] = deque()
+        self._polling_recovery_circuit_open_until_monotonic: float = 0.0
+        self._last_polling_circuit_log_monotonic: float = 0.0
+        self._last_escalated_restart_monotonic: float = 0.0
         self._started_monotonic: float = 0.0
         self._last_watchdog_tick_monotonic: float = 0.0
         self._last_watchdog_heartbeat_log_monotonic: float = 0.0
@@ -89,6 +100,8 @@ class ClaudeCodeBot:
         self._last_update_monotonic: float = 0.0
         self._last_update_progress_monotonic: float = 0.0
         self._last_update_id: Optional[int] = None
+        self._last_pending_update_count: Optional[int] = None
+        self._pending_update_nonzero_since_monotonic: float = 0.0
         # Update dedupe and persisted offset tracking
         self._update_dedupe_cache = UpdateDedupeCache(ttl_seconds=300, max_size=5000)
         self._update_offset_store: Optional[UpdateOffsetStore] = None
@@ -117,6 +130,14 @@ class ClaudeCodeBot:
         return self._get_float_setting(
             "polling_update_stall_seconds",
             _DEFAULT_POLLING_UPDATE_STALL_SECONDS,
+            minimum=0.0,
+        )
+
+    def _get_polling_pending_update_stall_seconds(self) -> float:
+        """Return pending-update stall threshold; 0 means disabled."""
+        return self._get_float_setting(
+            "polling_pending_update_stall_seconds",
+            _DEFAULT_POLLING_PENDING_UPDATE_STALL_SECONDS,
             minimum=0.0,
         )
 
@@ -223,6 +244,9 @@ class ClaudeCodeBot:
             minimum=2,
         )
         stall_threshold_seconds = self._get_polling_update_stall_seconds()
+        pending_stall_threshold_seconds = (
+            self._get_polling_pending_update_stall_seconds()
+        )
 
         builder.connect_timeout(connect_timeout_seconds)
         builder.read_timeout(read_timeout_seconds)
@@ -248,6 +272,7 @@ class ClaudeCodeBot:
             get_updates_pool_timeout_seconds=get_updates_pool_timeout_seconds,
             get_updates_connection_pool_size=get_updates_connection_pool_size,
             polling_update_stall_seconds=stall_threshold_seconds,
+            polling_pending_update_stall_seconds=pending_stall_threshold_seconds,
         )
 
         # Enable concurrent update processing so that permission button
@@ -656,6 +681,84 @@ class ClaudeCodeBot:
         self._last_polling_error_log = 0.0
         self._polling_restart_requested = False
         self._last_update_progress_monotonic = time.monotonic()
+        self._pending_update_nonzero_since_monotonic = 0.0
+        self._last_pending_update_count = None
+
+    def _prune_polling_restart_attempts(self, *, now: float) -> None:
+        """Drop outdated restart attempts outside the circuit-breaker window."""
+        cutoff = now - _POLLING_RECOVERY_WINDOW_SECONDS
+        while self._polling_restart_attempts_monotonic:
+            oldest = self._polling_restart_attempts_monotonic[0]
+            if oldest >= cutoff:
+                break
+            self._polling_restart_attempts_monotonic.popleft()
+
+    async def _trigger_escalated_restart(self, *, reason: str) -> bool:
+        """Trigger one detached supervisor restart via tmux-bot script."""
+        now = asyncio.get_running_loop().time()
+        if (
+            now - self._last_escalated_restart_monotonic
+            < _POLLING_ESCALATED_RESTART_COOLDOWN_SECONDS
+        ):
+            logger.warning(
+                "Escalated restart skipped due to cooldown",
+                reason=reason,
+                cooldown_seconds=_POLLING_ESCALATED_RESTART_COOLDOWN_SECONDS,
+            )
+            return False
+
+        project_root = Path(__file__).resolve().parents[2]
+        script_path = project_root / "scripts" / "tmux-bot.sh"
+        if not script_path.is_file():
+            logger.error(
+                "Escalated restart unavailable: tmux script not found",
+                reason=reason,
+                script_path=str(script_path),
+            )
+            return False
+
+        try:
+            process = await asyncio.create_subprocess_exec(
+                "bash",
+                str(script_path),
+                "restart-detached",
+                cwd=str(project_root),
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            stdout, stderr = await process.communicate()
+        except Exception as exc:
+            logger.error(
+                "Failed to trigger escalated restart",
+                reason=reason,
+                script_path=str(script_path),
+                error=str(exc),
+                error_type=type(exc).__name__,
+            )
+            return False
+
+        if process.returncode != 0:
+            logger.error(
+                "Escalated restart command failed",
+                reason=reason,
+                return_code=process.returncode,
+                script_path=str(script_path),
+                stdout=(
+                    stdout.decode("utf-8", errors="replace").strip() if stdout else ""
+                ),
+                stderr=(
+                    stderr.decode("utf-8", errors="replace").strip() if stderr else ""
+                ),
+            )
+            return False
+
+        self._last_escalated_restart_monotonic = now
+        logger.warning(
+            "Escalated detached restart triggered",
+            reason=reason,
+            script_path=str(script_path),
+        )
+        return True
 
     def _emit_polling_watchdog_heartbeat(
         self, *, now: float, updater_running: bool
@@ -678,6 +781,18 @@ class ClaudeCodeBot:
             if self._last_update_monotonic > 0
             else None
         )
+        pending_update_age_seconds = (
+            round(now - self._pending_update_nonzero_since_monotonic, 1)
+            if self._pending_update_nonzero_since_monotonic > 0
+            else None
+        )
+        self._prune_polling_restart_attempts(now=now)
+        recovery_attempts_in_window = len(self._polling_restart_attempts_monotonic)
+        circuit_open_remaining_seconds = (
+            round(self._polling_recovery_circuit_open_until_monotonic - now, 1)
+            if self._polling_recovery_circuit_open_until_monotonic > now
+            else None
+        )
         logger.info(
             "Polling watchdog heartbeat",
             updater_running=updater_running,
@@ -686,6 +801,10 @@ class ClaudeCodeBot:
             watchdog_tick_count=self._watchdog_tick_count,
             last_update_id=self._last_update_id,
             last_update_age_seconds=last_update_age_seconds,
+            pending_update_count=self._last_pending_update_count,
+            pending_update_age_seconds=pending_update_age_seconds,
+            recovery_attempts_in_window=recovery_attempts_in_window,
+            recovery_circuit_open_remaining_seconds=circuit_open_remaining_seconds,
             uptime_seconds=uptime_seconds,
         )
 
@@ -704,14 +823,29 @@ class ClaudeCodeBot:
         if bot is None:
             return
 
+        pending_update_count: Optional[int] = None
         try:
             me = await bot.get_me()
+            webhook_info = await bot.get_webhook_info()
+            raw_pending_count = getattr(webhook_info, "pending_update_count", None)
+            if isinstance(raw_pending_count, int) and raw_pending_count >= 0:
+                pending_update_count = raw_pending_count
+            self._last_pending_update_count = pending_update_count
+            if pending_update_count and pending_update_count > 0:
+                if self._pending_update_nonzero_since_monotonic <= 0:
+                    self._pending_update_nonzero_since_monotonic = now
+            else:
+                self._pending_update_nonzero_since_monotonic = 0.0
+
             logger.info(
                 "Polling health probe succeeded",
                 bot_id=getattr(me, "id", None),
                 bot_username=getattr(me, "username", None),
+                pending_update_count=pending_update_count,
             )
         except Exception as exc:
+            self._last_pending_update_count = None
+            self._pending_update_nonzero_since_monotonic = 0.0
             logger.warning(
                 "Polling health probe failed",
                 error=str(exc),
@@ -851,6 +985,49 @@ class ClaudeCodeBot:
             return False
 
         now = asyncio.get_running_loop().time()
+
+        if now < self._polling_recovery_circuit_open_until_monotonic:
+            if (
+                now - self._last_polling_circuit_log_monotonic
+                >= _POLLING_RECOVERY_CIRCUIT_LOG_INTERVAL_SECONDS
+            ):
+                self._last_polling_circuit_log_monotonic = now
+                logger.error(
+                    "Polling self-recovery skipped: circuit breaker is open",
+                    reason=reason,
+                    circuit_open_remaining_seconds=round(
+                        self._polling_recovery_circuit_open_until_monotonic - now, 1
+                    ),
+                    restart_attempts_in_window=len(
+                        self._polling_restart_attempts_monotonic
+                    ),
+                    window_seconds=_POLLING_RECOVERY_WINDOW_SECONDS,
+                    threshold=_POLLING_RECOVERY_MAX_RESTARTS_PER_WINDOW,
+                )
+            return False
+
+        self._prune_polling_restart_attempts(now=now)
+        if (
+            len(self._polling_restart_attempts_monotonic)
+            >= _POLLING_RECOVERY_MAX_RESTARTS_PER_WINDOW
+        ):
+            self._polling_recovery_circuit_open_until_monotonic = (
+                now + _POLLING_RECOVERY_CIRCUIT_OPEN_SECONDS
+            )
+            self._last_polling_circuit_log_monotonic = now
+            logger.error(
+                "Polling self-recovery circuit breaker opened",
+                reason=reason,
+                restart_attempts_in_window=len(
+                    self._polling_restart_attempts_monotonic
+                ),
+                window_seconds=_POLLING_RECOVERY_WINDOW_SECONDS,
+                threshold=_POLLING_RECOVERY_MAX_RESTARTS_PER_WINDOW,
+                circuit_open_seconds=_POLLING_RECOVERY_CIRCUIT_OPEN_SECONDS,
+            )
+            await self._trigger_escalated_restart(reason=f"circuit_breaker:{reason}")
+            return False
+
         if (
             now - self._last_polling_restart_monotonic
             < _POLLING_RESTART_COOLDOWN_SECONDS
@@ -863,6 +1040,7 @@ class ClaudeCodeBot:
             return False
 
         self._last_polling_restart_monotonic = now
+        self._polling_restart_attempts_monotonic.append(now)
         logger.warning(
             "Attempting polling self-recovery",
             reason=reason,
@@ -870,6 +1048,7 @@ class ClaudeCodeBot:
             polling_error_count=self._polling_error_count,
             polling_restart_requested=self._polling_restart_requested,
             last_update_id=self._last_update_id,
+            restart_attempts_in_window=len(self._polling_restart_attempts_monotonic),
         )
 
         try:
@@ -948,6 +1127,37 @@ class ClaudeCodeBot:
             await self._restart_polling(reason="network_error_threshold")
             return
 
+        pending_stall_threshold_seconds = (
+            self._get_polling_pending_update_stall_seconds()
+        )
+        if pending_stall_threshold_seconds > 0:
+            if (
+                self._last_pending_update_count is not None
+                and self._last_pending_update_count > 0
+                and self._pending_update_nonzero_since_monotonic > 0
+            ):
+                pending_stall_seconds = (
+                    now - self._pending_update_nonzero_since_monotonic
+                )
+                last_progress_age_seconds = (
+                    now - self._last_update_progress_monotonic
+                    if self._last_update_progress_monotonic > 0
+                    else pending_stall_seconds
+                )
+                if (
+                    pending_stall_seconds >= pending_stall_threshold_seconds
+                    and last_progress_age_seconds >= pending_stall_threshold_seconds
+                ):
+                    logger.warning(
+                        "Polling watchdog detected pending updates not consumed",
+                        pending_update_count=self._last_pending_update_count,
+                        pending_stall_seconds=round(pending_stall_seconds, 1),
+                        last_progress_age_seconds=round(last_progress_age_seconds, 1),
+                        threshold_seconds=pending_stall_threshold_seconds,
+                    )
+                    await self._restart_polling(reason="pending_updates_stalled")
+                    return
+
         stall_threshold_seconds = self._get_polling_update_stall_seconds()
         if stall_threshold_seconds <= 0:
             return
@@ -955,15 +1165,20 @@ class ClaudeCodeBot:
         if self._last_update_id is None:
             return
 
-        now = time.monotonic()
+        monotonic_now = time.monotonic()
         if self._last_update_progress_monotonic <= 0:
-            self._last_update_progress_monotonic = now
+            self._last_update_progress_monotonic = monotonic_now
             return
 
-        if now - self._last_update_progress_monotonic >= stall_threshold_seconds:
+        if (
+            monotonic_now - self._last_update_progress_monotonic
+            >= stall_threshold_seconds
+        ):
             logger.warning(
                 "Polling watchdog detected stalled update progression",
-                stall_seconds=round(now - self._last_update_progress_monotonic, 2),
+                stall_seconds=round(
+                    monotonic_now - self._last_update_progress_monotonic, 2
+                ),
                 threshold_seconds=stall_threshold_seconds,
             )
             await self._restart_polling(reason="update_stall_watchdog")
@@ -1001,6 +1216,8 @@ class ClaudeCodeBot:
             self._watchdog_tick_count = 0
             self._last_update_monotonic = 0.0
             self._last_update_id = None
+            self._last_pending_update_count = None
+            self._pending_update_nonzero_since_monotonic = 0.0
 
             # Polling mode only (webhook mode is intentionally disabled).
             await self.app.initialize()
