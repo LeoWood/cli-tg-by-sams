@@ -819,7 +819,7 @@ async def test_resume_project_selection_includes_start_new_session_option(tmp_pa
     await handle_resume_callback(query, f"p:{project_token}", context)
 
     rendered = query.edit_message_text.await_args.args[0]
-    assert "Session previews" in rendered
+    assert "Session previews" not in rendered
     assert "Start New Session Here" in rendered
     reply_markup = query.edit_message_text.await_args.kwargs["reply_markup"]
     callback_ids = [
@@ -1240,6 +1240,67 @@ async def test_resume_command_prefers_current_project_sessions(tmp_path):
     assert any(callback.startswith("resume:s:") for callback in callback_ids)
     assert any(callback.startswith("resume:n:") for callback in callback_ids)
     assert f"resume:show_recent:{ENGINE_CODEX}" in callback_ids
+    assert not any(callback.startswith("resume:p:") for callback in callback_ids)
+
+
+@pytest.mark.asyncio
+async def test_resume_command_tries_current_project_even_if_not_in_project_list(tmp_path):
+    """`/resume` should still try current project sessions before picker fallback."""
+    approved = tmp_path / "approved"
+    approved.mkdir()
+    project = approved / "proj-current"
+    project.mkdir()
+    other_project = approved / "proj-other"
+    other_project.mkdir()
+    user_id = 3003
+    scope_key = _scope_key(user_id, user_id)
+    codex_scanner = SimpleNamespace(
+        list_projects=AsyncMock(return_value=[other_project.resolve()]),
+        list_sessions=AsyncMock(
+            return_value=[
+                SimpleNamespace(
+                    session_id="019c-current-session",
+                    first_message="resume here",
+                    last_user_message="continue this task",
+                    is_probably_active=False,
+                )
+            ]
+        ),
+    )
+    update = SimpleNamespace(
+        effective_user=SimpleNamespace(id=user_id),
+        effective_chat=SimpleNamespace(id=user_id),
+        effective_message=SimpleNamespace(message_thread_id=None),
+        message=SimpleNamespace(reply_text=AsyncMock()),
+    )
+    context = SimpleNamespace(
+        args=[],
+        bot_data={
+            "settings": _build_settings(approved),
+            "codex_desktop_scanner": codex_scanner,
+            "resume_token_manager": ResumeTokenManager(),
+        },
+        user_data={
+            "scope_state": {
+                scope_key: {
+                    ENGINE_STATE_KEY: "codex",
+                    "current_directory": project,
+                }
+            }
+        },
+    )
+
+    await resume_command(update, context)
+
+    codex_scanner.list_projects.assert_awaited_once()
+    codex_scanner.list_sessions.assert_awaited_once_with(project_cwd=project.resolve())
+    rendered = update.message.reply_text.await_args.args[0]
+    assert "已优先定位当前目录" in rendered
+    keyboard = update.message.reply_text.await_args.kwargs[
+        "reply_markup"
+    ].inline_keyboard
+    callback_ids = [btn.callback_data for row in keyboard for btn in row]
+    assert any(callback.startswith("resume:s:") for callback in callback_ids)
     assert not any(callback.startswith("resume:p:") for callback in callback_ids)
 
 

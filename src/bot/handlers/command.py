@@ -2573,15 +2573,6 @@ def _build_resume_candidate_button_label(candidate: Any) -> str:
     return label
 
 
-def _build_resume_candidate_preview_line(candidate: Any) -> str:
-    """Build markdown-safe one-line session preview for body text."""
-    sid_short = str(getattr(candidate, "session_id", "") or "")[:8] or "unknown"
-    active = bool(getattr(candidate, "is_probably_active", False))
-    status = "活跃中" if active else "可恢复"
-    preview = _escape_markdown(_resume_candidate_preview(candidate, max_len=56))
-    return f"• `{sid_short}` · {status} · {preview}"
-
-
 async def _reply_resume_sessions_for_project(
     *,
     update: Update,
@@ -2598,7 +2589,6 @@ async def _reply_resume_sessions_for_project(
     if not candidates:
         return False
 
-    session_preview_lines: list[str] = []
     keyboard: list[list[InlineKeyboardButton]] = []
 
     new_session_token = token_mgr.issue(
@@ -2614,7 +2604,6 @@ async def _reply_resume_sessions_for_project(
         session_id = str(getattr(candidate, "session_id", "") or "").strip()
         if not session_id:
             continue
-        session_preview_lines.append(_build_resume_candidate_preview_line(candidate))
         session_token = token_mgr.issue(
             kind="s",
             user_id=user_id,
@@ -2666,8 +2655,6 @@ async def _reply_resume_sessions_for_project(
         context,
         "**Resume Desktop Session**\n\n"
         f"已优先定位当前目录：`{_escape_markdown(project_label)}`\n\n"
-        "Session previews:\n"
-        f"{chr(10).join(session_preview_lines)}\n\n"
         "Select a session to resume, or start a new one in this directory:",
         parse_mode="Markdown",
         reply_markup=InlineKeyboardMarkup(keyboard),
@@ -2936,7 +2923,7 @@ async def resume_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             return
 
         current_project = _resolve_resume_current_project(current_dir)
-        if current_project and any(project == current_project for project in projects):
+        if current_project is not None:
             handled = await _reply_resume_sessions_for_project(
                 update=update,
                 context=context,

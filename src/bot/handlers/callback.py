@@ -548,17 +548,6 @@ def _build_resume_session_button_label(candidate) -> str:
     return label
 
 
-def _build_resume_session_preview_line(candidate) -> str:
-    """Build markdown-safe preview line for session list body."""
-    sid_short = str(getattr(candidate, "session_id", "") or "")[:8] or "unknown"
-    active = bool(getattr(candidate, "is_probably_active", False))
-    status = (
-        "活跃中" if active else _format_relative_time(_candidate_event_time(candidate))
-    )
-    preview = _escape_markdown(_candidate_preview(candidate, max_len=56))
-    return f"• `{sid_short}` · {status} · {preview}"
-
-
 def _build_resume_history_preview_text(
     messages: list[ResumeHistoryMessage],
     *,
@@ -3110,12 +3099,10 @@ async def _resume_select_project(
         )
         return
 
-    # Build session selection buttons + preview lines
+    # Build session selection buttons
     keyboard = []
-    session_preview_lines: list[str] = []
     for c in candidates[:10]:  # limit to 10 sessions
         label = _build_resume_session_button_label(c)
-        session_preview_lines.append(_build_resume_session_preview_line(c))
 
         tok = token_mgr.issue(
             kind="s",
@@ -3158,12 +3145,9 @@ async def _resume_select_project(
     except ValueError:
         rel = project_cwd.name
 
-    session_preview_text = "\n".join(session_preview_lines)
     await _edit_query_message_resilient(
         query,
         f"**Sessions in** `{rel}`\n\n"
-        f"Session previews:\n"
-        f"{session_preview_text}\n\n"
         f"Select a session to resume, or tap *Start New Session Here*:",
         parse_mode="Markdown",
         reply_markup=InlineKeyboardMarkup(keyboard),
