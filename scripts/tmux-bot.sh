@@ -7,21 +7,53 @@ PROJECT_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 STARTUP_WAIT_SECONDS="${BOT_STARTUP_WAIT_SECONDS:-3}"
 LOG_TAIL_LINES="${BOT_LOG_TAIL_LINES:-120}"
 DETACHED_RESTART_LOG="${BOT_DETACHED_RESTART_LOG:-$PROJECT_ROOT/logs/restart-detached.log}"
+DEFAULT_PATH_PREFIX="/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
+export PATH="$DEFAULT_PATH_PREFIX:${PATH:-}"
 
 log() {
   printf '[tmux-bot] %s\n' "$*"
 }
 
 has_tmux() {
-  command -v tmux >/dev/null 2>&1
+  [[ -n "${TMUX_BIN:-}" ]]
+}
+
+resolve_tmux_bin() {
+  local candidate
+
+  if [[ -n "${BOT_TMUX_BIN:-}" ]]; then
+    if [[ -x "${BOT_TMUX_BIN}" ]]; then
+      printf '%s\n' "${BOT_TMUX_BIN}"
+      return 0
+    fi
+    log "BOT_TMUX_BIN is set but not executable: ${BOT_TMUX_BIN}"
+  fi
+
+  candidate="$(command -v tmux 2>/dev/null || true)"
+  if [[ -n "$candidate" && -x "$candidate" ]]; then
+    printf '%s\n' "$candidate"
+    return 0
+  fi
+
+  for candidate in /opt/homebrew/bin/tmux /usr/local/bin/tmux; do
+    if [[ -x "$candidate" ]]; then
+      printf '%s\n' "$candidate"
+      return 0
+    fi
+  done
+
+  return 1
 }
 
 require_tmux() {
   if ! has_tmux; then
     log "tmux not found. Install it first: brew install tmux"
+    log "or set BOT_TMUX_BIN=/absolute/path/to/tmux"
     exit 1
   fi
 }
+
+TMUX_BIN="$(resolve_tmux_bin || true)"
 
 list_bot_processes() {
   pgrep -af "virtualenvs/cli-tg-.*bin/(cli-tg-bot|claude-telegram-bot)|python -m src.main" || true
@@ -48,14 +80,14 @@ start_bot() {
   cd "$PROJECT_ROOT"
 
   # Pre-cleanup: enforce single startup entry and remove old leftovers.
-  tmux kill-session -t "$SESSION_NAME" >/dev/null 2>&1 || true
+  "$TMUX_BIN" kill-session -t "$SESSION_NAME" >/dev/null 2>&1 || true
   cleanup_residual_processes
 
   local entry="./scripts/restart-bot.sh"
   if [[ "${BOT_DEBUG:-}" == "1" ]]; then
     entry="./scripts/restart-bot.sh --debug"
   fi
-  tmux new-session -d -s "$SESSION_NAME" -c "$PROJECT_ROOT" \
+  "$TMUX_BIN" new-session -d -s "$SESSION_NAME" -c "$PROJECT_ROOT" \
     "export PATH=\"$HOME/.local/bin:/opt/homebrew/bin:/usr/local/bin:\$PATH\"; $entry"
 
   sleep "$STARTUP_WAIT_SECONDS"
@@ -73,14 +105,16 @@ start_bot() {
 }
 
 stop_bot() {
-  tmux kill-session -t "$SESSION_NAME" >/dev/null 2>&1 || true
+  if has_tmux; then
+    "$TMUX_BIN" kill-session -t "$SESSION_NAME" >/dev/null 2>&1 || true
+  fi
   cleanup_residual_processes
   log "stopped session '$SESSION_NAME' and cleaned residual processes"
 }
 
 status_bot() {
   local tmux_status="missing"
-  if has_tmux && tmux has-session -t "$SESSION_NAME" 2>/dev/null; then
+  if has_tmux && "$TMUX_BIN" has-session -t "$SESSION_NAME" 2>/dev/null; then
     tmux_status="running"
   fi
 
@@ -99,16 +133,16 @@ status_bot() {
 
 logs_bot() {
   require_tmux
-  if ! tmux has-session -t "$SESSION_NAME" 2>/dev/null; then
+  if ! "$TMUX_BIN" has-session -t "$SESSION_NAME" 2>/dev/null; then
     log "tmux session '$SESSION_NAME' not found"
     exit 1
   fi
-  tmux capture-pane -t "$SESSION_NAME" -p | tail -n "$LOG_TAIL_LINES"
+  "$TMUX_BIN" capture-pane -t "$SESSION_NAME" -p | tail -n "$LOG_TAIL_LINES"
 }
 
 attach_bot() {
   require_tmux
-  tmux attach -t "$SESSION_NAME"
+  "$TMUX_BIN" attach -t "$SESSION_NAME"
 }
 
 restart_bot_detached() {
