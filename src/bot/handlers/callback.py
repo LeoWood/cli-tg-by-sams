@@ -42,11 +42,27 @@ from ..utils.telegram_send import (
     send_message_resilient,
 )
 from ..utils.ui_adapter import build_reply_markup_from_spec
-from .message import _resolve_model_override, build_permission_handler
+from .message import (
+    _resolve_model_override,
+    _resolve_reasoning_effort_override,
+    build_permission_handler,
+)
 
 logger = structlog.get_logger()
 _PARSE_MODE_UNSET = object()
 _CHAT_ACTION_HEARTBEAT_INTERVAL_SECONDS = 4.0
+_CODEX_REASONING_EFFORT_KEY = "codex_reasoning_effort"
+_ALLOWED_CODEX_REASONING_EFFORTS = ("low", "medium", "high", "xhigh")
+_MAIN_QUICK_ACTION_CALLBACKS = frozenset(
+    {
+        "action:new_session",
+        "action:show_projects",
+        "action:status",
+    }
+)
+_PRESERVE_SOURCE_ACTIONS = frozenset(
+    {"show_projects", "ls", "status", "new_session", "resume", "help"}
+)
 
 
 async def _reply_query_message_resilient(
@@ -97,6 +113,82 @@ async def _reply_query_message_resilient(
 def _is_noop_edit_error(error: Exception) -> bool:
     """Whether Telegram rejected edit because target text is unchanged."""
     return "message is not modified" in str(error).lower()
+
+
+def _has_main_quick_actions_keyboard(query: Any) -> bool:
+    """Whether callback source contains the main quick-actions keyboard."""
+    message = getattr(query, "message", None)
+    markup = getattr(message, "reply_markup", None)
+    rows = getattr(markup, "inline_keyboard", None)
+    if not rows:
+        return False
+
+    callback_data_values: set[str] = set()
+    for row in rows:
+        for button in row:
+            callback_data = getattr(button, "callback_data", None)
+            if isinstance(callback_data, str):
+                callback_data_values.add(callback_data)
+
+    return _MAIN_QUICK_ACTION_CALLBACKS.issubset(callback_data_values)
+
+
+def _build_main_quick_actions_reply_markup() -> InlineKeyboardMarkup:
+    """Build the shared three-button quick actions menu."""
+    return build_reply_markup_from_spec(
+        SessionInteractionService.build_main_quick_actions_keyboard()
+    )
+
+
+class _PreserveSourceMessageQueryProxy:
+    """Route edits to a new reply message to avoid overwriting source content."""
+
+    def __init__(self, query: Any, context: ContextTypes.DEFAULT_TYPE) -> None:
+        self._query = query
+        self._context = context
+        self._target_message: Any | None = None
+        self._source_keyboard_cleared = False
+
+    async def edit_message_text(self, text: str, **kwargs: Any) -> Any:
+        if self._target_message is not None:
+            edit_text = getattr(self._target_message, "edit_text", None)
+            if callable(edit_text):
+                return await edit_text(text, **kwargs)
+
+        source_message = getattr(self._query, "message", None)
+        if source_message is None:
+            return await self._query.edit_message_text(text, **kwargs)
+
+        if not self._source_keyboard_cleared:
+            try:
+                await self._query.edit_message_reply_markup(reply_markup=None)
+            except Exception:
+                pass
+            self._source_keyboard_cleared = True
+
+        sent_message = await _reply_query_message_resilient(
+            self._query,
+            self._context,
+            text,
+            parse_mode=kwargs.get("parse_mode"),
+            reply_markup=kwargs.get("reply_markup"),
+            reply_to_message_id=getattr(source_message, "message_id", None),
+        )
+        if sent_message is None:
+            return await self._query.edit_message_text(text, **kwargs)
+
+        self._target_message = sent_message
+        return sent_message
+
+    async def edit_message_reply_markup(self, **kwargs: Any) -> Any:
+        if self._target_message is not None:
+            edit_reply_markup = getattr(self._target_message, "edit_reply_markup", None)
+            if callable(edit_reply_markup):
+                return await edit_reply_markup(**kwargs)
+        return await self._query.edit_message_reply_markup(**kwargs)
+
+    def __getattr__(self, item: str) -> Any:
+        return getattr(self._query, item)
 
 
 async def _edit_query_message_resilient(
@@ -354,6 +446,60 @@ def _build_codex_model_keyboard(*, selected_model: str | None) -> InlineKeyboard
     default_label = "✅ default" if not selected else "default"
     rows.append(
         [InlineKeyboardButton(default_label, callback_data="model:codex:default")]
+    )
+    return InlineKeyboardMarkup(rows)
+
+
+def _normalize_reasoning_effort_label(raw: str) -> str:
+    """Normalize reasoning effort label for user-facing text."""
+    mapping = {
+        "high": "High",
+        "medium": "Medium",
+        "low": "Low",
+        "xhigh": "X High",
+        "x-high": "X High",
+    }
+    normalized = str(raw or "").strip().lower()
+    if not normalized:
+        return ""
+    return mapping.get(normalized, normalized.title())
+
+
+def _normalize_codex_reasoning_effort(raw: str | None) -> str:
+    """Normalize Codex reasoning effort input to canonical value."""
+    normalized = str(raw or "").strip().lower().replace("_", "-")
+    if normalized == "x-high":
+        return "xhigh"
+    if normalized in _ALLOWED_CODEX_REASONING_EFFORTS:
+        return normalized
+    return ""
+
+
+def _build_codex_effort_keyboard(
+    *,
+    selected_effort: str | None,
+) -> InlineKeyboardMarkup:
+    """Build inline keyboard for Codex reasoning effort callbacks."""
+    selected = _normalize_codex_reasoning_effort(selected_effort)
+    candidates: list[str] = []
+    for candidate in (selected, *_ALLOWED_CODEX_REASONING_EFFORTS):
+        value = _normalize_codex_reasoning_effort(candidate)
+        if not value or value in candidates:
+            continue
+        candidates.append(value)
+
+    rows: list[list[InlineKeyboardButton]] = []
+    for value in candidates:
+        label = _normalize_reasoning_effort_label(value)
+        if value == selected:
+            label = f"✅ {label}"
+        rows.append(
+            [InlineKeyboardButton(label, callback_data=f"effort:codex:{value}")]
+        )
+
+    default_label = "✅ default" if not selected else "default"
+    rows.append(
+        [InlineKeyboardButton(default_label, callback_data="effort:codex:default")]
     )
     return InlineKeyboardMarkup(rows)
 
@@ -637,6 +783,7 @@ async def handle_callback_query(
             "thinking": handle_thinking_callback,
             "resume": handle_resume_callback,
             "model": handle_model_callback,
+            "effort": handle_effort_callback,
             "engine": handle_engine_callback,
             "provider": handle_provider_callback,
         }
@@ -737,22 +884,7 @@ async def handle_cd_callback(
         # Send confirmation with new directory info
         relative_path = new_path.relative_to(settings.approved_directory)
 
-        # Add navigation buttons
-        keyboard = [
-            [
-                InlineKeyboardButton("📁 List Files", callback_data="action:ls"),
-                InlineKeyboardButton(
-                    "🆕 New Session", callback_data="action:new_session"
-                ),
-            ],
-            [
-                InlineKeyboardButton(
-                    "📋 Projects", callback_data="action:show_projects"
-                ),
-                InlineKeyboardButton("📊 Context", callback_data="action:context"),
-            ],
-        ]
-        reply_markup = InlineKeyboardMarkup(keyboard)
+        reply_markup = _build_main_quick_actions_reply_markup()
 
         await _edit_query_message_resilient(
             query,
@@ -804,12 +936,18 @@ async def handle_action_callback(
         "export": _handle_export_action,
     }
 
+    dispatch_query = query
+    if action_type in _PRESERVE_SOURCE_ACTIONS and _has_main_quick_actions_keyboard(
+        query
+    ):
+        dispatch_query = _PreserveSourceMessageQueryProxy(query, context)
+
     handler = actions.get(action_type)
     if handler:
-        await handler(query, context)
+        await handler(dispatch_query, context)
     else:
         await _edit_query_message_resilient(
-            query,
+            dispatch_query,
             f"❌ **Unknown Action: {action_type}**\n\n"
             "This action is not implemented yet.",
         )
@@ -1205,12 +1343,14 @@ async def _handle_status_action(query, context: ContextTypes.DEFAULT_TYPE) -> No
         or SessionInteractionService()
     )
     view_spec = session_interaction.build_context_view_spec(for_callback=True)
+    reply_markup = _build_main_quick_actions_reply_markup()
     loading_kwargs = {}
     if view_spec.loading_parse_mode:
         loading_kwargs["parse_mode"] = view_spec.loading_parse_mode
     await _edit_query_message_resilient(
         query,
         view_spec.loading_text,
+        reply_markup=reply_markup,
         **loading_kwargs,
     )
 
@@ -1241,10 +1381,13 @@ async def _handle_status_action(query, context: ContextTypes.DEFAULT_TYPE) -> No
             query,
             render_result.primary_text,
             parse_mode=render_result.parse_mode,
+            reply_markup=reply_markup,
         )
     except Exception as exc:
         logger.error("Error in context callback", error=str(exc), user_id=user_id)
-        await _edit_query_message_resilient(query, view_spec.error_text)
+        await _edit_query_message_resilient(
+            query, view_spec.error_text, reply_markup=reply_markup
+        )
 
 
 async def handle_model_callback(
@@ -1371,6 +1514,69 @@ async def handle_model_callback(
         "下一条消息将从新会话开始，确保模型切换生效。",
         parse_mode="Markdown",
         reply_markup=InlineKeyboardMarkup(keyboard),
+    )
+
+
+async def handle_effort_callback(
+    query, param: str, context: ContextTypes.DEFAULT_TYPE
+) -> None:
+    """Handle Codex reasoning effort callback from inline keyboard."""
+    _, scope_state = _get_scope_state_for_query(query, context)
+    active_engine = get_active_cli_engine(scope_state)
+    if active_engine != ENGINE_CODEX:
+        await _edit_query_message_resilient(
+            query,
+            "ℹ️ 当前引擎不支持思考深度设置。\n"
+            f"当前引擎：`{active_engine}`\n"
+            "请先切换：`/engine codex`",
+            parse_mode="Markdown",
+        )
+        return
+
+    codex_param = str(param or "").strip()
+    if not codex_param.startswith("codex:"):
+        await _edit_query_message_resilient(
+            query,
+            "ℹ️ 当前引擎：`codex`\n"
+            "请使用 Codex 思考深度按钮，或手动执行 `/effort <low|medium|high|xhigh>`。",
+            parse_mode="Markdown",
+        )
+        return
+
+    selected_raw = codex_param.split(":", 1)[1].strip()
+    if not selected_raw:
+        await _edit_query_message_resilient(
+            query,
+            "❌ 无效思考深度参数，请重新执行 `/effort` 选择。",
+            parse_mode="Markdown",
+        )
+        return
+
+    normalized = selected_raw.lower()
+    if normalized in {"default", "clear", "reset"}:
+        scope_state.pop(_CODEX_REASONING_EFFORT_KEY, None)
+        selected = "default"
+    else:
+        normalized_effort = _normalize_codex_reasoning_effort(selected_raw)
+        if not normalized_effort:
+            await _edit_query_message_resilient(
+                query,
+                "❌ 无效思考深度参数，可选值：`low` / `medium` / `high` / `xhigh`。",
+                parse_mode="Markdown",
+            )
+            return
+        scope_state[_CODEX_REASONING_EFFORT_KEY] = normalized_effort
+        selected = _normalize_reasoning_effort_label(normalized_effort)
+
+    await _edit_query_message_resilient(
+        query,
+        "✅ 已更新 Codex 思考深度设置。\n"
+        f"当前设置：`{selected}`\n\n"
+        "你也可以手动输入：`/effort <low|medium|high|xhigh>`",
+        parse_mode="Markdown",
+        reply_markup=_build_codex_effort_keyboard(
+            selected_effort=str(scope_state.get(_CODEX_REASONING_EFFORT_KEY) or "")
+        ),
     )
 
 
@@ -1886,6 +2092,9 @@ async def handle_quick_action_callback(
                 message_thread_id=getattr(query.message, "message_thread_id", None),
             ),
             model=_resolve_model_override(scope_state, active_engine, cli_integration),
+            reasoning_effort=_resolve_reasoning_effort_override(
+                scope_state, active_engine, cli_integration
+            ),
         )
 
         if claude_response:
@@ -2964,19 +3173,6 @@ async def _resume_start_new_session(
     except ValueError:
         rel = project_cwd.name
 
-    keyboard = [
-        [
-            InlineKeyboardButton(
-                "Start Coding",
-                callback_data="action:start_coding",
-            ),
-            InlineKeyboardButton(
-                "Context",
-                callback_data="action:context",
-            ),
-        ]
-    ]
-
     await _edit_query_message_resilient(
         query,
         f"**New Session Ready**\n\n"
@@ -2985,7 +3181,7 @@ async def _resume_start_new_session(
         f"Old session binding was cleared.\n"
         f"Send a message to start a fresh session now.",
         parse_mode="Markdown",
-        reply_markup=InlineKeyboardMarkup(keyboard),
+        reply_markup=_build_main_quick_actions_reply_markup(),
     )
 
     audit_logger: AuditLogger = context.bot_data.get("audit_logger")
@@ -3108,18 +3304,6 @@ async def _do_adopt_session(
         except ValueError:
             rel = project_cwd.name
 
-        keyboard = [
-            [
-                InlineKeyboardButton(
-                    "Start Coding",
-                    callback_data="action:start_coding",
-                ),
-                InlineKeyboardButton(
-                    "Context",
-                    callback_data="action:context",
-                ),
-            ],
-        ]
         history_block = ""
         if history_preview:
             history_block = "\n\n" + _build_resume_history_preview_text(history_preview)
@@ -3133,7 +3317,7 @@ async def _do_adopt_session(
             f"{history_block}\n\n"
             f"Send a message to continue where you left off.",
             parse_mode="Markdown",
-            reply_markup=InlineKeyboardMarkup(keyboard),
+            reply_markup=_build_main_quick_actions_reply_markup(),
         )
 
         audit_logger: AuditLogger = context.bot_data.get("audit_logger")

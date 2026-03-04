@@ -13,6 +13,7 @@ from src.config.settings import Settings
 
 
 def _build_manager(tmp_path: Path, **overrides) -> ClaudeProcessManager:
+    overrides.setdefault("codex_enable_mcp", False)
     config = Settings(
         telegram_bot_token="test:token",
         telegram_bot_username="testbot",
@@ -169,6 +170,36 @@ def test_build_command_for_codex_resume_uses_resume_subcommand(tmp_path, monkeyp
         "resume",
         "thread-123",
         "继续",
+    ]
+
+
+def test_build_command_for_codex_exec_includes_reasoning_effort_override(
+    tmp_path, monkeypatch
+):
+    """Codex CLI should inject reasoning effort as config override when provided."""
+    manager = _build_manager(tmp_path)
+    monkeypatch.setattr(
+        "src.claude.sdk_integration.find_claude_cli",
+        lambda _: "/usr/local/bin/codex",
+    )
+
+    cmd = manager._build_command(
+        prompt="hello codex",
+        session_id=None,
+        continue_session=False,
+        reasoning_effort="x-high",
+    )
+
+    assert cmd == [
+        "/usr/local/bin/codex",
+        "exec",
+        "--json",
+        "--skip-git-repo-check",
+        "-c",
+        "mcp_servers={}",
+        "-c",
+        'model_reasoning_effort="xhigh"',
+        "hello codex",
     ]
 
 

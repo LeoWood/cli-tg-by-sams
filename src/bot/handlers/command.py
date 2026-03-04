@@ -39,13 +39,19 @@ from ..utils.telegram_send import (
     send_message_resilient,
 )
 from ..utils.ui_adapter import build_reply_markup_from_spec
-from .message import build_permission_handler
+from .message import (
+    _resolve_model_override,
+    _resolve_reasoning_effort_override,
+    build_permission_handler,
+)
 
 logger = structlog.get_logger()
 _PARSE_MODE_UNSET = object()
 _CHAT_ACTION_HEARTBEAT_INTERVAL_SECONDS = 4.0
 _SUBPROCESS_DEFAULT_TIMEOUT_SECONDS = 8.0
 _OPSSTATUS_RESTART_TAIL_LINES = 20
+_CODEX_REASONING_EFFORT_KEY = "codex_reasoning_effort"
+_ALLOWED_CODEX_REASONING_EFFORTS = ("low", "medium", "high", "xhigh")
 
 
 def _get_project_root() -> Path:
@@ -294,6 +300,16 @@ def _normalize_reasoning_effort_label(raw: str) -> str:
     return mapping.get(normalized, normalized.title())
 
 
+def _normalize_codex_reasoning_effort(raw: str | None) -> str:
+    """Normalize Codex reasoning effort input to canonical value."""
+    normalized = str(raw or "").strip().lower().replace("_", "-")
+    if normalized == "x-high":
+        return "xhigh"
+    if normalized in _ALLOWED_CODEX_REASONING_EFFORTS:
+        return normalized
+    return ""
+
+
 def _is_claude_model_name(value: str | None) -> bool:
     """Return whether model id is a Claude alias/name."""
     normalized = str(value or "").strip().lower()
@@ -355,6 +371,37 @@ def _build_codex_model_keyboard(
     default_label = "✅ default" if not selected else "default"
     rows.append(
         [InlineKeyboardButton(default_label, callback_data="model:codex:default")]
+    )
+    return InlineKeyboardMarkup(rows)
+
+
+def _build_codex_effort_keyboard(
+    *,
+    selected_effort: str | None,
+    runtime_effort: str | None = None,
+) -> InlineKeyboardMarkup:
+    """Build inline keyboard for Codex reasoning effort selection."""
+    selected = _normalize_codex_reasoning_effort(selected_effort)
+    runtime = _normalize_codex_reasoning_effort(runtime_effort)
+    candidates: list[str] = []
+    for candidate in (selected, runtime, *_ALLOWED_CODEX_REASONING_EFFORTS):
+        value = _normalize_codex_reasoning_effort(candidate)
+        if not value or value in candidates:
+            continue
+        candidates.append(value)
+
+    rows: list[list[InlineKeyboardButton]] = []
+    for value in candidates:
+        label = _normalize_reasoning_effort_label(value)
+        if value == selected:
+            label = f"✅ {label}"
+        rows.append(
+            [InlineKeyboardButton(label, callback_data=f"effort:codex:{value}")]
+        )
+
+    default_label = "✅ default" if not selected else "default"
+    rows.append(
+        [InlineKeyboardButton(default_label, callback_data="effort:codex:default")]
     )
     return InlineKeyboardMarkup(rows)
 
@@ -548,10 +595,16 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         status_hint_line = "• Check `/context` to monitor your usage"
     if active_engine == ENGINE_CODEX:
         model_line = "• `/model [name|default]` - View or set Codex model\n"
+        effort_line = (
+            "• `/effort [low|medium|high|xhigh|default]`"
+            " - View or set Codex reasoning effort\n"
+        )
     elif capabilities.supports_model_selection:
         model_line = "• `/model` - View or switch Claude model\n"
+        effort_line = ""
     else:
         model_line = "• `/model` - View current model\n"
+        effort_line = ""
 
     help_text = (
         "🤖 **CLITG Help**\n\n"
@@ -570,7 +623,7 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         "• `/provider` - Switch API provider (cc-switch)\n"
         "• `/restartbot` - Restart bot service (admin)\n"
         "• `/opsstatus` - Show bot runtime ops status\n"
-        f"{model_line}"
+        f"{model_line}{effort_line}"
         "• `/export` - Export session history\n"
         "• `/actions` - Show context-aware quick actions\n"
         "• `/git` - Git repository information\n\n"
@@ -961,6 +1014,10 @@ async def continue_session(update: Update, context: ContextTypes.DEFAULT_TYPE) -
             permission_handler=permission_handler,
             use_empty_prompt_when_existing=False,
             allow_none_prompt_when_discover=False,
+            model=_resolve_model_override(scope_state, active_engine, cli_integration),
+            reasoning_effort=_resolve_reasoning_effort_override(
+                scope_state, active_engine, cli_integration
+            ),
         )
         claude_response = continue_result.response
 
@@ -2484,6 +2541,109 @@ async def model_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         f"Current model: `{current or 'default'}`\nSelect a model:",
         parse_mode="Markdown",
         reply_markup=InlineKeyboardMarkup(keyboard),
+    )
+
+
+async def effort_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle /effort command for Codex reasoning effort selection."""
+    settings: Settings = context.bot_data["settings"]
+    _, scope_state = get_scope_state_from_update(
+        user_data=context.user_data,
+        update=update,
+        default_directory=settings.approved_directory,
+    )
+    active_engine = get_active_cli_engine(scope_state)
+    if active_engine != ENGINE_CODEX:
+        await _reply_update_message_resilient(
+            update,
+            context,
+            "ℹ️ 当前引擎不支持 `/effort`。\n"
+            f"当前引擎：`{active_engine}`\n"
+            "请先切换：`/engine codex`",
+            parse_mode="Markdown",
+        )
+        return
+
+    session_id = str(scope_state.get("claude_session_id") or "").strip()
+    codex_snapshot: dict | None = None
+    if session_id:
+        codex_snapshot = SessionService.get_cached_codex_snapshot(session_id)
+        if codex_snapshot is None:
+            codex_snapshot = SessionService._probe_codex_session_snapshot(session_id)
+
+    runtime_effort = ""
+    if isinstance(codex_snapshot, dict):
+        runtime_effort = _normalize_codex_reasoning_effort(
+            str(codex_snapshot.get("reasoning_effort") or "").strip()
+        )
+
+    selected_effort = _normalize_codex_reasoning_effort(
+        str(scope_state.get(_CODEX_REASONING_EFFORT_KEY) or "").strip()
+    )
+    if selected_effort:
+        scope_state[_CODEX_REASONING_EFFORT_KEY] = selected_effort
+    else:
+        scope_state.pop(_CODEX_REASONING_EFFORT_KEY, None)
+
+    requested_effort = " ".join(context.args or []).strip()
+    if requested_effort:
+        requested_norm = requested_effort.lower()
+        if requested_norm in {"default", "clear", "reset"}:
+            scope_state.pop(_CODEX_REASONING_EFFORT_KEY, None)
+            selected_display = "default"
+        else:
+            normalized_effort = _normalize_codex_reasoning_effort(requested_effort)
+            if not normalized_effort:
+                await _reply_update_message_resilient(
+                    update,
+                    context,
+                    "❌ 无效思考深度。\n"
+                    "可选值：`low` / `medium` / `high` / `xhigh`。\n"
+                    "恢复默认：`/effort default`",
+                    parse_mode="Markdown",
+                    reply_markup=_build_codex_effort_keyboard(
+                        selected_effort=selected_effort,
+                        runtime_effort=runtime_effort,
+                    ),
+                )
+                return
+            scope_state[_CODEX_REASONING_EFFORT_KEY] = normalized_effort
+            selected_display = _normalize_reasoning_effort_label(normalized_effort)
+
+        await _reply_update_message_resilient(
+            update,
+            context,
+            "✅ 已更新 Codex 思考深度设置。\n"
+            f"当前设置：`{selected_display}`\n\n"
+            "该设置会用于后续 Codex 请求（通过 `-c model_reasoning_effort=...` 传递）。\n"
+            "恢复默认：`/effort default`",
+            parse_mode="Markdown",
+            reply_markup=_build_codex_effort_keyboard(
+                selected_effort=str(scope_state.get(_CODEX_REASONING_EFFORT_KEY) or ""),
+                runtime_effort=runtime_effort,
+            ),
+        )
+        return
+
+    effort_display_raw = selected_effort or runtime_effort
+    effort_display = (
+        _normalize_reasoning_effort_label(effort_display_raw)
+        if effort_display_raw
+        else "default"
+    )
+
+    await _reply_update_message_resilient(
+        update,
+        context,
+        "ℹ️ 当前引擎：`codex`\n"
+        f"当前思考深度：`{effort_display}`\n\n"
+        "可直接切换：`/effort <low|medium|high|xhigh>`，或点下方按钮选择。\n"
+        "恢复默认：`/effort default`",
+        parse_mode="Markdown",
+        reply_markup=_build_codex_effort_keyboard(
+            selected_effort=selected_effort,
+            runtime_effort=runtime_effort,
+        ),
     )
 
 

@@ -174,6 +174,7 @@ claude auth status
 | `/status [full]` | `/context` 的兼容别名 | 全部（Codex 主展示） |
 | `/model` | Claude：按钮切换 Sonnet/Opus/Haiku | Claude |
 | `/model [name\|default]` | Codex：设置/清除 `--model` | Codex |
+| `/effort [low\|medium\|high\|xhigh\|default]` | Codex：设置/清除思考深度 | Codex |
 | `/codexdiag [root\|<session_id>]` | 诊断 Codex MCP 调用情况 | Codex |
 | `/cd <path>` | 切换目录（带安全校验） | 全部 |
 | `/ls` | 列出当前目录内容 | 全部 |

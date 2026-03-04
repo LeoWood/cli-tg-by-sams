@@ -803,14 +803,9 @@ class ResponseFormatter:
         """Get menu-like inline keyboard for common command entry points."""
         keyboard = [
             [
-                InlineKeyboardButton("📋 Projects", callback_data="action:show_projects"),
-                InlineKeyboardButton("📁 Files", callback_data="action:ls"),
-                InlineKeyboardButton("📊 Status", callback_data="action:status"),
-            ],
-            [
                 InlineKeyboardButton("🆕 New", callback_data="action:new_session"),
-                InlineKeyboardButton("🔁 Resume", callback_data="action:resume"),
-                InlineKeyboardButton("❓ Help", callback_data="action:help"),
+                InlineKeyboardButton("📋 Projects", callback_data="action:show_projects"),
+                InlineKeyboardButton("📊 Status", callback_data="action:status"),
             ],
         ]
 

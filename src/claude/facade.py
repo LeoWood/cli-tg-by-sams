@@ -70,6 +70,7 @@ class ClaudeIntegration:
         force_new_session: bool = False,
         permission_handler: Optional[PermissionRequestCallback] = None,
         model: Optional[str] = None,
+        reasoning_effort: Optional[str] = None,
         images: Optional[List[Dict[str, str]]] = None,
     ) -> ClaudeResponse:
         """Run Claude Code command with full integration."""
@@ -197,6 +198,7 @@ class ClaudeIntegration:
                     stream_callback=stream_handler,
                     permission_callback=permission_callback,
                     model=model,
+                    reasoning_effort=reasoning_effort,
                     images=images,
                 )
             except asyncio.CancelledError:
@@ -229,6 +231,7 @@ class ClaudeIntegration:
                                 stream_callback=stream_handler,
                                 permission_callback=permission_callback,
                                 model=model,
+                                reasoning_effort=reasoning_effort,
                                 images=images,
                             )
                         except Exception:
@@ -272,6 +275,7 @@ class ClaudeIntegration:
                             stream_callback=stream_handler,
                             permission_callback=permission_callback,
                             model=model,
+                            reasoning_effort=reasoning_effort,
                             images=images,
                         )
                 elif not is_signature_failure:
@@ -381,6 +385,7 @@ class ClaudeIntegration:
         stream_callback: Optional[Callable] = None,
         permission_callback: Optional[Callable] = None,
         model: Optional[str] = None,
+        reasoning_effort: Optional[str] = None,
         images: Optional[List[Dict[str, str]]] = None,
     ) -> ClaudeResponse:
         """Execute command with SDK->subprocess fallback on retryable errors.
@@ -537,6 +542,7 @@ class ClaudeIntegration:
                             continue_session=False,
                             stream_callback=stream_callback,
                             model=model,
+                            reasoning_effort=reasoning_effort,
                             images=images,
                         )
                         logger.info("Subprocess fallback succeeded")
@@ -567,6 +573,7 @@ class ClaudeIntegration:
                 continue_session=continue_session,
                 stream_callback=stream_callback,
                 model=model,
+                reasoning_effort=reasoning_effort,
                 images=images,
             )
 
@@ -604,6 +611,8 @@ class ClaudeIntegration:
         prompt: Optional[str] = None,
         on_stream: Optional[Callable[[StreamUpdate], None]] = None,
         permission_handler: Optional[PermissionRequestCallback] = None,
+        model: Optional[str] = None,
+        reasoning_effort: Optional[str] = None,
     ) -> Optional[ClaudeResponse]:
         """Continue the most recent session."""
         logger.info(
@@ -640,6 +649,8 @@ class ClaudeIntegration:
             session_id=latest_session.session_id,
             on_stream=on_stream,
             permission_handler=permission_handler,
+            model=model,
+            reasoning_effort=reasoning_effort,
         )
 
     async def get_session_info(self, session_id: str) -> Optional[Dict[str, Any]]:

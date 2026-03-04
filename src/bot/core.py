@@ -60,8 +60,7 @@ _DEFAULT_POLLING_UPDATE_STALL_SECONDS = 0.0
 _DEFAULT_TELEGRAM_USER_DATA_PERSISTENCE_PATH = Path("data/telegram-user-data.pkl")
 _USER_DATA_PERSISTENCE_UPDATE_INTERVAL_SECONDS = 10.0
 _STARTUP_RECOVERY_BROADCAST_TEXT = (
-    "♻️ Bot 服务已恢复在线（全局重启完成）。\n"
-    "你可以继续在当前会话发送消息。"
+    "♻️ Bot 服务已恢复在线（全局重启完成）。\n" "你可以继续在当前会话发送消息。"
 )
 
 
@@ -346,6 +345,7 @@ class ClaudeCodeBot:
             ("opsstatus", command.ops_status_command),
             ("resume", command.resume_command),
             ("model", command.model_command),
+            ("effort", command.effort_command),
             ("codexdiag", command.codex_diag_command),
             ("provider", command.switch_provider),
         ]
@@ -889,7 +889,7 @@ class ClaudeCodeBot:
 
     async def _polling_watchdog_tick(self) -> None:
         """Watch polling status and trigger self-recovery when needed."""
-        if getattr(self.settings, "webhook_url", None) or not self.app:
+        if not self.app:
             return
 
         now = asyncio.get_running_loop().time()
@@ -968,9 +968,20 @@ class ClaudeCodeBot:
 
         await self.initialize()
 
+        webhook_configured = bool(getattr(self.settings, "webhook_url", None))
         logger.info(
-            "Starting bot", mode="webhook" if self.settings.webhook_url else "polling"
+            "Starting bot",
+            mode="polling",
+            webhook_configured=webhook_configured,
+            webhook_mode_enabled=False,
         )
+        if webhook_configured:
+            logger.warning(
+                "Webhook mode is disabled; ignoring webhook settings",
+                webhook_url=self.settings.webhook_url,
+                webhook_port=self.settings.webhook_port,
+                webhook_path=self.settings.webhook_path,
+            )
 
         try:
             self.is_running = True
@@ -983,28 +994,17 @@ class ClaudeCodeBot:
             self._last_update_monotonic = 0.0
             self._last_update_id = None
 
-            if self.settings.webhook_url:
-                # Webhook mode
-                await self.app.run_webhook(
-                    listen="0.0.0.0",
-                    port=self.settings.webhook_port,
-                    url_path=self.settings.webhook_path,
-                    webhook_url=self.settings.webhook_url,
-                    drop_pending_updates=False,
-                    allowed_updates=Update.ALL_TYPES,
-                )
-            else:
-                # Polling mode - initialize and start polling manually
-                await self.app.initialize()
-                await self.app.start()
-                await self._start_polling()
-                self._reset_polling_recovery_state()
-                await self._broadcast_startup_recovery_notification()
+            # Polling mode only (webhook mode is intentionally disabled).
+            await self.app.initialize()
+            await self.app.start()
+            await self._start_polling()
+            self._reset_polling_recovery_state()
+            await self._broadcast_startup_recovery_notification()
 
-                # Keep running until manually stopped
-                while self.is_running:
-                    await asyncio.sleep(_POLLING_WATCHDOG_INTERVAL_SECONDS)
-                    await self._polling_watchdog_tick()
+            # Keep running until manually stopped
+            while self.is_running:
+                await asyncio.sleep(_POLLING_WATCHDOG_INTERVAL_SECONDS)
+                await self._polling_watchdog_tick()
         except Exception as e:
             logger.error("Error running bot", error=str(e))
             raise ClaudeCodeTelegramError(f"Failed to start bot: {str(e)}") from e
@@ -1217,10 +1217,9 @@ class ClaudeCodeBot:
                 "can_join_groups": me.can_join_groups,
                 "can_read_all_group_messages": me.can_read_all_group_messages,
                 "supports_inline_queries": me.supports_inline_queries,
-                "webhook_url": self.settings.webhook_url,
-                "webhook_port": (
-                    self.settings.webhook_port if self.settings.webhook_url else None
-                ),
+                "webhook_url": None,
+                "webhook_port": None,
+                "webhook_mode_enabled": False,
             }
         except Exception as e:
             logger.error("Failed to get bot info", error=str(e))

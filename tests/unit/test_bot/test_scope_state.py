@@ -33,6 +33,7 @@ def test_get_scope_state_seeds_config_only_from_legacy_user_data() -> None:
         "current_directory": Path("/tmp/project"),
         "claude_session_id": "sess-123",
         "claude_model": "sonnet",
+        "codex_reasoning_effort": "high",
         "force_new_session": True,
         "session_started": True,
         "last_message": "hello",
@@ -47,6 +48,7 @@ def test_get_scope_state_seeds_config_only_from_legacy_user_data() -> None:
     # Config-like keys should be inherited
     assert state["current_directory"] == Path("/tmp/project")
     assert state["claude_model"] == "sonnet"
+    assert state["codex_reasoning_effort"] == "high"
 
     # Session-identity keys must NOT be inherited
     assert "claude_session_id" not in state

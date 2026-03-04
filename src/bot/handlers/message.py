@@ -58,6 +58,8 @@ _CHAT_ACTION_HEARTBEAT_INTERVAL_SECONDS = 4.0
 _AUTO_IMAGE_ATTACHMENTS_LIMIT = 3
 _AUTO_FILE_ATTACHMENTS_LIMIT = 3
 _AUTO_IMAGE_MAX_FILE_SIZE_BYTES = 50 * 1024 * 1024  # Telegram bot document limit
+_CODEX_REASONING_EFFORT_KEY = "codex_reasoning_effort"
+_ALLOWED_CODEX_REASONING_EFFORTS = ("low", "medium", "high", "xhigh")
 _AUTO_IMAGE_SUFFIXES = {".png", ".jpg", ".jpeg", ".webp", ".gif", ".bmp"}
 _AUTO_FILE_SUFFIXES = {
     ".txt",
@@ -741,6 +743,16 @@ def _is_claude_model_name(value: str | None) -> bool:
     return any(token in normalized for token in ("claude", "sonnet", "opus", "haiku"))
 
 
+def _normalize_codex_reasoning_effort(raw: str | None) -> str:
+    """Normalize Codex reasoning effort value to canonical form."""
+    normalized = str(raw or "").strip().lower().replace("_", "-")
+    if normalized == "x-high":
+        return "xhigh"
+    if normalized in _ALLOWED_CODEX_REASONING_EFFORTS:
+        return normalized
+    return ""
+
+
 def _detect_integration_cli_kind(cli_integration: Any | None) -> str | None:
     """Best-effort detect CLI kind from integration; None means unknown."""
     process_manager = getattr(cli_integration, "process_manager", None)
@@ -779,6 +791,28 @@ def _resolve_model_override(
         "Ignoring non-Claude model override in Claude mode",
         model=selected_model,
     )
+    return None
+
+
+def _resolve_reasoning_effort_override(
+    scope_state: dict[str, Any],
+    active_engine: str | None,
+    cli_integration: Any | None = None,
+) -> str | None:
+    """Resolve safe Codex reasoning effort override for current engine."""
+    selected_effort = _normalize_codex_reasoning_effort(
+        str(scope_state.get(_CODEX_REASONING_EFFORT_KEY) or "").strip()
+    )
+    if not selected_effort:
+        return None
+
+    normalized_engine = normalize_cli_engine(active_engine)
+    if cli_integration is not None:
+        detected_kind = _detect_integration_cli_kind(cli_integration)
+        if detected_kind:
+            normalized_engine = normalize_cli_engine(detected_kind)
+    if normalized_engine == ENGINE_CODEX:
+        return selected_effort
     return None
 
 
@@ -1437,22 +1471,10 @@ async def _format_progress_update(update_obj) -> Optional[str]:
         return f"🤖 *{engine_label} is working...*\n\n{safe_preview}"
 
     elif update_obj.type == "system":
-        # System initialization or other system messages
-        if update_obj.metadata and update_obj.metadata.get("subtype") == "init":
-            tools_count = len(update_obj.metadata.get("tools", []))
-            # Avoid showing potentially stale requested/default model names here.
-            # Actual model should be shown only after resolution.
-            engine_label = _stream_engine_label(update_obj)
-            return (
-                f"🚀 *{engine_label} is preparing your request* "
-                f"with {tools_count} tools available"
-            )
-        if (
-            update_obj.metadata
-            and update_obj.metadata.get("subtype") == "model_resolved"
-        ):
-            model = _escape_md(update_obj.metadata.get("model", "Claude"))
-            return f"🧠 *Using model:* {model}"
+        metadata = update_obj.metadata or {}
+        # Keep system init/model selection updates silent to reduce default prefix noise.
+        if metadata.get("subtype") in {"init", "model_resolved"}:
+            return None
 
     return None
 
@@ -2096,6 +2118,10 @@ async def handle_text_message(
 
     typing_stop_event = asyncio.Event()
     typing_heartbeat_task: Optional[asyncio.Task] = None
+    # Defensive defaults for outer exception cleanup path.
+    progress_msg: Any | None = None
+    all_progress_lines: list[str] = []
+    frozen_messages: list[Any] = []
 
     try:
         # Check rate limit with estimated cost for text processing
@@ -2420,6 +2446,9 @@ async def handle_text_message(
                 force_new_session=force_new_session,
                 permission_handler=permission_handler,
                 model=_resolve_model_override(
+                    scope_state, active_engine, cli_integration
+                ),
+                reasoning_effort=_resolve_reasoning_effort_override(
                     scope_state, active_engine, cli_integration
                 ),
             )
@@ -2767,68 +2796,102 @@ async def handle_text_message(
         logger.info("Text message processed successfully", user_id=user_id)
 
     except Exception as e:
+        resolved_engine = locals().get("active_engine", ENGINE_CLAUDE)
         # Clean up progress message: collapse to summary if possible
         try:
-            if all_progress_lines:
-                summary_text = "[Error] " + _generate_thinking_summary(
-                    all_progress_lines
-                )
-                thinking_keyboard = InlineKeyboardMarkup(
-                    [
-                        [
-                            InlineKeyboardButton(
-                                "View thinking process",
-                                callback_data=f"thinking:expand:{progress_msg.message_id}",
-                            )
-                        ]
-                    ]
-                )
-                await progress_msg.edit_text(
-                    summary_text,
-                    parse_mode="Markdown",
-                    reply_markup=thinking_keyboard,
-                )
-                _cache_thinking_data(
-                    context, progress_msg.message_id, all_progress_lines, summary_text
-                )
-            else:
-                await progress_msg.delete()
-        except:
-            pass
+            if progress_msg is not None:
+                if all_progress_lines:
+                    summary_text = "[Error] " + _generate_thinking_summary(
+                        all_progress_lines
+                    )
+                    progress_message_id = getattr(progress_msg, "message_id", None)
+                    if progress_message_id:
+                        thinking_keyboard = InlineKeyboardMarkup(
+                            [
+                                [
+                                    InlineKeyboardButton(
+                                        "View thinking process",
+                                        callback_data=(
+                                            f"thinking:expand:{progress_message_id}"
+                                        ),
+                                    )
+                                ]
+                            ]
+                        )
+                        await progress_msg.edit_text(
+                            summary_text,
+                            parse_mode="Markdown",
+                            reply_markup=thinking_keyboard,
+                        )
+                        _cache_thinking_data(
+                            context,
+                            progress_message_id,
+                            all_progress_lines,
+                            summary_text,
+                        )
+                    else:
+                        await progress_msg.edit_text(summary_text, parse_mode="Markdown")
+                else:
+                    await progress_msg.delete()
+        except Exception as cleanup_error:
+            logger.warning(
+                "Failed to clean up progress message after error",
+                error=str(cleanup_error),
+                user_id=user_id,
+            )
 
         # Clean up frozen messages
         for frozen_msg in frozen_messages:
             try:
                 await frozen_msg.delete()
-            except:
+            except Exception:
                 pass
 
-        error_msg = _format_error_message(
-            str(e),
-            engine=locals().get("active_engine", ENGINE_CLAUDE),
-        )
-        await _reply_text_resilient(
-            update.message,
-            _with_engine_badge(error_msg, locals().get("active_engine", ENGINE_CLAUDE)),
-            parse_mode="Markdown",
-        )
-        await _set_message_reaction_safe(
-            context.bot,
-            chat_id=input_chat_id,
-            message_id=input_message_id,
-            emoji=_BOT_REACTION_FAILED,
-        )
+        error_msg = _format_error_message(str(e), engine=resolved_engine)
+        try:
+            await _reply_text_resilient(
+                update.message,
+                _with_engine_badge(error_msg, resolved_engine),
+                parse_mode="Markdown",
+            )
+        except Exception as send_error:
+            logger.warning(
+                "Failed to send formatted error message",
+                error=str(send_error),
+                user_id=user_id,
+            )
+
+        try:
+            await _set_message_reaction_safe(
+                context.bot,
+                chat_id=input_chat_id,
+                message_id=input_message_id,
+                emoji=_BOT_REACTION_FAILED,
+            )
+        except Exception as reaction_error:
+            logger.warning(
+                "Failed to set failure reaction after text error",
+                error=str(reaction_error),
+                user_id=user_id,
+            )
 
         # Log failed processing
         if audit_logger:
-            await audit_logger.log_command(
-                user_id=user_id,
-                command="text_message",
-                args=[message_text[:100]],
-                success=False,
-            )
+            try:
+                await audit_logger.log_command(
+                    user_id=user_id,
+                    command="text_message",
+                    args=[message_text[:100]],
+                    success=False,
+                )
+            except Exception as audit_error:
+                logger.warning(
+                    "Failed to log failed text command audit event",
+                    error=str(audit_error),
+                    user_id=user_id,
+                )
 
-        logger.error("Error processing text message", error=str(e), user_id=user_id)
+        logger.exception("Error processing text message", error=str(e), user_id=user_id)
     finally:
         typing_stop_event.set()
         if typing_heartbeat_task and not typing_heartbeat_task.done():
@@ -3033,6 +3096,9 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
                 force_new_session=force_new_session,
                 permission_handler=permission_handler,
                 model=_resolve_model_override(
+                    scope_state, active_engine, cli_integration
+                ),
+                reasoning_effort=_resolve_reasoning_effort_override(
                     scope_state, active_engine, cli_integration
                 ),
             )
@@ -3584,6 +3650,9 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
                             force_new_session=force_new_session,
                             permission_handler=permission_handler,
                             model=_resolve_model_override(
+                                scope_state, active_engine, cli_integration
+                            ),
+                            reasoning_effort=_resolve_reasoning_effort_override(
                                 scope_state, active_engine, cli_integration
                             ),
                             images=images,

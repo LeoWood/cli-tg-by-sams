@@ -330,36 +330,17 @@ def _render_model_usage_lines(model_usage: dict | None) -> list[str]:
 class SessionInteractionService:
     """Provide reusable continue/export interaction texts and keyboard specs."""
 
-    _NEW_SESSION_KEYBOARD: KeyboardSpec = [
+    _MAIN_QUICK_ACTIONS_KEYBOARD: KeyboardSpec = [
         [
-            ("📝 Start Coding", "action:start_coding"),
-            ("📁 Change Project", "action:show_projects"),
-        ],
-        [
-            ("📋 Quick Actions", "action:quick_actions"),
-            ("❓ Help", "action:help"),
-        ],
-    ]
-    _END_NO_ACTIVE_CALLBACK_KEYBOARD: KeyboardSpec = [
-        [("🆕 New Session", "action:new_session")],
-        [("📊 Context", "action:context")],
-    ]
-    _END_SUCCESS_KEYBOARD: KeyboardSpec = [
-        [
-            ("🆕 New Session", "action:new_session"),
-            ("📁 Change Project", "action:show_projects"),
-        ],
-        [
-            ("📊 Context", "action:context"),
-            ("❓ Help", "action:help"),
-        ],
-    ]
-    _CONTINUE_NOT_FOUND_KEYBOARD: KeyboardSpec = [
-        [
-            ("🆕 New Session", "action:new_session"),
-            ("📊 Context", "action:context"),
+            ("🆕 New", "action:new_session"),
+            ("📋 Projects", "action:show_projects"),
+            ("📊 Status", "action:status"),
         ]
     ]
+    _NEW_SESSION_KEYBOARD: KeyboardSpec = _MAIN_QUICK_ACTIONS_KEYBOARD
+    _END_NO_ACTIVE_CALLBACK_KEYBOARD: KeyboardSpec = _MAIN_QUICK_ACTIONS_KEYBOARD
+    _END_SUCCESS_KEYBOARD: KeyboardSpec = _MAIN_QUICK_ACTIONS_KEYBOARD
+    _CONTINUE_NOT_FOUND_KEYBOARD: KeyboardSpec = _MAIN_QUICK_ACTIONS_KEYBOARD
     _EXPORT_SELECTOR_KEYBOARD: KeyboardSpec = [
         [
             ("📝 Markdown", "export:markdown"),
@@ -377,6 +358,11 @@ class SessionInteractionService:
     _CONTEXT_COMMAND_LOADING_TEXT = "⏳ 正在获取会话状态，请稍候..."
     _CONTEXT_CALLBACK_LOADING_TEXT = "**Session Context**\n\n⏳ 正在刷新状态，请稍候..."
     _CONTEXT_ERROR_TEXT = "❌ 获取状态失败，请稍后重试。"
+
+    @classmethod
+    def build_main_quick_actions_keyboard(cls) -> KeyboardSpec:
+        """Return the shared three-button quick actions keyboard."""
+        return [row.copy() for row in cls._MAIN_QUICK_ACTIONS_KEYBOARD]
 
     @staticmethod
     def _relative_path_label(current_dir: Path, approved_directory: Path) -> str:
@@ -638,8 +624,8 @@ class SessionInteractionService:
                     "ℹ️ **No Active Session**\n\n"
                     "There's no active Claude session to end.\n\n"
                     "**What you can do:**\n"
-                    "• Use the button below to start a new session\n"
-                    "• Check your session context\n"
+                    "• Use the buttons below for next actions\n"
+                    "• Check your session status/context\n"
                     "• Send any message to start a conversation"
                 ),
                 keyboard=self._END_NO_ACTIVE_CALLBACK_KEYBOARD,
@@ -669,7 +655,7 @@ class SessionInteractionService:
         if for_callback:
             next_steps = (
                 "• Start a new session\n"
-                "• Check context\n"
+                "• Check status/context\n"
                 "• Send any message to begin a new conversation"
             )
         else:
@@ -728,8 +714,8 @@ class SessionInteractionService:
                 f"No recent Claude session found in this directory.\n"
                 f"Directory: `{self._relative_path_label(current_dir, approved_directory)}`\n\n"
                 f"**What you can do:**\n"
-                f"• Use the button below to start a fresh session\n"
-                f"• Check your session context\n"
+                f"• Use the buttons below for next actions\n"
+                f"• Check your session status/context\n"
                 f"• Navigate to a different directory"
             )
         else:

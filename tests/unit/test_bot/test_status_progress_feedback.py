@@ -182,7 +182,16 @@ async def test_status_callback_shows_loading_message_before_refresh_result(tmp_p
     calls = query.edit_message_text.await_args_list
     assert "正在刷新状态" in calls[0].args[0]
     assert "Session: none" in calls[1].args[0]
-    assert "reply_markup" not in calls[1].kwargs
+    loading_markup = calls[0].kwargs.get("reply_markup")
+    final_markup = calls[1].kwargs.get("reply_markup")
+    assert loading_markup is not None
+    assert final_markup is not None
+    callbacks = [
+        button.callback_data
+        for row in final_markup.inline_keyboard
+        for button in row
+    ]
+    assert callbacks == ["action:new_session", "action:show_projects", "action:status"]
 
 
 @pytest.mark.asyncio
@@ -218,6 +227,7 @@ async def test_status_callback_uses_context_error_message_on_snapshot_failure(tm
     calls = query.edit_message_text.await_args_list
     assert "正在刷新状态" in calls[0].args[0]
     assert calls[1].args[0] == "❌ 获取状态失败，请稍后重试。"
+    assert calls[1].kwargs.get("reply_markup") is not None
 
 
 @pytest.mark.asyncio

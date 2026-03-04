@@ -4,8 +4,37 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
 import pytest
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup
 
 from src.bot.handlers import callback as callback_handler
+
+
+def _build_main_quick_actions_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton("🆕 New", callback_data="action:new_session"),
+                InlineKeyboardButton(
+                    "📋 Projects", callback_data="action:show_projects"
+                ),
+                InlineKeyboardButton("📊 Status", callback_data="action:status"),
+            ],
+        ]
+    )
+
+
+def test_build_main_quick_actions_reply_markup_uses_main_menu_buttons():
+    """Callback helper should generate the same three-button main menu."""
+    markup = callback_handler._build_main_quick_actions_reply_markup()
+    callbacks = [
+        button.callback_data for row in markup.inline_keyboard for button in row
+    ]
+
+    assert callbacks == [
+        "action:new_session",
+        "action:show_projects",
+        "action:status",
+    ]
 
 
 @pytest.mark.asyncio
@@ -20,6 +49,54 @@ async def test_handle_action_callback_routes_resume(monkeypatch):
     await callback_handler.handle_action_callback(query, "resume", context)
 
     resume_handler.assert_awaited_once_with(query, context)
+
+
+@pytest.mark.asyncio
+async def test_handle_action_callback_wraps_main_menu_actions(monkeypatch):
+    """Main quick-action callbacks should preserve source message content."""
+    status_handler = AsyncMock()
+    monkeypatch.setattr(callback_handler, "_handle_status_action", status_handler)
+
+    query = SimpleNamespace(
+        message=SimpleNamespace(reply_markup=_build_main_quick_actions_keyboard())
+    )
+    context = SimpleNamespace()
+
+    await callback_handler.handle_action_callback(query, "status", context)
+
+    dispatched_query = status_handler.await_args.args[0]
+    assert dispatched_query is not query
+    assert isinstance(
+        dispatched_query, callback_handler._PreserveSourceMessageQueryProxy
+    )
+
+
+@pytest.mark.asyncio
+async def test_preserve_source_query_proxy_replies_once_then_edits():
+    """Proxy should create a new reply bubble, then edit that bubble."""
+    target_message = SimpleNamespace(
+        edit_text=AsyncMock(), edit_reply_markup=AsyncMock()
+    )
+    source_message = SimpleNamespace(
+        message_id=42,
+        reply_text=AsyncMock(return_value=target_message),
+    )
+    query = SimpleNamespace(
+        message=source_message,
+        edit_message_reply_markup=AsyncMock(),
+        edit_message_text=AsyncMock(),
+    )
+    proxy = callback_handler._PreserveSourceMessageQueryProxy(query, SimpleNamespace())
+
+    await proxy.edit_message_text("loading", parse_mode="Markdown")
+    await proxy.edit_message_text("done")
+
+    query.edit_message_reply_markup.assert_awaited_once_with(reply_markup=None)
+    source_message.reply_text.assert_awaited_once_with(
+        "loading", parse_mode="Markdown", reply_to_message_id=42
+    )
+    query.edit_message_text.assert_not_called()
+    target_message.edit_text.assert_awaited_once_with("done")
 
 
 @pytest.mark.asyncio

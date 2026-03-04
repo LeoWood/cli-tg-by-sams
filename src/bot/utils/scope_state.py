@@ -15,6 +15,7 @@ SCOPE_STATE_CONTAINER_KEY = "scope_state"
 _LEGACY_SEED_INHERIT_KEYS = {
     "current_directory",
     "claude_model",
+    "codex_reasoning_effort",
 }
 
 
@@ -109,7 +110,9 @@ def get_scope_state(
     if not isinstance(state, dict):
         state = {}
         scope_map[scope_key] = state
-        _seed_state_from_legacy(user_data=user_data, state=state, default_directory=default_directory)
+        _seed_state_from_legacy(
+            user_data=user_data, state=state, default_directory=default_directory
+        )
     return state
 
 

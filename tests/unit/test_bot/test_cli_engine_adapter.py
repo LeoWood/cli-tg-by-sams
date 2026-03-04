@@ -10,12 +10,14 @@ from src.bot.handlers.callback import (
     _do_adopt_session,
     _resume_select_project,
     handle_engine_callback,
+    handle_effort_callback,
     handle_model_callback,
     handle_quick_action_callback,
     handle_resume_callback,
 )
 from src.bot.handlers.command import (
     codex_diag_command,
+    effort_command,
     help_command,
     model_command,
     resume_command,
@@ -468,6 +470,103 @@ async def test_model_command_codex_formats_reasoning_effort_from_snapshot(
 
     rendered = update.message.reply_text.await_args.args[0]
     assert "当前模型：`gpt-5 (X High)`" in rendered
+
+
+@pytest.mark.asyncio
+async def test_effort_command_shows_switch_hint_for_codex_engine(tmp_path):
+    """Codex /effort without args should show current effort and switch hint."""
+    approved = tmp_path / "approved"
+    approved.mkdir()
+    user_id = 10044
+    scope_key = _scope_key(user_id, user_id)
+    update = SimpleNamespace(
+        effective_user=SimpleNamespace(id=user_id),
+        effective_chat=SimpleNamespace(id=user_id),
+        effective_message=SimpleNamespace(message_thread_id=None),
+        message=SimpleNamespace(reply_text=AsyncMock()),
+    )
+    context = SimpleNamespace(
+        args=[],
+        bot_data={"settings": _build_settings(approved)},
+        user_data={"scope_state": {scope_key: {ENGINE_STATE_KEY: "codex"}}},
+    )
+
+    await effort_command(update, context)
+
+    rendered = update.message.reply_text.await_args.args[0]
+    assert "当前引擎：`codex`" in rendered
+    assert "当前思考深度：`default`" in rendered
+    assert "/effort <low|medium|high|xhigh>" in rendered
+    assert "/effort default" in rendered
+    keyboard = update.message.reply_text.await_args.kwargs[
+        "reply_markup"
+    ].inline_keyboard
+    callback_ids = [btn.callback_data for row in keyboard for btn in row]
+    assert "effort:codex:high" in callback_ids
+    assert "effort:codex:default" in callback_ids
+
+
+@pytest.mark.asyncio
+async def test_effort_command_codex_can_set_and_reset_effort(tmp_path):
+    """Codex /effort should support setting explicit effort and resetting default."""
+    approved = tmp_path / "approved"
+    approved.mkdir()
+    user_id = 10045
+    scope_key = _scope_key(user_id, user_id)
+    update = SimpleNamespace(
+        effective_user=SimpleNamespace(id=user_id),
+        effective_chat=SimpleNamespace(id=user_id),
+        effective_message=SimpleNamespace(message_thread_id=None),
+        message=SimpleNamespace(reply_text=AsyncMock()),
+    )
+    context = SimpleNamespace(
+        args=["x-high"],
+        bot_data={"settings": _build_settings(approved)},
+        user_data={"scope_state": {scope_key: {ENGINE_STATE_KEY: "codex"}}},
+    )
+
+    await effort_command(update, context)
+
+    scope_state = context.user_data["scope_state"][scope_key]
+    assert scope_state["codex_reasoning_effort"] == "xhigh"
+    rendered = update.message.reply_text.await_args.args[0]
+    assert "已更新 Codex 思考深度设置" in rendered
+    assert "当前设置：`X High`" in rendered
+
+    context.args = ["default"]
+    await effort_command(update, context)
+    assert "codex_reasoning_effort" not in scope_state
+
+
+@pytest.mark.asyncio
+async def test_effort_callback_sets_effort_for_codex_engine(tmp_path):
+    """Codex effort callback should persist value and refresh keyboard."""
+    approved = tmp_path / "approved"
+    approved.mkdir()
+    user_id = 10046
+    scope_key = _scope_key(user_id, user_id)
+    query = SimpleNamespace(
+        from_user=SimpleNamespace(id=user_id),
+        message=SimpleNamespace(
+            chat=SimpleNamespace(id=user_id), message_thread_id=None
+        ),
+        edit_message_text=AsyncMock(),
+    )
+    context = SimpleNamespace(
+        bot_data={"settings": _build_settings(approved)},
+        user_data={"scope_state": {scope_key: {ENGINE_STATE_KEY: "codex"}}},
+    )
+
+    await handle_effort_callback(query, "codex:medium", context)
+
+    scope_state = context.user_data["scope_state"][scope_key]
+    assert scope_state["codex_reasoning_effort"] == "medium"
+    rendered = query.edit_message_text.await_args.args[0]
+    assert "已更新 Codex 思考深度设置" in rendered
+    assert "当前设置：`Medium`" in rendered
+    keyboard = query.edit_message_text.await_args.kwargs["reply_markup"].inline_keyboard
+    callback_ids = [btn.callback_data for row in keyboard for btn in row]
+    assert "effort:codex:default" in callback_ids
 
 
 @pytest.mark.asyncio

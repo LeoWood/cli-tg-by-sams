@@ -88,6 +88,8 @@ class SessionLifecycleService:
         permission_handler: Optional[Any] = None,
         use_empty_prompt_when_existing: bool = False,
         allow_none_prompt_when_discover: bool = False,
+        model: Optional[str] = None,
+        reasoning_effort: Optional[str] = None,
     ) -> ContinueSessionResult:
         """Continue existing session or discover latest session in directory."""
         if not claude_integration:
@@ -106,6 +108,8 @@ class SessionLifecycleService:
                 user_id=user_id,
                 session_id=existing_session_id,
                 permission_handler=permission_handler,
+                model=model,
+                reasoning_effort=reasoning_effort,
             )
             if response:
                 scope_state["claude_session_id"] = response.session_id
@@ -134,6 +138,8 @@ class SessionLifecycleService:
             working_directory=current_dir,
             prompt=discover_prompt,
             permission_handler=permission_handler,
+            model=model,
+            reasoning_effort=reasoning_effort,
         )
         if response:
             scope_state["claude_session_id"] = response.session_id

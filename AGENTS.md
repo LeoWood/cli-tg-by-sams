@@ -43,7 +43,7 @@
 
 注意：
 - 仅在用户明确要求“重启”时执行重启操作。
-- 通过 Telegram 远程协作时，若用户仅要求“重启”，默认只执行单条命令 `./scripts/tmux-bot.sh restart`；除非用户明确要求，否则不附带 `status/logs` 检测。
+- 通过 Telegram 远程协作时，若用户仅要求“重启”，默认只执行单条命令 `./scripts/tmux-bot.sh restart-detached`（异步重启，避免会话中断导致回执丢失）；除非用户明确要求，否则不附带 `status/logs` 检测。
 - 不要在文档中硬编码机器本地绝对路径或固定 bot 用户名。
 
 ## 代码风格与命名约定

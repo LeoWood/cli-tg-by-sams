@@ -367,7 +367,10 @@ class TestResponseFormatter:
             for row in keyboard.inline_keyboard
             for button in row
         ]
-        assert ("🔁 Resume", "action:resume") in button_pairs
+        assert ("🆕 New", "action:new_session") in button_pairs
+        assert ("📋 Projects", "action:show_projects") in button_pairs
+        assert ("📊 Status", "action:status") in button_pairs
+        assert len(button_pairs) == 3
 
         # Check that buttons have callback data
         for row in keyboard.inline_keyboard:

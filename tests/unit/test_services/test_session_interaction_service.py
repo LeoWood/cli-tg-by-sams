@@ -23,6 +23,19 @@ def test_build_continue_progress_text_with_existing_session():
     assert "Continuing where you left off" in text
 
 
+def test_build_main_quick_actions_keyboard_uses_three_button_layout():
+    """Shared quick actions keyboard should stay aligned with main reply menu."""
+    keyboard = SessionInteractionService.build_main_quick_actions_keyboard()
+
+    assert keyboard == [
+        [
+            ("🆕 New", "action:new_session"),
+            ("📋 Projects", "action:show_projects"),
+            ("📊 Status", "action:status"),
+        ]
+    ]
+
+
 def test_build_continue_progress_text_without_existing_session():
     """Missing active session should render discovery progress text."""
     service = SessionInteractionService()
@@ -53,7 +66,8 @@ def test_build_new_session_message_for_command_with_previous_session():
     assert "project/" in message.text
     assert "Previous session `session-...` cleared" in message.text
     assert message.keyboard is not None
-    assert message.keyboard[0][0][1] == "action:start_coding"
+    callbacks = {callback for row in message.keyboard for _, callback in row}
+    assert {"action:new_session", "action:show_projects", "action:status"} <= callbacks
 
 
 def test_build_new_session_message_for_callback():
@@ -69,7 +83,8 @@ def test_build_new_session_message_for_callback():
 
     assert "Ready to help you code!" in message.text
     assert message.keyboard is not None
-    assert message.keyboard[1][0][1] == "action:quick_actions"
+    callbacks = {callback for row in message.keyboard for _, callback in row}
+    assert {"action:new_session", "action:show_projects", "action:status"} <= callbacks
 
 
 def test_build_new_session_message_uses_active_engine_title():
@@ -96,7 +111,7 @@ def test_build_end_no_active_message_for_callback():
     assert "No Active Session" in message.text
     assert message.keyboard is not None
     assert message.keyboard[0][0][1] == "action:new_session"
-    assert message.keyboard[1][0][1] == "action:context"
+    assert message.keyboard[0][2][1] == "action:status"
 
 
 def test_build_end_success_message_for_command():
@@ -131,7 +146,7 @@ def test_build_continue_not_found_message_for_command():
     assert "Use `/context`" in message.text
     assert message.keyboard is not None
     assert message.keyboard[0][0][1] == "action:new_session"
-    assert message.keyboard[0][1][1] == "action:context"
+    assert message.keyboard[0][2][1] == "action:status"
 
 
 def test_build_continue_not_found_message_for_callback():
@@ -144,7 +159,7 @@ def test_build_continue_not_found_message_for_callback():
         for_callback=True,
     )
 
-    assert "Use the button below" in message.text
+    assert "Use the buttons below" in message.text
     assert message.keyboard is not None
     assert message.keyboard[0][0][1] == "action:new_session"
 

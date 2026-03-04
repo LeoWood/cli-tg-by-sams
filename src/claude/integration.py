@@ -115,6 +115,7 @@ class ClaudeProcessManager:
         continue_session: bool = False,
         stream_callback: Optional[Callable[[StreamUpdate], None]] = None,
         model: Optional[str] = None,
+        reasoning_effort: Optional[str] = None,
         images: Optional[List[Dict[str, str]]] = None,
     ) -> ClaudeResponse:
         """Execute Claude Code command."""
@@ -124,6 +125,7 @@ class ClaudeProcessManager:
             session_id,
             continue_session,
             model=model,
+            reasoning_effort=reasoning_effort,
             images=images,
         )
         cli_kind = self._detect_cli_kind(cmd[0])
@@ -278,6 +280,7 @@ class ClaudeProcessManager:
         session_id: Optional[str],
         continue_session: bool,
         model: Optional[str] = None,
+        reasoning_effort: Optional[str] = None,
         images: Optional[List[Dict[str, str]]] = None,
     ) -> List[str]:
         """Build CLI command with engine-specific arguments."""
@@ -290,6 +293,7 @@ class ClaudeProcessManager:
                 session_id=session_id,
                 continue_session=continue_session,
                 model=model,
+                reasoning_effort=reasoning_effort,
                 images=images,
             )
         return self._build_claude_command(
@@ -362,6 +366,7 @@ class ClaudeProcessManager:
         session_id: Optional[str],
         continue_session: bool,
         model: Optional[str],
+        reasoning_effort: Optional[str],
         images: Optional[List[Dict[str, str]]] = None,
     ) -> List[str]:
         """Build Codex CLI command."""
@@ -379,6 +384,10 @@ class ClaudeProcessManager:
 
         if model:
             cmd.extend(["--model", model])
+
+        normalized_effort = self._normalize_codex_reasoning_effort(reasoning_effort)
+        if normalized_effort:
+            cmd.extend(["-c", f'model_reasoning_effort="{normalized_effort}"'])
 
         image_paths = self._extract_codex_image_paths(images)
         if images and not image_paths:
@@ -409,6 +418,16 @@ class ClaudeProcessManager:
 
         logger.debug("Built Codex CLI command", command=cmd)
         return cmd
+
+    @staticmethod
+    def _normalize_codex_reasoning_effort(value: Optional[str]) -> str:
+        """Normalize codex reasoning effort values from Telegram/state input."""
+        normalized = str(value or "").strip().lower().replace("_", "-")
+        if normalized == "x-high":
+            return "xhigh"
+        if normalized in {"low", "medium", "high", "xhigh"}:
+            return normalized
+        return ""
 
     def supports_image_inputs(
         self, images: Optional[List[Dict[str, str]]] = None
@@ -448,9 +467,7 @@ class ClaudeProcessManager:
         env.pop("CLAUDECODE", None)
         return await asyncio.create_subprocess_exec(
             *cmd,
-            stdin=(
-                asyncio.subprocess.PIPE if stdin_payload is not None else None
-            ),
+            stdin=(asyncio.subprocess.PIPE if stdin_payload is not None else None),
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
             cwd=str(cwd),
