@@ -4,6 +4,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Any, Callable, Dict
 
 import structlog
+from telegram.ext import ApplicationHandlerStop
 
 from ..utils.telegram_send import send_message_resilient
 
@@ -64,7 +65,7 @@ async def auth_middleware(handler: Callable, event: Any, data: Dict[str, Any]) -
 
     if not user_id:
         logger.warning("No user information in update")
-        return
+        raise ApplicationHandlerStop
 
     # Get dependencies from context
     auth_manager = data.get("auth_manager")
@@ -76,7 +77,7 @@ async def auth_middleware(handler: Callable, event: Any, data: Dict[str, Any]) -
             await _reply_event_message_resilient(
                 event, "🔒 Authentication system unavailable. Please try again later."
             )
-        return
+        raise ApplicationHandlerStop
 
     # Check if user is already authenticated
     if auth_manager.is_authenticated(user_id):
@@ -144,7 +145,7 @@ async def auth_middleware(handler: Callable, event: Any, data: Dict[str, Any]) -
                 f"Your Telegram ID: `{user_id}`\n"
                 "Share this ID with the administrator to request access.",
             )
-        return  # Stop processing
+        raise ApplicationHandlerStop
 
 
 async def require_auth(handler: Callable, event: Any, data: Dict[str, Any]) -> Any:

@@ -475,16 +475,101 @@ async def _sync_chat_menu_for_engine(
         )
 
 
+async def _is_callback_query_authenticated(
+    *,
+    user_id: int,
+    context: ContextTypes.DEFAULT_TYPE,
+) -> bool:
+    """Check callback authorization using auth manager first, then whitelist."""
+    auth_manager = context.bot_data.get("auth_manager")
+    if auth_manager is not None:
+        is_authenticated = getattr(auth_manager, "is_authenticated", None)
+        if not callable(is_authenticated):
+            logger.error(
+                "Auth manager missing is_authenticated for callback authorization",
+                user_id=user_id,
+            )
+            return False
+
+        try:
+            if bool(is_authenticated(user_id)):
+                refresh_session = getattr(auth_manager, "refresh_session", None)
+                if callable(refresh_session):
+                    refresh_session(user_id)
+                return True
+        except Exception as exc:
+            logger.warning(
+                "Callback auth session check failed",
+                user_id=user_id,
+                error=str(exc),
+            )
+            return False
+
+        authenticate_user = getattr(auth_manager, "authenticate_user", None)
+        if not callable(authenticate_user):
+            return False
+
+        try:
+            authenticated = bool(await authenticate_user(user_id))
+        except Exception as exc:
+            logger.warning(
+                "Callback auth authenticate attempt failed",
+                user_id=user_id,
+                error=str(exc),
+            )
+            return False
+
+        if authenticated:
+            refresh_session = getattr(auth_manager, "refresh_session", None)
+            if callable(refresh_session):
+                refresh_session(user_id)
+        return authenticated
+
+    settings = context.bot_data.get("settings")
+    allowed_users = getattr(settings, "allowed_users", None)
+    if allowed_users:
+        return user_id in allowed_users
+
+    logger.error(
+        "No callback authentication context available",
+        user_id=user_id,
+    )
+    return False
+
+
 async def handle_callback_query(
     update: Update, context: ContextTypes.DEFAULT_TYPE
 ) -> None:
     """Route callback queries to appropriate handlers."""
     query = update.callback_query
+    if query is None:
+        logger.warning("Received callback handler update without callback_query")
+        return
 
-    user_id = query.from_user.id
-    data = query.data
+    user = getattr(query, "from_user", None)
+    user_id = getattr(user, "id", None)
+    if not isinstance(user_id, int):
+        logger.warning("Received callback query without valid user id")
+        return
+
+    data = str(getattr(query, "data", "") or "")
 
     logger.info("Processing callback query", user_id=user_id, callback_data=data)
+
+    if not await _is_callback_query_authenticated(user_id=user_id, context=context):
+        logger.warning(
+            "Blocked unauthorized callback query",
+            user_id=user_id,
+            callback_data=data,
+        )
+        try:
+            await query.answer("🔒 Authentication required.", show_alert=True)
+        except Exception:
+            logger.debug(
+                "Failed to deliver unauthorized callback alert",
+                user_id=user_id,
+            )
+        return
 
     try:
         # Parse callback data

@@ -3,6 +3,7 @@
 from typing import Any, Callable, Dict
 
 import structlog
+from telegram.ext import ApplicationHandlerStop
 
 from ..utils.telegram_send import send_message_resilient
 
@@ -72,7 +73,7 @@ async def security_middleware(
     if not security_validator:
         logger.error("Security validator not available in middleware context")
         # fail-closed: block request when security component is unavailable
-        return
+        raise ApplicationHandlerStop
 
     # Validate text content if present
     message = event.effective_message
@@ -88,7 +89,7 @@ async def security_middleware(
                 f"Violation: {violation_type}\n\n"
                 "If you believe this is an error, please contact the administrator.",
             )
-            return  # Block processing
+            raise ApplicationHandlerStop
 
     # Validate file uploads if present
     if message and message.document:
@@ -102,7 +103,7 @@ async def security_middleware(
                 f"{error_message}\n\n"
                 "Please ensure your file meets security requirements.",
             )
-            return  # Block processing
+            raise ApplicationHandlerStop
 
     # Log successful security validation
     logger.debug(

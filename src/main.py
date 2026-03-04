@@ -203,14 +203,7 @@ async def create_application(config: Settings) -> Dict[str, Any]:
         token_storage = InMemoryTokenStorage()  # TODO: Use database storage
         providers.append(TokenAuthProvider(config.auth_token_secret, token_storage))
 
-    # Fall back to allowing all users in development mode
-    if not providers and config.development_mode:
-        logger.warning(
-            "No auth providers configured - "
-            "creating development-only allow-all provider"
-        )
-        providers.append(WhitelistAuthProvider([], allow_all_dev=True))
-    elif not providers:
+    if not providers:
         raise ConfigurationError("No authentication providers configured")
 
     auth_manager = AuthenticationManager(providers)

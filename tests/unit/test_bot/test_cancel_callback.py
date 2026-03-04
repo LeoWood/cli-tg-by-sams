@@ -2,7 +2,7 @@
 
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, Mock
 
 import pytest
 
@@ -39,6 +39,10 @@ async def test_cancel_button_uses_fallback_when_scope_task_not_found(tmp_path: P
             "task_registry": task_registry,
             "settings": SimpleNamespace(approved_directory=tmp_path),
             "audit_logger": audit_logger,
+            "auth_manager": SimpleNamespace(
+                is_authenticated=Mock(return_value=True),
+                refresh_session=Mock(return_value=True),
+            ),
         },
         user_data={},
     )
@@ -71,6 +75,10 @@ async def test_cancel_button_shows_alert_when_no_active_task(tmp_path: Path):
         bot_data={
             "task_registry": task_registry,
             "settings": SimpleNamespace(approved_directory=tmp_path),
+            "auth_manager": SimpleNamespace(
+                is_authenticated=Mock(return_value=True),
+                refresh_session=Mock(return_value=True),
+            ),
         },
         user_data={},
     )
@@ -83,3 +91,32 @@ async def test_cancel_button_shows_alert_when_no_active_task(tmp_path: Path):
         show_alert=True,
     )
     query.edit_message_reply_markup.assert_awaited_once_with(reply_markup=None)
+
+
+@pytest.mark.asyncio
+async def test_cancel_button_blocks_unauthenticated_user(tmp_path: Path):
+    """Callback router should block unauthenticated users before dispatching."""
+    user_id = 8203
+    chat_id = 9003
+    query = _build_query(user_id=user_id, chat_id=chat_id)
+    update = SimpleNamespace(callback_query=query)
+    task_registry = SimpleNamespace(cancel=AsyncMock())
+    context = SimpleNamespace(
+        bot_data={
+            "task_registry": task_registry,
+            "settings": SimpleNamespace(approved_directory=tmp_path),
+            "auth_manager": SimpleNamespace(
+                is_authenticated=Mock(return_value=False),
+                authenticate_user=AsyncMock(return_value=False),
+            ),
+        },
+        user_data={},
+    )
+
+    await handle_callback_query(update, context)
+
+    query.answer.assert_awaited_once_with(
+        "🔒 Authentication required.",
+        show_alert=True,
+    )
+    task_registry.cancel.assert_not_awaited()
