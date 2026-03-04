@@ -4,6 +4,7 @@ import asyncio
 import shutil
 import sys
 import uuid
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
@@ -18,6 +19,7 @@ from ...security.validators import SecurityValidator
 from ...services.session_interaction_service import SessionInteractionService
 from ...services.session_lifecycle_service import SessionLifecycleService
 from ...services.session_service import SessionService
+from ..inbound_task_queue import InboundTaskQueue
 from ..utils.cli_engine import (
     ENGINE_CLAUDE,
     ENGINE_CODEX,
@@ -525,6 +527,8 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         f"• `/engine [claude|codex]` - Switch CLI engine\n"
         f"• `/actions` - Show quick actions\n"
         f"• `/git` - Git repository commands\n"
+        f"• `/queue` - Show pending queued tasks\n"
+        f"• `/dequeue <id>` - Remove queued task\n"
         f"• `/restartbot` - Restart bot service (admin)\n"
         f"• `/opsstatus` - Show bot runtime ops status\n"
         f"{diagnostics_line}\n"
@@ -620,6 +624,8 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         f"{status_line}\n"
         f"{status_alias_line}\n"
         "• `/engine [claude|codex]` - Switch active CLI engine\n"
+        "• `/queue` - Show pending queued tasks\n"
+        "• `/dequeue <id>` - Remove queued task\n"
         "• `/provider` - Switch API provider (cc-switch)\n"
         "• `/restartbot` - Restart bot service (admin)\n"
         "• `/opsstatus` - Show bot runtime ops status\n"
@@ -1873,6 +1879,115 @@ async def cancel_task(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     if audit_logger:
         await audit_logger.log_command(
             user_id=user_id, command="cancel", args=[], success=cancelled
+        )
+
+
+async def queue_status_command(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> None:
+    """Handle /queue command - show pending queued tasks for current scope."""
+    user_id = update.effective_user.id
+    scope_key, _ = get_scope_state_from_update(
+        user_data=context.user_data,
+        update=update,
+        default_directory=context.bot_data["settings"].approved_directory,
+    )
+    inbound_queue = context.bot_data.get("inbound_task_queue")
+    if not isinstance(inbound_queue, InboundTaskQueue):
+        await _reply_update_message_resilient(update, context, "Queue is not available.")
+        return
+
+    queued_items = await inbound_queue.list_scope(scope_key=scope_key, user_id=user_id)
+    if not queued_items:
+        await _reply_update_message_resilient(update, context, "当前排队为空。")
+        return
+
+    lines = ["⏳ **当前排队任务**", ""]
+    for idx, item in enumerate(queued_items, start=1):
+        created = item.created_at
+        created_text = (
+            created.strftime("%H:%M:%S")
+            if isinstance(created, datetime)
+            else "unknown-time"
+        )
+        preview = _escape_markdown(str(item.preview or "(empty)"))
+        lines.append(
+            f"{idx}. `#{item.queue_id}` [{created_text}] `{item.kind}` - {preview}"
+        )
+
+    lines.append("")
+    lines.append("使用 `/dequeue <queue_id>` 可撤回，或在入队消息中点击“插队执行”。")
+    await _reply_update_message_resilient(
+        update,
+        context,
+        "\n".join(lines),
+        parse_mode="Markdown",
+    )
+
+    audit_logger: AuditLogger = context.bot_data.get("audit_logger")
+    if audit_logger:
+        await audit_logger.log_command(
+            user_id=user_id,
+            command="queue",
+            args=[],
+            success=True,
+        )
+
+
+async def dequeue_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle /dequeue command - remove a queued task by queue_id."""
+    user_id = update.effective_user.id
+    settings: Settings = context.bot_data["settings"]
+    scope_key, _ = get_scope_state_from_update(
+        user_data=context.user_data,
+        update=update,
+        default_directory=settings.approved_directory,
+    )
+    inbound_queue = context.bot_data.get("inbound_task_queue")
+    if not isinstance(inbound_queue, InboundTaskQueue):
+        await _reply_update_message_resilient(update, context, "Queue is not available.")
+        return
+
+    args = [str(arg).strip() for arg in (context.args or []) if str(arg).strip()]
+    if not args:
+        await _reply_update_message_resilient(
+            update,
+            context,
+            "用法：`/dequeue <queue_id>`",
+            parse_mode="Markdown",
+        )
+        return
+
+    queue_id = args[0]
+    removed = await inbound_queue.dequeue(
+        queue_id=queue_id,
+        scope_key=scope_key,
+        user_id=user_id,
+    )
+    if removed is None:
+        await _reply_update_message_resilient(
+            update,
+            context,
+            f"未找到排队任务：`{_escape_markdown(queue_id)}`",
+            parse_mode="Markdown",
+        )
+        success = False
+    else:
+        await _reply_update_message_resilient(
+            update,
+            context,
+            f"✅ 已撤回排队任务：`{_escape_markdown(queue_id)}`",
+            parse_mode="Markdown",
+        )
+        success = True
+
+    audit_logger: AuditLogger = context.bot_data.get("audit_logger")
+    if audit_logger:
+        await audit_logger.log_command(
+            user_id=user_id,
+            command="dequeue",
+            args=[queue_id],
+            success=success,
         )
 
 

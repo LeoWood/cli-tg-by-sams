@@ -33,6 +33,7 @@ from ..claude.task_registry import TaskRegistry
 from ..config.settings import Settings
 from ..exceptions import ClaudeCodeTelegramError
 from .features.registry import FeatureRegistry
+from .inbound_task_queue import InboundTaskQueue
 from .utils.cli_engine import get_default_cli_engine
 from .utils.command_menu import build_bot_commands_for_engine
 from .utils.scope_state import SCOPE_STATE_CONTAINER_KEY
@@ -270,6 +271,11 @@ class ClaudeCodeBot:
 
         # Initialize task registry for cancel support
         self.deps["task_registry"] = TaskRegistry()
+        self.deps["inbound_task_queue"] = InboundTaskQueue(
+            max_per_scope=int(
+                getattr(self.settings, "inbound_queue_max_per_scope", 20) or 20
+            )
+        )
         self._initialize_update_tracking()
 
         # Set bot commands for menu
@@ -341,6 +347,8 @@ class ClaudeCodeBot:
             ("actions", command.quick_actions),
             ("git", command.git_command),
             ("cancel", command.cancel_task),
+            ("queue", command.queue_status_command),
+            ("dequeue", command.dequeue_command),
             ("restartbot", command.restart_bot_command),
             ("opsstatus", command.ops_status_command),
             ("resume", command.resume_command),

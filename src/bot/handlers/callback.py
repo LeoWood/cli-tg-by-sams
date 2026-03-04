@@ -19,6 +19,7 @@ from ...services.session_interaction_service import SessionInteractionService
 from ...services.session_lifecycle_service import SessionLifecycleService
 from ...services.session_service import SessionService
 from ...utils.beijing_time import format_datetime_beijing
+from ..inbound_task_queue import InboundTaskQueue
 from ..features.session_export import ExportFormat
 from ..utils.cli_engine import (
     DEFAULT_CLI_ENGINE,
@@ -43,6 +44,7 @@ from ..utils.telegram_send import (
 )
 from ..utils.ui_adapter import build_reply_markup_from_spec
 from .message import (
+    dispatch_next_queued_task_if_idle,
     _resolve_model_override,
     _resolve_reasoning_effort_override,
     build_permission_handler,
@@ -283,6 +285,184 @@ async def _cancel_task_with_fallback(
             return True, True
 
     return False, False
+
+
+async def _handle_queue_callback(
+    *,
+    query: Any,
+    context: ContextTypes.DEFAULT_TYPE,
+    user_id: int,
+    param: str | None,
+) -> None:
+    """Handle queue management callbacks (dequeue/promote)."""
+    inbound_queue = context.bot_data.get("inbound_task_queue")
+    if not isinstance(inbound_queue, InboundTaskQueue):
+        await query.answer("Queue is not available.", show_alert=True)
+        return
+
+    payload = str(param or "").strip()
+    if ":" not in payload:
+        await query.answer("Invalid queue action.", show_alert=True)
+        return
+
+    sub_action, queue_id = payload.split(":", 1)
+    sub_action = str(sub_action or "").strip().lower()
+    queue_id = str(queue_id or "").strip()
+    if not queue_id:
+        await query.answer("Missing queue id.", show_alert=True)
+        return
+
+    scope_key, _ = _get_scope_state_for_query(query, context)
+    if sub_action == "dequeue":
+        removed = await inbound_queue.dequeue(
+            queue_id=queue_id,
+            scope_key=scope_key,
+            user_id=user_id,
+        )
+        if removed is None:
+            await query.answer("排队任务不存在或已执行。", show_alert=True)
+        else:
+            await query.answer("已撤回排队任务。")
+            await _cleanup_queue_messages_after_dequeue(
+                query=query,
+                context=context,
+                user_id=user_id,
+            )
+        return
+
+    if sub_action == "promote":
+        promoted = await inbound_queue.promote(
+            queue_id=queue_id,
+            scope_key=scope_key,
+            user_id=user_id,
+        )
+        if promoted is None:
+            await query.answer("排队任务不存在或已执行。", show_alert=True)
+            return
+
+        task_registry = context.bot_data.get("task_registry")
+        cancelled = False
+        if isinstance(task_registry, TaskRegistry):
+            cancelled, used_fallback = await _cancel_task_with_fallback(
+                task_registry=task_registry,
+                user_id=user_id,
+                scope_key=scope_key,
+            )
+            if used_fallback:
+                logger.info(
+                    "Queue promote used fallback cancellation scope",
+                    user_id=user_id,
+                    scope_key=scope_key,
+                    queue_id=queue_id,
+                )
+
+        await query.answer(
+            "已请求插队，正在中断当前任务..." if cancelled else "已插队，任务将立即执行。"
+        )
+        await _cleanup_queue_prompt_message(query=query)
+
+        try:
+            await dispatch_next_queued_task_if_idle(
+                context=context,
+                scope_key=scope_key,
+            )
+        except Exception as dispatch_error:
+            logger.warning(
+                "Failed to dispatch queue task after promote",
+                error=str(dispatch_error),
+                user_id=user_id,
+                scope_key=scope_key,
+                queue_id=queue_id,
+            )
+        return
+
+    await query.answer("Unknown queue action.", show_alert=True)
+
+
+async def _cleanup_queue_messages_after_dequeue(
+    *,
+    query: Any,
+    context: ContextTypes.DEFAULT_TYPE,
+    user_id: int,
+) -> None:
+    """Delete queue prompt bubble and best-effort delete source user message."""
+    message = getattr(query, "message", None)
+    if message is None:
+        return
+
+    # 1) Delete queue prompt message first; fallback to remove buttons.
+    deleted_prompt = False
+    delete_prompt = getattr(message, "delete", None)
+    if callable(delete_prompt):
+        try:
+            await delete_prompt()
+            deleted_prompt = True
+        except Exception:
+            deleted_prompt = False
+
+    if not deleted_prompt:
+        try:
+            await query.edit_message_reply_markup(reply_markup=None)
+        except Exception:
+            pass
+
+    # 2) Best-effort delete source user message that this prompt replied to.
+    source_message = getattr(message, "reply_to_message", None)
+    if source_message is None:
+        return
+
+    source_message_id = getattr(source_message, "message_id", None)
+    if not isinstance(source_message_id, int):
+        return
+
+    source_owner_id = getattr(getattr(source_message, "from_user", None), "id", None)
+    if isinstance(source_owner_id, int) and source_owner_id != user_id:
+        return
+
+    delete_source = getattr(source_message, "delete", None)
+    if callable(delete_source):
+        try:
+            await delete_source()
+            return
+        except Exception:
+            pass
+
+    chat_obj = getattr(message, "chat", None)
+    chat_id = getattr(chat_obj, "id", None)
+    if not isinstance(chat_id, int):
+        chat_id = getattr(message, "chat_id", None)
+    if not isinstance(chat_id, int):
+        return
+
+    bot = getattr(context, "bot", None)
+    delete_message = getattr(bot, "delete_message", None)
+    if not callable(delete_message):
+        return
+
+    try:
+        await delete_message(chat_id=chat_id, message_id=source_message_id)
+    except Exception:
+        pass
+
+
+async def _cleanup_queue_prompt_message(*, query: Any) -> None:
+    """Delete queue prompt message; fallback to clearing inline keyboard."""
+    message = getattr(query, "message", None)
+    deleted_prompt = False
+    if message is not None:
+        delete_prompt = getattr(message, "delete", None)
+        if callable(delete_prompt):
+            try:
+                await delete_prompt()
+                deleted_prompt = True
+            except Exception:
+                deleted_prompt = False
+    if deleted_prompt:
+        return
+    try:
+        await query.edit_message_reply_markup(reply_markup=None)
+    except Exception:
+        pass
 
 
 def _resume_engine_label(engine: str) -> str:
@@ -764,6 +944,15 @@ async def handle_callback_query(
                 await audit_logger.log_command(
                     user_id=user_id, command="cancel_button", args=[], success=cancelled
                 )
+            return
+
+        if action == "queue":
+            await _handle_queue_callback(
+                query=query,
+                context=context,
+                user_id=user_id,
+                param=param,
+            )
             return
 
         # Acknowledge the callback for all other actions

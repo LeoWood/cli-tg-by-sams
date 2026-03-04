@@ -182,6 +182,12 @@ class Settings(BaseSettings):
         ge=0,
         le=10000,
     )
+    inbound_queue_max_per_scope: int = Field(
+        20,
+        description="Max queued inbound tasks per scope",
+        ge=1,
+        le=200,
+    )
     status_context_probe_ttl_seconds: int = Field(
         0,
         description="TTL for /context precise /context probe cache (0 disables cache)",

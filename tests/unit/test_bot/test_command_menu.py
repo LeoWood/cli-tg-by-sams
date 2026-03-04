@@ -20,6 +20,8 @@ def test_build_bot_commands_for_claude_hides_codexdiag():
     assert "model" in names
     assert "restartbot" in names
     assert "opsstatus" in names
+    assert "queue" in names
+    assert "dequeue" in names
     assert "codexdiag" not in names
     assert "effort" not in names
     assert "status" not in names
@@ -36,6 +38,8 @@ def test_build_bot_commands_for_codex_includes_read_only_model():
     assert "effort" in names
     assert "restartbot" in names
     assert "opsstatus" in names
+    assert "queue" in names
+    assert "dequeue" in names
     assert "status" in names
 
 

@@ -31,6 +31,8 @@ COMMAND_MENU_SPECS: tuple[MenuCommandSpec, ...] = (
     MenuCommandSpec("status", "Show session status and usage"),
     MenuCommandSpec("engine", "Switch CLI engine (claude/codex)"),
     MenuCommandSpec("cancel", "Cancel the current running task"),
+    MenuCommandSpec("queue", "Show queued pending tasks"),
+    MenuCommandSpec("dequeue", "Remove a queued task by id"),
     MenuCommandSpec("model", "View or set model"),
     MenuCommandSpec("effort", "View or set reasoning effort (Codex)"),
     MenuCommandSpec("codexdiag", "Diagnose Codex MCP status (Codex)"),

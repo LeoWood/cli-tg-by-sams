@@ -23,6 +23,7 @@ from ...security.rate_limiter import RateLimiter
 from ...security.validators import SecurityValidator
 from ...services.session_service import SessionService
 from ...utils.codex_rate_limits import format_rate_limit_summary
+from ..inbound_task_queue import InboundTaskQueue, QueueFullError
 from ..utils.cli_engine import (
     ENGINE_CLAUDE,
     ENGINE_CODEX,
@@ -60,6 +61,8 @@ _AUTO_FILE_ATTACHMENTS_LIMIT = 3
 _AUTO_IMAGE_MAX_FILE_SIZE_BYTES = 50 * 1024 * 1024  # Telegram bot document limit
 _CODEX_REASONING_EFFORT_KEY = "codex_reasoning_effort"
 _ALLOWED_CODEX_REASONING_EFFORTS = ("low", "medium", "high", "xhigh")
+_INBOUND_QUEUE_DISPATCH_LOCKS_KEY = "inbound_queue_dispatch_locks"
+_INBOUND_QUEUE_PREVIEW_MAX_LENGTH = 120
 _AUTO_IMAGE_SUFFIXES = {".png", ".jpg", ".jpeg", ".webp", ".gif", ".bmp"}
 _AUTO_FILE_SUFFIXES = {
     ".txt",
@@ -2075,8 +2078,136 @@ def _compose_prompt_with_telegram_remote_context(message_text: str) -> str:
     return f"{_TELEGRAM_REMOTE_CONTEXT_HINT}\n\n{prompt}"
 
 
+def _get_inbound_task_queue(
+    context: ContextTypes.DEFAULT_TYPE,
+) -> Optional[InboundTaskQueue]:
+    """Get shared inbound queue instance from bot_data."""
+    queue_obj = context.bot_data.get("inbound_task_queue")
+    if isinstance(queue_obj, InboundTaskQueue):
+        return queue_obj
+    return None
+
+
+def _get_scope_queue_dispatch_lock(
+    context: ContextTypes.DEFAULT_TYPE, scope_key: str
+) -> asyncio.Lock:
+    """Get per-scope lock used to avoid duplicate queue dispatch."""
+    lock_map = context.bot_data.get(_INBOUND_QUEUE_DISPATCH_LOCKS_KEY)
+    if not isinstance(lock_map, dict):
+        lock_map = {}
+        context.bot_data[_INBOUND_QUEUE_DISPATCH_LOCKS_KEY] = lock_map
+
+    lock = lock_map.get(scope_key)
+    if isinstance(lock, asyncio.Lock):
+        return lock
+
+    created = asyncio.Lock()
+    lock_map[scope_key] = created
+    return created
+
+
+def _normalize_queue_preview(raw: str) -> str:
+    """Build compact preview text for queue list output."""
+    compact = " ".join(str(raw or "").split())
+    if not compact:
+        return "(empty)"
+    if len(compact) <= _INBOUND_QUEUE_PREVIEW_MAX_LENGTH:
+        return compact
+    return compact[: _INBOUND_QUEUE_PREVIEW_MAX_LENGTH - 3].rstrip() + "..."
+
+
+def _build_queue_controls_keyboard(queue_id: str) -> InlineKeyboardMarkup:
+    """Build inline controls for queued item management."""
+    return InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton(
+                    "🗑 撤回", callback_data=f"queue:dequeue:{queue_id}"
+                ),
+                InlineKeyboardButton(
+                    "⚡ 插队执行", callback_data=f"queue:promote:{queue_id}"
+                ),
+            ]
+        ]
+    )
+
+
+async def dispatch_next_queued_task_if_idle(
+    *, context: ContextTypes.DEFAULT_TYPE, scope_key: str
+) -> bool:
+    """Dispatch the next queued text task when current scope is idle."""
+    inbound_queue = _get_inbound_task_queue(context)
+    if inbound_queue is None:
+        return False
+
+    dispatch_lock = _get_scope_queue_dispatch_lock(context, scope_key)
+    async with dispatch_lock:
+        next_item = await inbound_queue.peek_next(scope_key=scope_key)
+        if next_item is None:
+            return False
+
+        task_registry = context.bot_data.get("task_registry")
+        if isinstance(task_registry, TaskRegistry):
+            if await task_registry.is_busy(next_item.user_id, scope_key=scope_key):
+                return False
+
+        queue_item = await inbound_queue.pop_next(scope_key=scope_key)
+        if queue_item is None:
+            return False
+        if queue_item.kind != "text":
+            logger.warning(
+                "Skip unsupported queued task kind",
+                scope_key=scope_key,
+                queue_id=queue_item.queue_id,
+                kind=queue_item.kind,
+            )
+            return False
+
+        payload = queue_item.payload if isinstance(queue_item.payload, dict) else {}
+        queued_update = payload.get("update")
+        if queued_update is None:
+            logger.warning(
+                "Skip queued task without update payload",
+                scope_key=scope_key,
+                queue_id=queue_item.queue_id,
+            )
+            return False
+
+        queued_message_text = str(payload.get("message_text") or "")
+        queued_source_message_id = payload.get("source_message_id")
+        queued_fragment_count = payload.get("fragment_count")
+        if not isinstance(queued_source_message_id, int):
+            queued_source_message_id = None
+        if not isinstance(queued_fragment_count, int):
+            queued_fragment_count = 1
+
+        asyncio.create_task(
+            handle_text_message(
+                queued_update,
+                context,
+                _from_queue=True,
+                _queued_message_text=queued_message_text,
+                _queued_source_message_id=queued_source_message_id,
+                _queued_fragment_count=max(1, queued_fragment_count),
+            )
+        )
+        logger.info(
+            "Dispatched queued task",
+            scope_key=scope_key,
+            queue_id=queue_item.queue_id,
+            user_id=queue_item.user_id,
+        )
+        return True
+
+
 async def handle_text_message(
-    update: Update, context: ContextTypes.DEFAULT_TYPE
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    *,
+    _from_queue: bool = False,
+    _queued_message_text: Optional[str] = None,
+    _queued_source_message_id: Optional[int] = None,
+    _queued_fragment_count: int = 1,
 ) -> None:
     """Handle regular text messages as Claude prompts."""
     user_id = update.effective_user.id
@@ -2093,24 +2224,34 @@ async def handle_text_message(
     # Get services
     rate_limiter: Optional[RateLimiter] = context.bot_data.get("rate_limiter")
     audit_logger: Optional[AuditLogger] = context.bot_data.get("audit_logger")
+    queue_dispatch_needed = False
 
-    aggregated_ready, aggregated_text, aggregated_source_message_id, fragment_count = (
-        await _collect_text_fragments(update, context)
-    )
-    if not aggregated_ready:
-        return
-    message_text = aggregated_text
-    if aggregated_source_message_id is not None:
-        input_message_id = aggregated_source_message_id
-    if fragment_count > 1:
-        logger.info(
-            "Merged inbound text fragments",
-            user_id=user_id,
-            scope_key=scope_key,
-            fragment_count=fragment_count,
-            merged_length=len(message_text),
-            source_message_id=input_message_id,
-        )
+    if _from_queue and _queued_message_text is not None:
+        message_text = str(_queued_message_text)
+        if isinstance(_queued_source_message_id, int) and _queued_source_message_id > 0:
+            input_message_id = _queued_source_message_id
+        fragment_count = max(1, int(_queued_fragment_count))
+    else:
+        (
+            aggregated_ready,
+            aggregated_text,
+            aggregated_source_message_id,
+            fragment_count,
+        ) = await _collect_text_fragments(update, context)
+        if not aggregated_ready:
+            return
+        message_text = aggregated_text
+        if aggregated_source_message_id is not None:
+            input_message_id = aggregated_source_message_id
+        if fragment_count > 1:
+            logger.info(
+                "Merged inbound text fragments",
+                user_id=user_id,
+                scope_key=scope_key,
+                fragment_count=fragment_count,
+                merged_length=len(message_text),
+                source_message_id=input_message_id,
+            )
 
     logger.info(
         "Processing text message", user_id=user_id, message_length=len(message_text)
@@ -2138,8 +2279,79 @@ async def handle_text_message(
         # Check if user already has an active task
         task_registry: Optional[TaskRegistry] = context.bot_data.get("task_registry")
         if task_registry and await task_registry.is_busy(user_id, scope_key=scope_key):
+            if _from_queue:
+                logger.info(
+                    "Skip queued text dispatch because scope is still busy",
+                    user_id=user_id,
+                    scope_key=scope_key,
+                )
+                inbound_queue = _get_inbound_task_queue(context)
+                if inbound_queue is not None:
+                    try:
+                        await inbound_queue.enqueue(
+                            user_id=user_id,
+                            scope_key=scope_key,
+                            kind="text",
+                            payload={
+                                "update": update,
+                                "message_text": message_text,
+                                "source_message_id": input_message_id,
+                                "fragment_count": fragment_count,
+                            },
+                            preview=_normalize_queue_preview(message_text),
+                        )
+                    except QueueFullError:
+                        logger.warning(
+                            "Failed to requeue busy queued item because queue is full",
+                            user_id=user_id,
+                            scope_key=scope_key,
+                        )
+                return
+
+            inbound_queue = _get_inbound_task_queue(context)
+            if inbound_queue is None:
+                await _reply_text_resilient(
+                    update.message,
+                    "A task is already running. Use /cancel to cancel it.",
+                )
+                return
+
+            preview = _normalize_queue_preview(message_text)
+            try:
+                queue_item, ahead_count = await inbound_queue.enqueue(
+                    user_id=user_id,
+                    scope_key=scope_key,
+                    kind="text",
+                    payload={
+                        "update": update,
+                        "message_text": message_text,
+                        "source_message_id": input_message_id,
+                        "fragment_count": fragment_count,
+                    },
+                    preview=preview,
+                )
+            except QueueFullError:
+                await _reply_text_resilient(
+                    update.message,
+                    (
+                        "⛔ 当前排队已满，请稍后重试。\n"
+                        f"每个会话最多排队 {inbound_queue.max_per_scope} 条任务。"
+                    ),
+                    reply_to_message_id=input_message_id,
+                )
+                return
+
             await _reply_text_resilient(
-                update.message, "A task is already running. Use /cancel to cancel it."
+                update.message,
+                (
+                    "⏳ 上一条消息仍在处理中，当前消息已加入队列。\n"
+                    f"队列编号：`{queue_item.queue_id}`\n"
+                    f"前方等待：{ahead_count} 条\n\n"
+                    "可用 `/dequeue <编号>` 撤回，或点击下方按钮插队执行。"
+                ),
+                parse_mode="Markdown",
+                reply_to_message_id=input_message_id,
+                reply_markup=_build_queue_controls_keyboard(queue_item.queue_id),
             )
             return
 
@@ -2453,6 +2665,7 @@ async def handle_text_message(
                 ),
             )
 
+        queue_dispatch_needed = True
         task = asyncio.create_task(_run_claude())
 
         # Register task for cancel support
@@ -2900,6 +3113,18 @@ async def handle_text_message(
                 await typing_heartbeat_task
             except asyncio.CancelledError:
                 pass
+        if queue_dispatch_needed:
+            try:
+                await dispatch_next_queued_task_if_idle(
+                    context=context, scope_key=scope_key
+                )
+            except Exception as dispatch_error:
+                logger.warning(
+                    "Failed to dispatch queued task after text completion",
+                    error=str(dispatch_error),
+                    user_id=user_id,
+                    scope_key=scope_key,
+                )
 
 
 async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -3726,6 +3951,18 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
                     await _cancel_stream_flush_task()
                     if task_registry:
                         await task_registry.remove(user_id, scope_key=scope_key)
+                    try:
+                        await dispatch_next_queued_task_if_idle(
+                            context=context,
+                            scope_key=scope_key,
+                        )
+                    except Exception as dispatch_error:
+                        logger.warning(
+                            "Failed to dispatch queued task after image completion",
+                            error=str(dispatch_error),
+                            user_id=user_id,
+                            scope_key=scope_key,
+                        )
 
                 # Update session ID
                 scope_state["claude_session_id"] = claude_response.session_id
