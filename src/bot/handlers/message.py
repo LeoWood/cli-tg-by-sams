@@ -63,6 +63,8 @@ _CODEX_REASONING_EFFORT_KEY = "codex_reasoning_effort"
 _ALLOWED_CODEX_REASONING_EFFORTS = ("low", "medium", "high", "xhigh")
 _INBOUND_QUEUE_DISPATCH_LOCKS_KEY = "inbound_queue_dispatch_locks"
 _INBOUND_QUEUE_PREVIEW_MAX_LENGTH = 120
+_INBOUND_QUEUE_PROMPT_CHAT_ID_KEY = "queue_prompt_chat_id"
+_INBOUND_QUEUE_PROMPT_MESSAGE_ID_KEY = "queue_prompt_message_id"
 _AUTO_IMAGE_SUFFIXES = {".png", ".jpg", ".jpeg", ".webp", ".gif", ".bmp"}
 _AUTO_FILE_SUFFIXES = {
     ".txt",
@@ -2116,6 +2118,65 @@ def _normalize_queue_preview(raw: str) -> str:
     return compact[: _INBOUND_QUEUE_PREVIEW_MAX_LENGTH - 3].rstrip() + "..."
 
 
+def _extract_message_identity(message: Any) -> tuple[Optional[int], Optional[int]]:
+    """Extract ``(chat_id, message_id)`` from Telegram message-like objects."""
+    chat_id = getattr(message, "chat_id", None)
+    if not isinstance(chat_id, int):
+        chat_obj = getattr(message, "chat", None)
+        chat_id = getattr(chat_obj, "id", None)
+
+    message_id = getattr(message, "message_id", None)
+    if not isinstance(message_id, int):
+        message_id = None
+    if not isinstance(chat_id, int):
+        chat_id = None
+    return chat_id, message_id
+
+
+def _remember_queue_prompt_message(
+    *,
+    payload: dict[str, Any],
+    prompt_message: Any,
+) -> None:
+    """Persist queue prompt message identity for later auto-cleanup."""
+    prompt_chat_id, prompt_message_id = _extract_message_identity(prompt_message)
+    if prompt_chat_id is None or prompt_message_id is None:
+        return
+    payload[_INBOUND_QUEUE_PROMPT_CHAT_ID_KEY] = prompt_chat_id
+    payload[_INBOUND_QUEUE_PROMPT_MESSAGE_ID_KEY] = prompt_message_id
+
+
+async def _cleanup_queued_prompt_message(
+    *,
+    context: ContextTypes.DEFAULT_TYPE,
+    payload: dict[str, Any],
+    scope_key: str,
+    queue_id: str,
+) -> None:
+    """Best-effort cleanup for queue prompt message once task is dispatched."""
+    prompt_chat_id = payload.get(_INBOUND_QUEUE_PROMPT_CHAT_ID_KEY)
+    prompt_message_id = payload.get(_INBOUND_QUEUE_PROMPT_MESSAGE_ID_KEY)
+    if not isinstance(prompt_chat_id, int) or not isinstance(prompt_message_id, int):
+        return
+
+    bot = getattr(context, "bot", None)
+    delete_message = getattr(bot, "delete_message", None)
+    if not callable(delete_message):
+        return
+
+    try:
+        await delete_message(chat_id=prompt_chat_id, message_id=prompt_message_id)
+    except Exception as exc:
+        logger.debug(
+            "Failed to cleanup queued prompt message",
+            scope_key=scope_key,
+            queue_id=queue_id,
+            chat_id=prompt_chat_id,
+            message_id=prompt_message_id,
+            error=str(exc),
+        )
+
+
 def _build_queue_controls_keyboard(queue_id: str) -> InlineKeyboardMarkup:
     """Build inline controls for queued item management."""
     return InlineKeyboardMarkup(
@@ -2135,7 +2196,7 @@ def _build_queue_controls_keyboard(queue_id: str) -> InlineKeyboardMarkup:
 async def dispatch_next_queued_task_if_idle(
     *, context: ContextTypes.DEFAULT_TYPE, scope_key: str
 ) -> bool:
-    """Dispatch the next queued text task when current scope is idle."""
+    """Dispatch the next queued task when current scope is idle."""
     inbound_queue = _get_inbound_task_queue(context)
     if inbound_queue is None:
         return False
@@ -2154,15 +2215,6 @@ async def dispatch_next_queued_task_if_idle(
         queue_item = await inbound_queue.pop_next(scope_key=scope_key)
         if queue_item is None:
             return False
-        if queue_item.kind != "text":
-            logger.warning(
-                "Skip unsupported queued task kind",
-                scope_key=scope_key,
-                queue_id=queue_item.queue_id,
-                kind=queue_item.kind,
-            )
-            return False
-
         payload = queue_item.payload if isinstance(queue_item.payload, dict) else {}
         queued_update = payload.get("update")
         if queued_update is None:
@@ -2173,31 +2225,92 @@ async def dispatch_next_queued_task_if_idle(
             )
             return False
 
-        queued_message_text = str(payload.get("message_text") or "")
-        queued_source_message_id = payload.get("source_message_id")
-        queued_fragment_count = payload.get("fragment_count")
-        if not isinstance(queued_source_message_id, int):
-            queued_source_message_id = None
-        if not isinstance(queued_fragment_count, int):
-            queued_fragment_count = 1
+        queued_prompt_chat_id = payload.get(_INBOUND_QUEUE_PROMPT_CHAT_ID_KEY)
+        queued_prompt_message_id = payload.get(_INBOUND_QUEUE_PROMPT_MESSAGE_ID_KEY)
+        if not isinstance(queued_prompt_chat_id, int):
+            queued_prompt_chat_id = None
+        if not isinstance(queued_prompt_message_id, int):
+            queued_prompt_message_id = None
 
-        asyncio.create_task(
-            handle_text_message(
-                queued_update,
-                context,
-                _from_queue=True,
-                _queued_message_text=queued_message_text,
-                _queued_source_message_id=queued_source_message_id,
-                _queued_fragment_count=max(1, queued_fragment_count),
-            )
-        )
-        logger.info(
-            "Dispatched queued task",
+        await _cleanup_queued_prompt_message(
+            context=context,
+            payload=payload,
             scope_key=scope_key,
             queue_id=queue_item.queue_id,
-            user_id=queue_item.user_id,
         )
-        return True
+
+        if queue_item.kind == "text":
+            queued_message_text = str(payload.get("message_text") or "")
+            queued_source_message_id = payload.get("source_message_id")
+            queued_fragment_count = payload.get("fragment_count")
+            if not isinstance(queued_source_message_id, int):
+                queued_source_message_id = None
+            if not isinstance(queued_fragment_count, int):
+                queued_fragment_count = 1
+
+            asyncio.create_task(
+                handle_text_message(
+                    queued_update,
+                    context,
+                    _from_queue=True,
+                    _queued_message_text=queued_message_text,
+                    _queued_source_message_id=queued_source_message_id,
+                    _queued_fragment_count=max(1, queued_fragment_count),
+                    _queued_prompt_chat_id=queued_prompt_chat_id,
+                    _queued_prompt_message_id=queued_prompt_message_id,
+                )
+            )
+            logger.info(
+                "Dispatched queued task",
+                scope_key=scope_key,
+                queue_id=queue_item.queue_id,
+                user_id=queue_item.user_id,
+                kind=queue_item.kind,
+            )
+            return True
+
+        if queue_item.kind == "photo":
+            queued_photos = payload.get("grouped_photos")
+            if not isinstance(queued_photos, list) or not queued_photos:
+                logger.warning(
+                    "Skip queued photo task without grouped photos payload",
+                    scope_key=scope_key,
+                    queue_id=queue_item.queue_id,
+                )
+                return False
+            queued_caption = str(payload.get("grouped_caption") or "")
+            queued_source_message_id = payload.get("source_message_id")
+            if not isinstance(queued_source_message_id, int):
+                queued_source_message_id = None
+
+            asyncio.create_task(
+                handle_photo(
+                    queued_update,
+                    context,
+                    _from_queue=True,
+                    _queued_grouped_photos=queued_photos,
+                    _queued_grouped_caption=queued_caption,
+                    _queued_source_message_id=queued_source_message_id,
+                    _queued_prompt_chat_id=queued_prompt_chat_id,
+                    _queued_prompt_message_id=queued_prompt_message_id,
+                )
+            )
+            logger.info(
+                "Dispatched queued task",
+                scope_key=scope_key,
+                queue_id=queue_item.queue_id,
+                user_id=queue_item.user_id,
+                kind=queue_item.kind,
+            )
+            return True
+
+        logger.warning(
+            "Skip unsupported queued task kind",
+            scope_key=scope_key,
+            queue_id=queue_item.queue_id,
+            kind=queue_item.kind,
+        )
+        return False
 
 
 async def handle_text_message(
@@ -2208,6 +2321,8 @@ async def handle_text_message(
     _queued_message_text: Optional[str] = None,
     _queued_source_message_id: Optional[int] = None,
     _queued_fragment_count: int = 1,
+    _queued_prompt_chat_id: Optional[int] = None,
+    _queued_prompt_message_id: Optional[int] = None,
 ) -> None:
     """Handle regular text messages as Claude prompts."""
     user_id = update.effective_user.id
@@ -2225,6 +2340,14 @@ async def handle_text_message(
     rate_limiter: Optional[RateLimiter] = context.bot_data.get("rate_limiter")
     audit_logger: Optional[AuditLogger] = context.bot_data.get("audit_logger")
     queue_dispatch_needed = False
+    queued_prompt_chat_id = (
+        _queued_prompt_chat_id if isinstance(_queued_prompt_chat_id, int) else None
+    )
+    queued_prompt_message_id = (
+        _queued_prompt_message_id
+        if isinstance(_queued_prompt_message_id, int)
+        else None
+    )
 
     if _from_queue and _queued_message_text is not None:
         message_text = str(_queued_message_text)
@@ -2288,16 +2411,25 @@ async def handle_text_message(
                 inbound_queue = _get_inbound_task_queue(context)
                 if inbound_queue is not None:
                     try:
+                        requeue_payload: dict[str, Any] = {
+                            "update": update,
+                            "message_text": message_text,
+                            "source_message_id": input_message_id,
+                            "fragment_count": fragment_count,
+                        }
+                        if queued_prompt_chat_id is not None:
+                            requeue_payload[_INBOUND_QUEUE_PROMPT_CHAT_ID_KEY] = (
+                                queued_prompt_chat_id
+                            )
+                        if queued_prompt_message_id is not None:
+                            requeue_payload[_INBOUND_QUEUE_PROMPT_MESSAGE_ID_KEY] = (
+                                queued_prompt_message_id
+                            )
                         await inbound_queue.enqueue(
                             user_id=user_id,
                             scope_key=scope_key,
                             kind="text",
-                            payload={
-                                "update": update,
-                                "message_text": message_text,
-                                "source_message_id": input_message_id,
-                                "fragment_count": fragment_count,
-                            },
+                            payload=requeue_payload,
                             preview=_normalize_queue_preview(message_text),
                         )
                     except QueueFullError:
@@ -2318,16 +2450,17 @@ async def handle_text_message(
 
             preview = _normalize_queue_preview(message_text)
             try:
+                queue_payload: dict[str, Any] = {
+                    "update": update,
+                    "message_text": message_text,
+                    "source_message_id": input_message_id,
+                    "fragment_count": fragment_count,
+                }
                 queue_item, ahead_count = await inbound_queue.enqueue(
                     user_id=user_id,
                     scope_key=scope_key,
                     kind="text",
-                    payload={
-                        "update": update,
-                        "message_text": message_text,
-                        "source_message_id": input_message_id,
-                        "fragment_count": fragment_count,
-                    },
+                    payload=queue_payload,
                     preview=preview,
                 )
             except QueueFullError:
@@ -2341,7 +2474,7 @@ async def handle_text_message(
                 )
                 return
 
-            await _reply_text_resilient(
+            queue_prompt_message = await _reply_text_resilient(
                 update.message,
                 (
                     "⏳ 上一条消息仍在处理中，当前消息已加入队列。\n"
@@ -2352,6 +2485,10 @@ async def handle_text_message(
                 parse_mode="Markdown",
                 reply_to_message_id=input_message_id,
                 reply_markup=_build_queue_controls_keyboard(queue_item.queue_id),
+            )
+            _remember_queue_prompt_message(
+                payload=queue_payload,
+                prompt_message=queue_prompt_message,
             )
             return
 
@@ -3043,7 +3180,9 @@ async def handle_text_message(
                             summary_text,
                         )
                     else:
-                        await progress_msg.edit_text(summary_text, parse_mode="Markdown")
+                        await progress_msg.edit_text(
+                            summary_text, parse_mode="Markdown"
+                        )
                 else:
                     await progress_msg.delete()
         except Exception as cleanup_error:
@@ -3463,17 +3602,47 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         logger.error("Error processing document", error=str(e), user_id=user_id)
 
 
-async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+async def handle_photo(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    *,
+    _from_queue: bool = False,
+    _queued_grouped_photos: Optional[list[Any]] = None,
+    _queued_grouped_caption: Optional[str] = None,
+    _queued_source_message_id: Optional[int] = None,
+    _queued_prompt_chat_id: Optional[int] = None,
+    _queued_prompt_message_id: Optional[int] = None,
+) -> None:
     """Handle photo uploads."""
     user_id = update.effective_user.id
-    (
-        media_group_ready,
-        grouped_photos,
-        grouped_caption,
-        source_message_id,
-    ) = await _collect_media_group_photos(update, context)
-    if not media_group_ready:
-        return
+    queued_prompt_chat_id = (
+        _queued_prompt_chat_id if isinstance(_queued_prompt_chat_id, int) else None
+    )
+    queued_prompt_message_id = (
+        _queued_prompt_message_id
+        if isinstance(_queued_prompt_message_id, int)
+        else None
+    )
+    if _from_queue and isinstance(_queued_grouped_photos, list):
+        grouped_photos = [item for item in _queued_grouped_photos if item is not None]
+        if not grouped_photos:
+            return
+        grouped_caption = str(_queued_grouped_caption or "")
+        source_message_id = (
+            _queued_source_message_id
+            if isinstance(_queued_source_message_id, int)
+            and _queued_source_message_id > 0
+            else None
+        )
+    else:
+        (
+            media_group_ready,
+            grouped_photos,
+            grouped_caption,
+            source_message_id,
+        ) = await _collect_media_group_photos(update, context)
+        if not media_group_ready:
+            return
 
     reply_target_message_id = (
         source_message_id
@@ -3504,8 +3673,94 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     if image_handler:
         task_registry: Optional[TaskRegistry] = context.bot_data.get("task_registry")
         if task_registry and await task_registry.is_busy(user_id, scope_key=scope_key):
-            await _reply_text_resilient(
-                update.message, "A task is already running. Use /cancel to cancel it."
+            if _from_queue:
+                logger.info(
+                    "Skip queued photo dispatch because scope is still busy",
+                    user_id=user_id,
+                    scope_key=scope_key,
+                )
+                inbound_queue = _get_inbound_task_queue(context)
+                if inbound_queue is not None:
+                    preview_source = grouped_caption or f"[photo x{photo_count}]"
+                    requeue_payload: dict[str, Any] = {
+                        "update": update,
+                        "grouped_photos": grouped_photos,
+                        "grouped_caption": grouped_caption,
+                        "source_message_id": reply_target_message_id,
+                    }
+                    if queued_prompt_chat_id is not None:
+                        requeue_payload[_INBOUND_QUEUE_PROMPT_CHAT_ID_KEY] = (
+                            queued_prompt_chat_id
+                        )
+                    if queued_prompt_message_id is not None:
+                        requeue_payload[_INBOUND_QUEUE_PROMPT_MESSAGE_ID_KEY] = (
+                            queued_prompt_message_id
+                        )
+                    try:
+                        await inbound_queue.enqueue(
+                            user_id=user_id,
+                            scope_key=scope_key,
+                            kind="photo",
+                            payload=requeue_payload,
+                            preview=_normalize_queue_preview(preview_source),
+                        )
+                    except QueueFullError:
+                        logger.warning(
+                            "Failed to requeue busy queued photo item because queue is full",
+                            user_id=user_id,
+                            scope_key=scope_key,
+                        )
+                return
+
+            inbound_queue = _get_inbound_task_queue(context)
+            if inbound_queue is None:
+                await _reply_text_resilient(
+                    update.message,
+                    "A task is already running. Use /cancel to cancel it.",
+                )
+                return
+
+            preview_source = grouped_caption or f"[photo x{photo_count}]"
+            queue_payload: dict[str, Any] = {
+                "update": update,
+                "grouped_photos": grouped_photos,
+                "grouped_caption": grouped_caption,
+                "source_message_id": reply_target_message_id,
+            }
+            try:
+                queue_item, ahead_count = await inbound_queue.enqueue(
+                    user_id=user_id,
+                    scope_key=scope_key,
+                    kind="photo",
+                    payload=queue_payload,
+                    preview=_normalize_queue_preview(preview_source),
+                )
+            except QueueFullError:
+                await _reply_text_resilient(
+                    update.message,
+                    (
+                        "⛔ 当前排队已满，请稍后重试。\n"
+                        f"每个会话最多排队 {inbound_queue.max_per_scope} 条任务。"
+                    ),
+                    reply_to_message_id=reply_target_message_id,
+                )
+                return
+
+            queue_prompt_message = await _reply_text_resilient(
+                update.message,
+                (
+                    "⏳ 上一条消息仍在处理中，当前图片请求已加入队列。\n"
+                    f"队列编号：`{queue_item.queue_id}`\n"
+                    f"前方等待：{ahead_count} 条\n\n"
+                    "可用 `/dequeue <编号>` 撤回，或点击下方按钮插队执行。"
+                ),
+                parse_mode="Markdown",
+                reply_to_message_id=reply_target_message_id,
+                reply_markup=_build_queue_controls_keyboard(queue_item.queue_id),
+            )
+            _remember_queue_prompt_message(
+                payload=queue_payload,
+                prompt_message=queue_prompt_message,
             )
             return
 
