@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
+import asyncio
 from typing import Any, Optional
 
 _TELEGRAM_MESSAGE_LIMIT = 4096
 _TELEGRAM_SAFE_SPLIT_LIMIT = 3800
+_TELEGRAM_TRANSIENT_RETRY_DELAYS_SECONDS: tuple[float, ...] = (0.35, 0.8)
 
 
 def is_markdown_parse_error(error: Exception) -> bool:
@@ -28,6 +30,51 @@ def is_thread_not_found_error(error: Exception) -> bool:
     """Whether Telegram rejected the provided topic/thread id."""
     error_text = str(error).lower()
     return "message thread not found" in error_text or "thread not found" in error_text
+
+
+def is_transient_network_error(error: Exception) -> bool:
+    """Whether Telegram send failure looks like a transient network/proxy issue."""
+    error_text = str(error).lower()
+    error_type = type(error).__name__.lower()
+
+    if "httpx.connecterror" in error_text or "httpcore.connecterror" in error_text:
+        return True
+    if error_type == "networkerror":
+        return True
+
+    transient_markers = (
+        "connection reset",
+        "connection aborted",
+        "connection refused",
+        "server disconnected",
+        "remote protocol error",
+        "temporary failure",
+        "timed out",
+        "timeout",
+        "tls",
+    )
+    return any(marker in error_text for marker in transient_markers)
+
+
+async def _send_message_with_retry(bot: Any, *, send_kwargs: dict[str, Any]) -> Any:
+    """Send Telegram message with short retry for transient network hiccups."""
+    max_attempts = len(_TELEGRAM_TRANSIENT_RETRY_DELAYS_SECONDS) + 1
+    last_error: Exception | None = None
+
+    for attempt_idx in range(max_attempts):
+        try:
+            return await bot.send_message(**send_kwargs)
+        except Exception as send_error:
+            last_error = send_error
+            if attempt_idx >= max_attempts - 1 or not is_transient_network_error(
+                send_error
+            ):
+                raise
+            await asyncio.sleep(_TELEGRAM_TRANSIENT_RETRY_DELAYS_SECONDS[attempt_idx])
+
+    if last_error is not None:
+        raise last_error
+    raise RuntimeError("Failed to send Telegram message: unknown send error")
 
 
 def split_text_for_telegram(
@@ -115,7 +162,7 @@ async def send_message_resilient(
     active_kwargs = dict(send_kwargs)
 
     try:
-        return await bot.send_message(**active_kwargs)
+        return await _send_message_with_retry(bot, send_kwargs=active_kwargs)
     except Exception as send_error:
         final_error: Exception = send_error
 
@@ -123,7 +170,7 @@ async def send_message_resilient(
         no_md_kwargs = dict(active_kwargs)
         no_md_kwargs.pop("parse_mode", None)
         try:
-            return await bot.send_message(**no_md_kwargs)
+            return await _send_message_with_retry(bot, send_kwargs=no_md_kwargs)
         except Exception as no_md_error:
             final_error = no_md_error
             active_kwargs = no_md_kwargs
@@ -132,7 +179,7 @@ async def send_message_resilient(
         no_thread_kwargs = dict(active_kwargs)
         no_thread_kwargs.pop("message_thread_id", None)
         try:
-            return await bot.send_message(**no_thread_kwargs)
+            return await _send_message_with_retry(bot, send_kwargs=no_thread_kwargs)
         except Exception as no_thread_error:
             final_error = no_thread_error
             active_kwargs = no_thread_kwargs
@@ -141,7 +188,9 @@ async def send_message_resilient(
             no_thread_no_md_kwargs = dict(active_kwargs)
             no_thread_no_md_kwargs.pop("parse_mode", None)
             try:
-                return await bot.send_message(**no_thread_no_md_kwargs)
+                return await _send_message_with_retry(
+                    bot, send_kwargs=no_thread_no_md_kwargs
+                )
             except Exception as no_thread_no_md_error:
                 final_error = no_thread_no_md_error
                 active_kwargs = no_thread_no_md_kwargs
@@ -157,7 +206,7 @@ async def send_message_resilient(
             chunk_kwargs["text"] = chunk
             if idx > 0:
                 chunk_kwargs.pop("reply_markup", None)
-            last_message = await bot.send_message(**chunk_kwargs)
+            last_message = await _send_message_with_retry(bot, send_kwargs=chunk_kwargs)
         return last_message
 
     raise final_error

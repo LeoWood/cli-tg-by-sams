@@ -131,10 +131,7 @@ _BOT_REACTION_PROCESSING = "👀"
 _BOT_REACTION_SUCCESS = "👍"
 _BOT_REACTION_FAILED = "👎"
 _TELEGRAM_REMOTE_CONTEXT_HINT = (
-    "系统提示：你正在通过 Telegram 与用户远程协作，"
-    "用户不在当前机器终端。"
-    "如果需要向用户交付图片或文件，请在可访问目录内生成文件，"
-    "并在回复中明确给出“文件路径：<path>”。"
+    "系统提示：你正在通过 Telegram 与用户远程协作，" "用户不在当前机器终端。"
 )
 
 
@@ -155,6 +152,74 @@ def _clean_path_candidate(raw_value: str) -> str:
     if "://" in candidate.lower():
         return ""
     return candidate
+
+
+def _resolve_delivery_root_path(
+    raw_value: Any, *, approved_root: Path
+) -> Optional[Path]:
+    """Resolve delivery root path; relative values are anchored to approved root."""
+    if raw_value is None:
+        return None
+    try:
+        candidate = Path(raw_value).expanduser()
+    except (TypeError, ValueError):
+        return None
+    if not candidate.is_absolute():
+        candidate = approved_root / candidate
+    try:
+        return candidate.resolve()
+    except OSError:
+        return None
+
+
+def _build_auto_delivery_policy(
+    settings: Settings,
+) -> tuple[list[Path], Optional[Path], Optional[Path]]:
+    """Build allowed roots and required root for auto-delivery checks."""
+    approved_root = Path(settings.approved_directory).expanduser().resolve()
+    allowed_roots: list[Path] = [approved_root]
+
+    preferred_root = _resolve_delivery_root_path(
+        settings.auto_delivery_directory, approved_root=approved_root
+    )
+    if preferred_root is not None:
+        try:
+            preferred_root.mkdir(parents=True, exist_ok=True)
+        except OSError as e:
+            logger.warning(
+                "Failed to ensure auto delivery directory",
+                path=str(preferred_root),
+                error=str(e),
+            )
+        allowed_roots.append(preferred_root)
+
+    extra_roots = settings.auto_delivery_allowed_directories or []
+    for raw_root in extra_roots:
+        resolved = _resolve_delivery_root_path(raw_root, approved_root=approved_root)
+        if resolved is None:
+            continue
+        allowed_roots.append(resolved)
+
+    deduped_roots: list[Path] = []
+    seen: set[str] = set()
+    for root in allowed_roots:
+        marker = str(root)
+        if marker in seen:
+            continue
+        seen.add(marker)
+        deduped_roots.append(root)
+
+    required_root = (
+        preferred_root
+        if settings.auto_delivery_require_directory and preferred_root is not None
+        else None
+    )
+    return deduped_roots, required_root, preferred_root
+
+
+def _is_path_within_any_root(candidate_path: Path, roots: list[Path]) -> bool:
+    """Check whether candidate path is under any allowed root."""
+    return any(candidate_path.is_relative_to(root) for root in roots)
 
 
 def _iter_tool_path_hints(payload: Any) -> list[str]:
@@ -345,11 +410,11 @@ def _resolve_image_paths_for_delivery(
     candidates: list[str],
     *,
     working_directory: Path,
-    approved_directory: Path,
+    allowed_roots: list[Path],
+    required_root: Optional[Path],
     limit: int = _AUTO_IMAGE_ATTACHMENTS_LIMIT,
 ) -> list[Path]:
     """Resolve, validate and deduplicate image paths before Telegram delivery."""
-    approved_root = Path(approved_directory).expanduser().resolve()
     work_root = Path(working_directory).expanduser().resolve()
     resolved: list[Path] = []
     seen: set[str] = set()
@@ -376,11 +441,20 @@ def _resolve_image_paths_for_delivery(
             continue
         if not candidate_path.exists() or not candidate_path.is_file():
             continue
-        if not candidate_path.is_relative_to(approved_root):
+        if required_root is not None and not candidate_path.is_relative_to(
+            required_root
+        ):
             logger.warning(
-                "Skip auto image delivery outside approved directory",
+                "Skip auto image delivery outside required directory",
                 path=path_str,
-                approved_directory=str(approved_root),
+                required_directory=str(required_root),
+            )
+            continue
+        if not _is_path_within_any_root(candidate_path, allowed_roots):
+            logger.warning(
+                "Skip auto image delivery outside allowed directories",
+                path=path_str,
+                allowed_directories=[str(root) for root in allowed_roots],
             )
             continue
         try:
@@ -404,11 +478,11 @@ def _resolve_file_paths_for_delivery(
     candidates: list[str],
     *,
     working_directory: Path,
-    approved_directory: Path,
+    allowed_roots: list[Path],
+    required_root: Optional[Path],
     limit: int = _AUTO_FILE_ATTACHMENTS_LIMIT,
 ) -> list[Path]:
     """Resolve, validate and deduplicate file paths before Telegram delivery."""
-    approved_root = Path(approved_directory).expanduser().resolve()
     work_root = Path(working_directory).expanduser().resolve()
     resolved: list[Path] = []
     seen: set[str] = set()
@@ -436,11 +510,20 @@ def _resolve_file_paths_for_delivery(
             continue
         if not candidate_path.exists() or not candidate_path.is_file():
             continue
-        if not candidate_path.is_relative_to(approved_root):
+        if required_root is not None and not candidate_path.is_relative_to(
+            required_root
+        ):
             logger.warning(
-                "Skip auto file delivery outside approved directory",
+                "Skip auto file delivery outside required directory",
                 path=path_str,
-                approved_directory=str(approved_root),
+                required_directory=str(required_root),
+            )
+            continue
+        if not _is_path_within_any_root(candidate_path, allowed_roots):
+            logger.warning(
+                "Skip auto file delivery outside allowed directories",
+                path=path_str,
+                allowed_directories=[str(root) for root in allowed_roots],
             )
             continue
         try:
@@ -464,17 +547,17 @@ def _extract_generated_image_paths(
     *,
     claude_response: Any | None,
     scope_state: dict[str, Any],
-    approved_directory: Path,
+    settings: Settings,
 ) -> list[Path]:
     """Collect generated image files from response content + tool traces."""
     if claude_response is None:
         return []
 
-    current_dir_raw = scope_state.get("current_directory", approved_directory)
+    current_dir_raw = scope_state.get("current_directory", settings.approved_directory)
     try:
         current_dir = Path(current_dir_raw)
     except TypeError:
-        current_dir = Path(approved_directory)
+        current_dir = Path(settings.approved_directory)
 
     content_candidates = _collect_candidate_image_paths_from_text(
         str(getattr(claude_response, "content", "") or "")
@@ -482,11 +565,13 @@ def _extract_generated_image_paths(
     tool_candidates = _collect_candidate_image_paths_from_tools(
         getattr(claude_response, "tools_used", None)
     )
+    allowed_roots, required_root, _ = _build_auto_delivery_policy(settings)
 
     return _resolve_image_paths_for_delivery(
         [*content_candidates, *tool_candidates],
         working_directory=current_dir,
-        approved_directory=Path(approved_directory),
+        allowed_roots=allowed_roots,
+        required_root=required_root,
     )
 
 
@@ -494,17 +579,17 @@ def _extract_generated_file_paths(
     *,
     claude_response: Any | None,
     scope_state: dict[str, Any],
-    approved_directory: Path,
+    settings: Settings,
 ) -> list[Path]:
     """Collect generated non-image files from response content + tool traces."""
     if claude_response is None:
         return []
 
-    current_dir_raw = scope_state.get("current_directory", approved_directory)
+    current_dir_raw = scope_state.get("current_directory", settings.approved_directory)
     try:
         current_dir = Path(current_dir_raw)
     except TypeError:
-        current_dir = Path(approved_directory)
+        current_dir = Path(settings.approved_directory)
 
     content_candidates = _collect_candidate_file_paths_from_text(
         str(getattr(claude_response, "content", "") or "")
@@ -512,11 +597,13 @@ def _extract_generated_file_paths(
     tool_candidates = _collect_candidate_file_paths_from_tools(
         getattr(claude_response, "tools_used", None)
     )
+    allowed_roots, required_root, _ = _build_auto_delivery_policy(settings)
 
     return _resolve_file_paths_for_delivery(
         [*content_candidates, *tool_candidates],
         working_directory=current_dir,
-        approved_directory=Path(approved_directory),
+        allowed_roots=allowed_roots,
+        required_root=required_root,
     )
 
 
@@ -540,7 +627,7 @@ async def _send_generated_images_from_response(
     image_paths = _extract_generated_image_paths(
         claude_response=claude_response,
         scope_state=scope_state,
-        approved_directory=settings.approved_directory,
+        settings=settings,
     )
     if not image_paths:
         return 0
@@ -594,7 +681,7 @@ async def _send_generated_files_from_response(
     file_paths = _extract_generated_file_paths(
         claude_response=claude_response,
         scope_state=scope_state,
-        approved_directory=settings.approved_directory,
+        settings=settings,
     )
     if not file_paths:
         return 0
@@ -1523,6 +1610,20 @@ def _format_error_message(error_str: str, *, engine: str = ENGINE_CLAUDE) -> str
             f"• Use simpler commands\n"
             f"• Try again in a moment"
         )
+    elif (
+        "httpx.connecterror" in error_str.lower()
+        or "httpcore.connecterror" in error_str.lower()
+        or "networkerror" in error_str.lower()
+    ):
+        return (
+            "🌐 **Telegram Network Error**\n\n"
+            "The bot temporarily lost network connectivity while sending Telegram "
+            "messages.\n\n"
+            "**What you can do:**\n"
+            "• Retry in a few seconds\n"
+            "• Check your local proxy/network status\n"
+            "• Contact the administrator if the problem persists"
+        )
     else:
         # Generic error handling
         # Escape special markdown characters in error message
@@ -2072,12 +2173,24 @@ def _compose_prompt_with_reaction_feedback(
     return message_text
 
 
-def _compose_prompt_with_telegram_remote_context(message_text: str) -> str:
+def _compose_prompt_with_telegram_remote_context(
+    message_text: str, *, settings: Optional[Settings] = None
+) -> str:
     """Inject remote Telegram context so CLI understands file delivery constraints."""
     prompt = str(message_text or "")
     if _TELEGRAM_REMOTE_CONTEXT_HINT in prompt:
         return prompt
-    return f"{_TELEGRAM_REMOTE_CONTEXT_HINT}\n\n{prompt}"
+
+    context_lines = [_TELEGRAM_REMOTE_CONTEXT_HINT]
+    if settings is not None:
+        _, _, preferred_root = _build_auto_delivery_policy(settings)
+        if preferred_root is not None:
+            context_lines.append(
+                "如需自动回传生成的图片或文件，请将输出保存到：" f"`{preferred_root}`。"
+            )
+            context_lines.append("完成后请在回复中写明：`文件路径: <绝对路径>`。")
+
+    return "\n".join(context_lines) + f"\n\n{prompt}"
 
 
 def _get_inbound_task_queue(
@@ -2772,7 +2885,9 @@ async def handle_text_message(
         model_prompt = _compose_prompt_with_reaction_feedback(
             message_text, reaction_feedback
         )
-        model_prompt = _compose_prompt_with_telegram_remote_context(model_prompt)
+        model_prompt = _compose_prompt_with_telegram_remote_context(
+            model_prompt, settings=settings
+        )
         if reaction_feedback:
             logger.info(
                 "Applying pending reaction feedback to model prompt",
@@ -3447,7 +3562,7 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             ),
         )
 
-        prompt = _compose_prompt_with_telegram_remote_context(prompt)
+        prompt = _compose_prompt_with_telegram_remote_context(prompt, settings=settings)
 
         # Process with Claude
         blocked_local_image_fallback = False
@@ -4057,7 +4172,9 @@ async def handle_photo(
                         f"Please analyze these {len(processed_images)} images in order "
                         "and provide one consolidated response."
                     )
-            model_prompt = _compose_prompt_with_telegram_remote_context(model_prompt)
+            model_prompt = _compose_prompt_with_telegram_remote_context(
+                model_prompt, settings=settings
+            )
 
             # Get current directory and session
             current_dir = Path(

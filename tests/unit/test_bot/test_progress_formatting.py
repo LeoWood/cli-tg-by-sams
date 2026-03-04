@@ -385,11 +385,46 @@ async def test_reply_text_resilient_bot_path_retries_without_thread():
     assert "message_thread_id" not in second_call_kwargs
 
 
+@pytest.mark.asyncio
+async def test_reply_text_resilient_bot_path_retries_transient_network_error(
+    monkeypatch,
+):
+    """Bot send path should retry once when transient network errors occur."""
+    sleep_mock = AsyncMock(return_value=None)
+    monkeypatch.setattr("src.bot.utils.telegram_send.asyncio.sleep", sleep_mock)
+
+    bot = type("FakeBot", (), {})()
+    bot.send_message = AsyncMock(
+        side_effect=[Exception("httpx.ConnectError: "), object()]
+    )
+    message = type("FakeMessage", (), {})()
+    message.chat_id = -100123
+    message.message_thread_id = 42
+
+    await _reply_text_resilient(
+        message,
+        "hello",
+        parse_mode="Markdown",
+        bot=bot,
+        chat_type="supergroup",
+    )
+
+    assert bot.send_message.await_count == 2
+    sleep_mock.assert_awaited_once()
+
+
 def test_format_error_message_uses_codex_label_for_generic_errors():
     """Codex generic error should not render Claude-branded header."""
     text = _format_error_message("mcp backend crashed", engine=ENGINE_CODEX)
     assert "Codex CLI Error" in text
     assert "Claude Code Error" not in text
+
+
+def test_format_error_message_uses_network_label_for_connect_error():
+    """Telegram network failures should not be mislabeled as CLI errors."""
+    text = _format_error_message("httpx.ConnectError: ", engine=ENGINE_CODEX)
+    assert "Telegram Network Error" in text
+    assert "Codex CLI Error" not in text
 
 
 def test_format_error_message_uses_status_command_for_codex_hints():
@@ -534,8 +569,7 @@ def test_build_collapsed_thinking_summary_uses_fallback_model_when_missing():
     collapsed = _build_collapsed_thinking_summary(
         all_progress_lines=["🔧 Read: `src/main.py`"],
         context_tag=(
-            "⬜ `Codex CLI` | `cli-tg` | `019c6252`\n"
-            "📁 *Project:* `/tmp/cli-tg`"
+            "⬜ `Codex CLI` | `cli-tg` | `019c6252`\n" "📁 *Project:* `/tmp/cli-tg`"
         ),
         fallback_model="gpt-5.3-codex",
     )

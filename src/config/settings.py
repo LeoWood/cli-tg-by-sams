@@ -155,6 +155,27 @@ class Settings(BaseSettings):
     enable_git_integration: bool = Field(True, description="Enable git commands")
     enable_file_uploads: bool = Field(True, description="Enable file upload handling")
     enable_quick_actions: bool = Field(True, description="Enable quick action buttons")
+    auto_delivery_directory: Optional[Path] = Field(
+        None,
+        description=(
+            "Preferred directory for auto-delivered generated files/images. "
+            "Relative values are resolved against APPROVED_DIRECTORY."
+        ),
+    )
+    auto_delivery_allowed_directories: Optional[List[Path]] = Field(
+        None,
+        description=(
+            "Extra allowed roots (comma-separated) for auto-delivery path checks. "
+            "Relative values are resolved against APPROVED_DIRECTORY."
+        ),
+    )
+    auto_delivery_require_directory: bool = Field(
+        False,
+        description=(
+            "Require generated files/images to be under AUTO_DELIVERY_DIRECTORY "
+            "before auto-delivery."
+        ),
+    )
     image_cleanup_max_age_hours: int = Field(
         24, description="Max age in hours for uploaded images before cleanup"
     )
@@ -346,6 +367,42 @@ class Settings(BaseSettings):
         if isinstance(v, Path):
             return v
         return Path(str(v))
+
+    @field_validator("auto_delivery_directory", mode="before")
+    @classmethod
+    def parse_auto_delivery_directory(cls, v: Any) -> Optional[Path]:
+        """Allow empty value and normalize auto delivery directory input."""
+        if v is None:
+            return None
+        if isinstance(v, str):
+            normalized = v.strip()
+            if not normalized:
+                return None
+            return Path(normalized)
+        if isinstance(v, Path):
+            return v
+        return Path(str(v))
+
+    @field_validator("auto_delivery_allowed_directories", mode="before")
+    @classmethod
+    def parse_auto_delivery_allowed_directories(
+        cls, v: Any
+    ) -> Optional[List[Path]]:
+        """Parse comma-separated extra auto delivery roots."""
+        if v is None:
+            return None
+        if isinstance(v, str):
+            raw_items = [item.strip() for item in v.split(",") if item.strip()]
+            return [Path(item) for item in raw_items] or None
+        if isinstance(v, list):
+            parsed: list[Path] = []
+            for item in v:
+                normalized = str(item).strip()
+                if not normalized:
+                    continue
+                parsed.append(Path(normalized))
+            return parsed or None
+        return v  # type: ignore[no-any-return]
 
     @field_validator("approved_directory")
     @classmethod
