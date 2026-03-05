@@ -96,7 +96,7 @@ _AUTO_IMAGE_PATH_PATTERN = re.compile(
     re.IGNORECASE,
 )
 _AUTO_PATH_LINE_HINT_PATTERN = re.compile(
-    r"(?:文件路径|路径|file\s*path|path)\s*[:：]\s*(?P<path>[^\s`\"'<>|]+)",
+    r"(?:文件路径|路径|file\s*path|path)\s*[:：]\s*(?P<path>[^\s\"'<>|]+)",
     re.IGNORECASE,
 )
 _IMAGE_GEN_GENERATE_COMMAND_PATTERN = re.compile(
