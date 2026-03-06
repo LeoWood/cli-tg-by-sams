@@ -2593,7 +2593,7 @@ async def handle_text_message(
                     "⏳ 上一条消息仍在处理中，当前消息已加入队列。\n"
                     f"队列编号：`{queue_item.queue_id}`\n"
                     f"前方等待：{ahead_count} 条\n\n"
-                    "可用 `/dequeue <编号>` 撤回，或点击下方按钮插队执行。"
+                    "可点击下方按钮撤回/插队执行。"
                 ),
                 parse_mode="Markdown",
                 reply_to_message_id=input_message_id,
@@ -3867,7 +3867,7 @@ async def handle_photo(
                     "⏳ 上一条消息仍在处理中，当前图片请求已加入队列。\n"
                     f"队列编号：`{queue_item.queue_id}`\n"
                     f"前方等待：{ahead_count} 条\n\n"
-                    "可用 `/dequeue <编号>` 撤回，或点击下方按钮插队执行。"
+                    "可点击下方按钮撤回/插队执行。"
                 ),
                 parse_mode="Markdown",
                 reply_to_message_id=reply_target_message_id,

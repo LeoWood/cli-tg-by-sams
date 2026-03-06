@@ -123,7 +123,7 @@ async def test_handle_photo_busy_enqueues_queue_item_instead_of_cancel(
     reply_mock.assert_awaited_once()
     sent_text = reply_mock.await_args.args[1]
     assert "已加入队列" in sent_text
-    assert "/dequeue" in sent_text
+    assert "撤回/插队执行" in sent_text
 
     queued_items = await queue.list_scope(scope_key=scope_key, user_id=user_id)
     assert len(queued_items) == 1
