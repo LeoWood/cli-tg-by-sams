@@ -277,10 +277,10 @@ class Settings(BaseSettings):
         ),
     )
     polling_update_stall_seconds: float = Field(
-        0.0,
+        60.0,
         description=(
-            "Polling stall watchdog threshold in seconds; "
-            "set 0 to disable update-stall auto restart"
+            "Polling stall watchdog threshold in seconds while Telegram reports "
+            "pending updates; set 0 to disable update-stall auto restart"
         ),
         ge=0.0,
         le=86400.0,
@@ -385,9 +385,7 @@ class Settings(BaseSettings):
 
     @field_validator("auto_delivery_allowed_directories", mode="before")
     @classmethod
-    def parse_auto_delivery_allowed_directories(
-        cls, v: Any
-    ) -> Optional[List[Path]]:
+    def parse_auto_delivery_allowed_directories(cls, v: Any) -> Optional[List[Path]]:
         """Parse comma-separated extra auto delivery roots."""
         if v is None:
             return None

@@ -63,7 +63,7 @@ _DEFAULT_TELEGRAM_CONNECTION_POOL_SIZE = 64
 _DEFAULT_TELEGRAM_GET_UPDATES_READ_TIMEOUT_SECONDS = 50.0
 _DEFAULT_TELEGRAM_GET_UPDATES_POOL_TIMEOUT_SECONDS = 30.0
 _DEFAULT_TELEGRAM_GET_UPDATES_CONNECTION_POOL_SIZE = 16
-_DEFAULT_POLLING_UPDATE_STALL_SECONDS = 0.0
+_DEFAULT_POLLING_UPDATE_STALL_SECONDS = 60.0
 _DEFAULT_POLLING_PENDING_UPDATE_STALL_SECONDS = 120.0
 _DEFAULT_TELEGRAM_USER_DATA_PERSISTENCE_PATH = Path("data/telegram-user-data.pkl")
 _USER_DATA_PERSISTENCE_UPDATE_INTERVAL_SECONDS = 10.0
@@ -1165,6 +1165,13 @@ class ClaudeCodeBot:
         if self._last_update_id is None:
             return
 
+        if (
+            self._last_pending_update_count is None
+            or self._last_pending_update_count <= 0
+            or self._pending_update_nonzero_since_monotonic <= 0
+        ):
+            return
+
         monotonic_now = time.monotonic()
         if self._last_update_progress_monotonic <= 0:
             self._last_update_progress_monotonic = monotonic_now
@@ -1180,6 +1187,7 @@ class ClaudeCodeBot:
                     monotonic_now - self._last_update_progress_monotonic, 2
                 ),
                 threshold_seconds=stall_threshold_seconds,
+                pending_update_count=self._last_pending_update_count,
             )
             await self._restart_polling(reason="update_stall_watchdog")
 

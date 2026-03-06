@@ -104,7 +104,8 @@ async def test_watchdog_restarts_when_error_flag_set() -> None:
 
 @pytest.mark.asyncio
 async def test_watchdog_restarts_when_update_progress_stalls() -> None:
-    """Watchdog should self-heal when no updates are processed for too long."""
+    """Watchdog should self-heal stalled progress only when pending updates exist."""
+    now = asyncio.get_running_loop().time()
     bot = ClaudeCodeBot(
         settings=SimpleNamespace(
             webhook_url=None,
@@ -115,12 +116,37 @@ async def test_watchdog_restarts_when_update_progress_stalls() -> None:
     bot.app = SimpleNamespace(updater=SimpleNamespace(running=True))
     bot._polling_restart_requested = False
     bot._last_update_id = 123
-    bot._last_update_progress_monotonic = asyncio.get_running_loop().time() - 11.0
+    bot._last_pending_update_count = 2
+    bot._pending_update_nonzero_since_monotonic = now - 11.0
+    bot._last_update_progress_monotonic = now - 11.0
     bot._restart_polling = AsyncMock(return_value=True)  # type: ignore[method-assign]
 
     await bot._polling_watchdog_tick()
 
     bot._restart_polling.assert_awaited_once_with(reason="update_stall_watchdog")
+
+
+@pytest.mark.asyncio
+async def test_watchdog_skips_update_stall_without_pending_updates() -> None:
+    """Update-stall watchdog should ignore normal idle periods without queue backlog."""
+    bot = ClaudeCodeBot(
+        settings=SimpleNamespace(
+            webhook_url=None,
+            polling_update_stall_seconds=10.0,
+        ),
+        dependencies={},
+    )
+    bot.app = SimpleNamespace(updater=SimpleNamespace(running=True))
+    bot._polling_restart_requested = False
+    bot._last_update_id = 123
+    bot._last_pending_update_count = 0
+    bot._pending_update_nonzero_since_monotonic = 0.0
+    bot._last_update_progress_monotonic = asyncio.get_running_loop().time() - 1000.0
+    bot._restart_polling = AsyncMock(return_value=True)  # type: ignore[method-assign]
+
+    await bot._polling_watchdog_tick()
+
+    bot._restart_polling.assert_not_awaited()
 
 
 @pytest.mark.asyncio
