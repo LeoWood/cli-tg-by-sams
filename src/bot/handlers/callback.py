@@ -1,7 +1,6 @@
 """Handle inline keyboard callbacks."""
 
 import asyncio
-from datetime import datetime
 from pathlib import Path
 from typing import Any
 
@@ -18,7 +17,6 @@ from ...services import ApprovalService
 from ...services.session_interaction_service import SessionInteractionService
 from ...services.session_lifecycle_service import SessionLifecycleService
 from ...services.session_service import SessionService
-from ...utils.beijing_time import format_datetime_beijing
 from ..features.session_export import ExportFormat
 from ..inbound_task_queue import InboundTaskQueue
 from ..utils.cli_engine import (
@@ -38,6 +36,11 @@ from ..utils.codex_models import (
 from ..utils.command_menu import sync_chat_command_menu
 from ..utils.recent_projects import build_recent_projects_message, scan_recent_projects
 from ..utils.resume_history import ResumeHistoryMessage, load_resume_history_preview
+from ..utils.resume_summary import (
+    build_resume_button_label,
+    build_resume_button_labels,
+    normalize_resume_preview,
+)
 from ..utils.resume_ui import build_resume_project_selector
 from ..utils.scope_state import get_scope_state_from_query
 from ..utils.telegram_send import (
@@ -488,69 +491,14 @@ def _escape_markdown(text: str) -> str:
     return escaped
 
 
-def _normalize_preview_text(raw: str, *, max_len: int) -> str:
-    """Normalize preview text into one compact line."""
-    compact = " ".join(str(raw or "").split())
-    if not compact:
-        return "无预览"
-    if len(compact) <= max_len:
-        return compact
-    return compact[: max_len - 3].rstrip() + "..."
-
-
-def _candidate_event_time(candidate) -> datetime | None:
-    """Resolve candidate event time, fallback to file mtime."""
-    last_event_at = getattr(candidate, "last_event_at", None)
-    if isinstance(last_event_at, datetime):
-        return last_event_at
-
-    file_mtime = getattr(candidate, "file_mtime", None)
-    if isinstance(file_mtime, datetime):
-        return file_mtime
-    return None
-
-
-def _format_relative_time(target: datetime | None) -> str:
-    """Format relative age from UTC naive datetime."""
-    if target is None:
-        return "时间未知"
-
-    now = datetime.utcnow()
-    delta_sec = max(0, int((now - target).total_seconds()))
-    if delta_sec < 60:
-        return "刚刚"
-    if delta_sec < 3600:
-        return f"{delta_sec // 60}分钟前"
-    if delta_sec < 86400:
-        return f"{delta_sec // 3600}小时前"
-    if delta_sec < 86400 * 7:
-        return f"{delta_sec // 86400}天前"
-    return format_datetime_beijing(target, fmt="%m-%d %H:%M")
-
-
-def _candidate_preview(candidate, *, max_len: int) -> str:
-    """Pick the best preview text for one session candidate."""
-    last_user_message = str(getattr(candidate, "last_user_message", "") or "").strip()
-    if last_user_message:
-        return _normalize_preview_text(last_user_message, max_len=max_len)
-
-    first_message = str(getattr(candidate, "first_message", "") or "").strip()
-    return _normalize_preview_text(first_message, max_len=max_len)
-
-
 def _build_resume_session_button_label(candidate) -> str:
     """Build concise button label for one resumable session."""
-    sid_short = str(getattr(candidate, "session_id", "") or "")[:8] or "unknown"
-    active = bool(getattr(candidate, "is_probably_active", False))
-    status = "🟢" if active else "⚪"
-    age = (
-        "活跃中" if active else _format_relative_time(_candidate_event_time(candidate))
+    return build_resume_button_label(
+        candidate,
+        preview_max_len=20,
+        max_label_len=60,
+        include_time=True,
     )
-    preview = _candidate_preview(candidate, max_len=14)
-    label = f"{status} {sid_short} · {age} · {preview}"
-    if len(label) > 60:
-        return label[:57] + "..."
-    return label
 
 
 def _build_resume_history_preview_text(
@@ -566,7 +514,7 @@ def _build_resume_history_preview_text(
     for message in messages:
         role = "你" if message.role == "user" else "助手"
         preview = _escape_markdown(
-            _normalize_preview_text(message.content, max_len=max_len)
+            normalize_resume_preview(message.content, max_len=max_len)
         )
         lines.append(f"• *{role}*: {preview}")
     return "\n".join(lines)
@@ -3090,8 +3038,18 @@ async def _resume_select_project(
 
     # Build session selection buttons
     keyboard = []
-    for c in candidates[:10]:  # limit to 10 sessions
-        label = _build_resume_session_button_label(c)
+    visible_candidates = [
+        candidate
+        for candidate in candidates[:10]
+        if str(getattr(candidate, "session_id", "") or "").strip()
+    ]
+    labels = build_resume_button_labels(
+        visible_candidates,
+        preview_max_len=20,
+        max_label_len=60,
+        include_time=True,
+    )
+    for c, label in zip(visible_candidates, labels):
 
         tok = token_mgr.issue(
             kind="s",

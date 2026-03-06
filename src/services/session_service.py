@@ -36,6 +36,8 @@ class SessionService:
 
     _codex_snapshot_cache: Dict[str, tuple[float, Dict[str, Any]]] = {}
     _codex_snapshot_ttl_seconds = 5
+    _codex_global_rate_limits_cache: Optional[tuple[float, Dict[str, Any]]] = None
+    _codex_global_rate_limits_ttl_seconds = 0
 
     def __init__(self, storage: Storage, event_service: EventService):
         self.storage = storage
@@ -368,6 +370,89 @@ class SessionService:
         return snapshot
 
     @classmethod
+    def _probe_latest_codex_global_rate_limits(cls) -> Optional[Dict[str, Any]]:
+        """Read the newest available Codex rate-limit snapshot across all sessions."""
+        now = time.monotonic()
+        cache_entry = cls._codex_global_rate_limits_cache
+        if cache_entry:
+            cached_at, cached_snapshot = cache_entry
+            if now - cached_at <= cls._codex_global_rate_limits_ttl_seconds:
+                return dict(cached_snapshot)
+
+        sessions_root = Path.home() / ".codex" / "sessions"
+        if not sessions_root.is_dir():
+            return None
+
+        latest_timestamp = ""
+        latest_snapshot: Optional[Dict[str, Any]] = None
+        try:
+            candidates = sessions_root.rglob("*.jsonl")
+        except OSError:
+            return None
+
+        for candidate in candidates:
+            parsed = cls._extract_latest_codex_rate_limits_from_file(candidate)
+            if not parsed:
+                continue
+            updated_at, snapshot = parsed
+            if updated_at > latest_timestamp:
+                latest_timestamp = updated_at
+                latest_snapshot = snapshot
+
+        if latest_snapshot is None:
+            cls._codex_global_rate_limits_cache = None
+            return None
+
+        cls._codex_global_rate_limits_cache = (now, dict(latest_snapshot))
+        return dict(latest_snapshot)
+
+    @classmethod
+    def _extract_latest_codex_rate_limits_from_file(
+        cls, session_file: Path
+    ) -> Optional[tuple[str, Dict[str, Any]]]:
+        """Extract the newest rate_limits block from one Codex session file tail."""
+        try:
+            size = session_file.stat().st_size
+        except OSError:
+            return None
+        if size <= 0:
+            return None
+
+        try:
+            chunk_size = min(size, 524_288)
+            with open(session_file, "rb") as fh:
+                fh.seek(max(0, size - chunk_size))
+                data = fh.read().decode("utf-8", errors="replace")
+        except OSError:
+            return None
+
+        lines = [line.strip() for line in data.splitlines() if line.strip()]
+        for line in reversed(lines):
+            try:
+                record = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if not isinstance(record, dict):
+                continue
+            if str(record.get("type") or "").strip() != "event_msg":
+                continue
+            payload = record.get("payload")
+            if not isinstance(payload, dict) or payload.get("type") != "token_count":
+                continue
+
+            parsed = cls._parse_codex_rate_limits(
+                payload.get("rate_limits"),
+                event_timestamp=str(record.get("timestamp") or "").strip(),
+            )
+            if not parsed:
+                continue
+
+            updated_at = str(parsed.get("updated_at") or "").strip()
+            return updated_at, parsed
+
+        return None
+
+    @classmethod
     def get_cached_codex_snapshot(cls, session_id: str) -> Optional[Dict[str, Any]]:
         """Return cached Codex snapshot if it is still fresh."""
         sid = str(session_id or "").strip()
@@ -525,36 +610,94 @@ class SessionService:
             lines.append(f"Session: `{session_id[:8]}...`")
             if claude_integration:
                 codex_local_snapshot: Optional[Dict[str, Any]] = None
+                codex_global_rate_limits: Optional[Dict[str, Any]] = None
+                live_precise_context: Optional[Dict[str, Any]] = None
                 if cli_kind == "codex":
                     codex_local_snapshot = SessionService._probe_codex_session_snapshot(
                         session_id
                     )
-                    if (
-                        codex_local_snapshot
-                        and codex_local_snapshot.get("used_tokens") is not None
-                        and codex_local_snapshot.get("total_tokens") is not None
-                    ):
-                        precise_context = dict(codex_local_snapshot)
+                    codex_global_rate_limits = (
+                        SessionService._probe_latest_codex_global_rate_limits()
+                    )
 
-                if allow_precise_context_probe and not precise_context:
-                    precise_context = (
+                if allow_precise_context_probe and cli_kind != "codex":
+                    live_precise_context = (
                         await claude_integration.get_precise_context_usage(
                             session_id=session_id,
                             working_directory=current_dir,
                             model=current_model,
                         )
                     )
-                if (
-                    cli_kind == "codex"
-                    and isinstance(precise_context, dict)
-                    and codex_local_snapshot
-                    and codex_local_snapshot.get("reasoning_effort")
-                    and not precise_context.get("reasoning_effort")
-                ):
-                    precise_context["reasoning_effort"] = codex_local_snapshot[
-                        "reasoning_effort"
-                    ]
-                if precise_context:
+                if cli_kind == "codex":
+                    merged_precise_context: Dict[str, Any] = {}
+                    if isinstance(live_precise_context, dict):
+                        merged_precise_context.update(live_precise_context)
+
+                    if isinstance(codex_local_snapshot, dict):
+                        if (
+                            merged_precise_context.get("used_tokens") is None
+                            or merged_precise_context.get("total_tokens") is None
+                        ):
+                            for key in (
+                                "used_tokens",
+                                "total_tokens",
+                                "remaining_tokens",
+                                "used_percent",
+                            ):
+                                if (
+                                    merged_precise_context.get(key) is None
+                                    and codex_local_snapshot.get(key) is not None
+                                ):
+                                    merged_precise_context[key] = codex_local_snapshot[
+                                        key
+                                    ]
+
+                        if not merged_precise_context.get("resolved_model"):
+                            resolved_model = codex_local_snapshot.get("resolved_model")
+                            if resolved_model:
+                                merged_precise_context["resolved_model"] = (
+                                    resolved_model
+                                )
+
+                        if not merged_precise_context.get("reasoning_effort"):
+                            reasoning_effort = codex_local_snapshot.get(
+                                "reasoning_effort"
+                            )
+                            if reasoning_effort:
+                                merged_precise_context["reasoning_effort"] = (
+                                    reasoning_effort
+                                )
+
+                        for key in ("probe_command", "cached", "estimated"):
+                            if (
+                                merged_precise_context.get(key) is None
+                                and codex_local_snapshot.get(key) is not None
+                            ):
+                                merged_precise_context[key] = codex_local_snapshot[key]
+
+                        if not merged_precise_context.get("rate_limits"):
+                            rate_limits = codex_local_snapshot.get("rate_limits")
+                            if rate_limits:
+                                merged_precise_context["rate_limits"] = rate_limits
+
+                    if codex_global_rate_limits:
+                        merged_precise_context["rate_limits"] = codex_global_rate_limits
+
+                    precise_context = merged_precise_context or None
+                else:
+                    precise_context = live_precise_context
+
+                has_precise_status_lines = bool(
+                    isinstance(precise_context, dict)
+                    and (
+                        precise_context.get("rate_limits")
+                        or (
+                            precise_context.get("used_tokens") is not None
+                            and precise_context.get("total_tokens") is not None
+                        )
+                    )
+                )
+                if has_precise_status_lines:
                     lines.extend(build_precise_context_status_lines(precise_context))
 
                 session_info = await claude_integration.get_session_info(session_id)
@@ -570,7 +713,7 @@ class SessionService:
                         lines.append(f"Cost: `${cost_value:.4f}`")
 
                     model_usage = session_info.get("model_usage")
-                    if model_usage and not precise_context:
+                    if model_usage and not has_precise_status_lines:
                         if (
                             cli_kind == "codex"
                             and not SessionService._usage_has_context_window(
@@ -592,19 +735,6 @@ class SessionService:
                                     allow_estimated_ratio=True,
                                 )
                             )
-
-                    if (
-                        cli_kind == "codex"
-                        and precise_context is None
-                        and codex_local_snapshot
-                        and codex_local_snapshot.get("resolved_model")
-                    ):
-                        precise_context = {
-                            "resolved_model": codex_local_snapshot["resolved_model"]
-                        }
-                        effort = codex_local_snapshot.get("reasoning_effort")
-                        if effort:
-                            precise_context["reasoning_effort"] = effort
 
                     model_display = SessionService._resolve_display_model(
                         current_model=current_model,
@@ -628,6 +758,16 @@ class SessionService:
                     )
         else:
             lines.append("Session: none")
+            if cli_kind == "codex":
+                global_rate_limits = (
+                    SessionService._probe_latest_codex_global_rate_limits()
+                )
+                if global_rate_limits:
+                    lines.extend(
+                        build_precise_context_status_lines(
+                            {"rate_limits": global_rate_limits}
+                        )
+                    )
             if include_resumable and claude_integration:
                 existing = await claude_integration._find_resumable_session(
                     user_id, current_dir

@@ -36,6 +36,7 @@ from ..utils.codex_models import (
 )
 from ..utils.command_menu import sync_chat_command_menu
 from ..utils.recent_projects import build_recent_projects_message, scan_recent_projects
+from ..utils.resume_summary import build_resume_button_labels
 from ..utils.resume_ui import build_resume_project_selector
 from ..utils.scope_state import get_scope_state_from_update
 from ..utils.telegram_send import (
@@ -2524,31 +2525,6 @@ def _resolve_resume_current_project(path_like: Any) -> Path | None:
         return None
 
 
-def _resume_candidate_preview(candidate: Any, *, max_len: int = 20) -> str:
-    """Build compact session preview text from scanner candidate."""
-    text = str(getattr(candidate, "last_user_message", "") or "").strip()
-    if not text:
-        text = str(getattr(candidate, "first_message", "") or "").strip()
-    if not text:
-        return "no preview"
-    compact = " ".join(text.split())
-    if len(compact) > max_len:
-        return compact[: max_len - 1] + "…"
-    return compact
-
-
-def _build_resume_candidate_button_label(candidate: Any) -> str:
-    """Build concise inline button label for resumable session."""
-    sid_short = str(getattr(candidate, "session_id", "") or "")[:8] or "unknown"
-    active = bool(getattr(candidate, "is_probably_active", False))
-    status_icon = "🟢" if active else "⚪"
-    preview = _resume_candidate_preview(candidate, max_len=14)
-    label = f"{status_icon} {sid_short} · {preview}"
-    if len(label) > 58:
-        return label[:55] + "..."
-    return label
-
-
 async def _reply_resume_sessions_for_project(
     *,
     update: Update,
@@ -2576,10 +2552,22 @@ async def _reply_resume_sessions_for_project(
         },
     )
 
+    visible_candidates = []
     for candidate in candidates[:10]:
         session_id = str(getattr(candidate, "session_id", "") or "").strip()
         if not session_id:
             continue
+        visible_candidates.append(candidate)
+
+    labels = build_resume_button_labels(
+        visible_candidates,
+        preview_max_len=20,
+        max_label_len=58,
+        include_time=True,
+    )
+
+    for candidate, label in zip(visible_candidates, labels):
+        session_id = str(getattr(candidate, "session_id", "") or "").strip()
         session_token = token_mgr.issue(
             kind="s",
             user_id=user_id,
@@ -2593,7 +2581,7 @@ async def _reply_resume_sessions_for_project(
         keyboard.append(
             [
                 InlineKeyboardButton(
-                    _build_resume_candidate_button_label(candidate),
+                    label,
                     callback_data=f"resume:s:{session_token}",
                 )
             ]

@@ -508,6 +508,43 @@ class TestClaudeIntegrationFacade:
         process_manager.execute_command.assert_awaited_once()
         assert process_manager.execute_command.await_args.kwargs["prompt"] == "/status"
 
+    async def test_get_precise_context_usage_parses_codex_live_limits(self, tmp_path):
+        """Codex `/status` should surface live limit bars even without context numbers."""
+        config = _build_config(tmp_path, use_sdk=False)
+        sdk_manager = MagicMock()
+        process_manager = MagicMock()
+        process_manager._resolve_cli_path = MagicMock(
+            return_value="/usr/local/bin/codex"
+        )
+        process_manager._detect_cli_kind = MagicMock(return_value="codex")
+        process_manager.execute_command = AsyncMock(
+            return_value=ClaudeResponse(
+                content=(
+                    "Model: gpt-5.4 (reasoning xhigh, summaries auto)\n"
+                    "5h limit: [█████] 20% left (resets 13:45)\n"
+                    "Weekly limit: [████] 19% left (resets 10:10 on 10 Mar)"
+                ),
+                session_id="thread-codex-2",
+                cost=0.0,
+                duration_ms=1,
+                num_turns=0,
+            )
+        )
+
+        facade = _build_facade(config, sdk_manager, process_manager)
+        result = await facade.get_precise_context_usage(
+            session_id="thread-codex-2",
+            working_directory=tmp_path,
+        )
+
+        assert result is not None
+        assert result["resolved_model"] == "gpt-5.4"
+        assert result["reasoning_effort"] == "xhigh"
+        assert result["rate_limits"]["primary"]["used_percent"] == 80.0
+        assert result["rate_limits"]["primary"]["resets_text"] == "13:45"
+        assert result["rate_limits"]["secondary"]["used_percent"] == 81.0
+        assert result["rate_limits"]["secondary"]["resets_text"] == "10:10 on 10 Mar"
+
     async def test_get_precise_context_usage_returns_none_when_unparseable(
         self, tmp_path
     ):

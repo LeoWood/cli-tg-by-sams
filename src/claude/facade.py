@@ -767,7 +767,10 @@ class ClaudeIntegration:
                 )
                 continue
 
-            parsed = self._parse_context_usage_text(response.content or "")
+            if cli_kind == "codex":
+                parsed = self._parse_codex_status_text(response.content or "")
+            else:
+                parsed = self._parse_context_usage_text(response.content or "")
             if parsed:
                 break
 
@@ -810,6 +813,111 @@ class ClaudeIntegration:
             }
             for s in sessions
         ]
+
+    @classmethod
+    def _parse_codex_status_text(cls, text: str) -> Optional[Dict[str, Any]]:
+        """Parse Codex `/status` output for live limits plus optional context/model data."""
+        if not text:
+            return None
+
+        normalized = re.sub(r"\x1b\[[0-9;?]*[ -/]*[@-~]", "", text)
+        payload: Dict[str, Any] = dict(cls._parse_context_usage_text(normalized) or {})
+
+        model_match = re.search(
+            r"(?im)^\s*Model:\s*(?P<model>[^\n(]+?)(?:\s+\(|\s*$)",
+            normalized,
+        )
+        if model_match:
+            payload["resolved_model"] = model_match.group("model").strip()
+
+        effort_match = re.search(
+            r"(?im)\breasoning\s+(?P<effort>xhigh|high|medium|low)\b",
+            normalized,
+        )
+        if effort_match:
+            payload["reasoning_effort"] = effort_match.group("effort").strip().lower()
+
+        rate_limits = cls._parse_codex_rate_limits_text(normalized)
+        if rate_limits:
+            payload["rate_limits"] = rate_limits
+
+        return payload or None
+
+    @classmethod
+    def _parse_codex_rate_limits_text(cls, text: str) -> Optional[Dict[str, Any]]:
+        """Parse live 5h/weekly limit lines from Codex `/status` output."""
+        if not text:
+            return None
+
+        entries: Dict[str, Dict[str, Any]] = {}
+        updated_match = re.search(
+            r"(?im)^\s*Updated:\s*(?P<updated>[^\n]+?)\s*$",
+            text,
+        )
+
+        line_specs = (
+            (
+                "primary",
+                300,
+                ("5h", "5h limit", "5h window", "primary", "primary limit"),
+            ),
+            (
+                "secondary",
+                10_080,
+                (
+                    "weekly",
+                    "weekly limit",
+                    "7d",
+                    "7d limit",
+                    "7d window",
+                    "secondary",
+                    "secondary limit",
+                ),
+            ),
+        )
+
+        remaining_pattern = re.compile(
+            r"(?P<remaining>\d{1,3}(?:\.\d+)?)\s*%\s*(?:left|remaining)\b",
+            re.IGNORECASE,
+        )
+        resets_pattern = re.compile(
+            r"\(\s*resets?\s+(?P<reset>[^)]+?)\s*\)",
+            re.IGNORECASE,
+        )
+
+        for raw_line in text.splitlines():
+            line = raw_line.strip()
+            if not line:
+                continue
+            lower = line.lower()
+            for key, window_minutes, aliases in line_specs:
+                if not any(lower.startswith(alias) for alias in aliases):
+                    continue
+                remaining_match = remaining_pattern.search(line)
+                if not remaining_match:
+                    continue
+                remaining_percent = float(remaining_match.group("remaining"))
+                entry: Dict[str, Any] = {
+                    "used_percent": max(min(100.0 - remaining_percent, 100.0), 0.0),
+                    "window_minutes": window_minutes,
+                }
+                resets_match = resets_pattern.search(line)
+                if resets_match:
+                    reset_text = resets_match.group("reset").strip()
+                    if reset_text:
+                        entry["resets_text"] = reset_text
+                entries[key] = entry
+                break
+
+        if not entries:
+            return None
+
+        result: Dict[str, Any] = dict(entries)
+        if updated_match:
+            updated_text = updated_match.group("updated").strip()
+            if updated_text:
+                result["updated_text"] = updated_text
+        return result
 
     @classmethod
     def _parse_context_usage_text(cls, text: str) -> Optional[Dict[str, Any]]:

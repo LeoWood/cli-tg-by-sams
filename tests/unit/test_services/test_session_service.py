@@ -213,30 +213,37 @@ async def test_build_context_snapshot_codex_without_precise_uses_status_hint():
             }
         ),
     )
+    SessionService._codex_global_rate_limits_cache = None
 
-    snapshot = await SessionService.build_context_snapshot(
-        user_id=3011,
-        session_id="thread-codex-1",
-        current_dir=approved,
-        approved_directory=approved,
-        current_model="default",
-        claude_integration=claude_integration,
-        allow_precise_context_probe=True,
-    )
+    with pytest.MonkeyPatch.context() as monkeypatch:
+        monkeypatch.setattr(
+            SessionService,
+            "_probe_latest_codex_global_rate_limits",
+            classmethod(lambda cls: None),
+        )
+        snapshot = await SessionService.build_context_snapshot(
+            user_id=3011,
+            session_id="thread-codex-1",
+            current_dir=approved,
+            approved_directory=approved,
+            current_model="default",
+            claude_integration=claude_integration,
+            allow_precise_context_probe=True,
+        )
 
     rendered = "\n".join(snapshot.lines)
     assert "Context (/status)" in rendered
     assert "请执行 `/status` 刷新" in rendered
     assert "Cost:" not in rendered
     assert "Tokens: `156,647,370`" not in rendered
-    claude_integration.get_precise_context_usage.assert_awaited_once()
+    claude_integration.get_precise_context_usage.assert_not_awaited()
 
 
 @pytest.mark.asyncio
-async def test_build_context_snapshot_codex_uses_local_snapshot_for_model_and_usage(
+async def test_build_context_snapshot_codex_uses_global_limits_and_local_usage(
     monkeypatch,
 ):
-    """Codex /context should render model and usage from local session snapshot."""
+    """Codex /context should use global latest limits plus local session usage."""
     approved = Path("/tmp/project")
     process_manager = SimpleNamespace(
         _resolve_cli_path=lambda: "/usr/local/bin/codex",
@@ -251,6 +258,24 @@ async def test_build_context_snapshot_codex_uses_local_snapshot_for_model_and_us
                 "turns": 37,
                 "cost": 0.0,
                 "model_usage": None,
+            }
+        ),
+    )
+    monkeypatch.setattr(
+        SessionService,
+        "_probe_latest_codex_global_rate_limits",
+        classmethod(
+            lambda cls: {
+                "primary": {
+                    "used_percent": 80.0,
+                    "window_minutes": 300,
+                    "resets_text": "13:45",
+                },
+                "secondary": {
+                    "used_percent": 81.0,
+                    "window_minutes": 10_080,
+                    "resets_text": "10:10 on 10 Mar",
+                },
             }
         ),
     )
@@ -292,8 +317,8 @@ async def test_build_context_snapshot_codex_uses_local_snapshot_for_model_and_us
     assert "Cost:" not in rendered
     assert "Usage: `108,000` / `258,400` (41.8%)" in rendered
     assert "Usage Limits (/status)" in rendered
-    assert "5h window: `80.0% remaining`" in rendered
-    assert "7d window: `64.0% remaining`" in rendered
+    assert "5h window: `20.0% remaining` (resets `13:45`)" in rendered
+    assert "7d window: `19.0% remaining` (resets `10:10 on 10 Mar`)" in rendered
     claude_integration.get_precise_context_usage.assert_not_awaited()
 
 
@@ -418,6 +443,49 @@ async def test_build_context_snapshot_for_resumable_session():
     assert "Session: none" in rendered
     assert "Resumable: `resume-1...` (18 msgs)" in rendered
     assert snapshot.resumable_payload is not None
+
+
+@pytest.mark.asyncio
+async def test_build_context_snapshot_without_session_can_show_global_codex_limits(
+    monkeypatch,
+):
+    """Codex /status should still show global usage windows after /new clears session."""
+    approved = Path("/tmp/project")
+    current_dir = approved
+    claude_integration = SimpleNamespace(
+        process_manager=SimpleNamespace(
+            _resolve_cli_path=lambda: "/usr/local/bin/codex",
+            _detect_cli_kind=lambda _: "codex",
+        ),
+        _find_resumable_session=AsyncMock(return_value=None),
+    )
+    monkeypatch.setattr(
+        SessionService,
+        "_probe_latest_codex_global_rate_limits",
+        classmethod(
+            lambda cls: {
+                "primary": {"used_percent": 77.0, "window_minutes": 300},
+                "secondary": {"used_percent": 80.0, "window_minutes": 10_080},
+                "updated_at": "2026-03-06T02:50:22.205000Z",
+            }
+        ),
+    )
+
+    snapshot = await SessionService.build_context_snapshot(
+        user_id=3002,
+        session_id=None,
+        current_dir=current_dir,
+        approved_directory=approved,
+        current_model=None,
+        claude_integration=claude_integration,
+        include_resumable=True,
+    )
+
+    rendered = "\n".join(snapshot.lines)
+    assert "Session: none" in rendered
+    assert "Usage Limits (/status)" in rendered
+    assert "5h window: `23.0% remaining`" in rendered
+    assert "7d window: `20.0% remaining`" in rendered
 
 
 @pytest.mark.asyncio

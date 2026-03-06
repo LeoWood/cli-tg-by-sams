@@ -209,6 +209,9 @@ def _build_rate_limit_lines(rate_limits: Any) -> List[str]:
                 normalized["resets_at"] = resets_at
         except (TypeError, ValueError):
             pass
+        reset_text = str(entry.get("resets_text") or "").strip()
+        if reset_text:
+            normalized["resets_text"] = reset_text
         entries.append(normalized)
 
     if not entries:
@@ -220,6 +223,10 @@ def _build_rate_limit_lines(rate_limits: Any) -> List[str]:
     updated_at = format_iso_datetime_beijing(rate_limits.get("updated_at"))
     if updated_at:
         lines.append(f"Updated: `{updated_at}`")
+    else:
+        updated_text = str(rate_limits.get("updated_text") or "").strip()
+        if updated_text:
+            lines.append(f"Updated: `{updated_text}`")
 
     for entry in entries:
         window_minutes = int(entry["window_minutes"])
@@ -227,6 +234,8 @@ def _build_rate_limit_lines(rate_limits: Any) -> List[str]:
         used_percent = max(min(float(entry["used_percent"]), 100.0), 0.0)
         remaining_percent = max(min(100.0 - used_percent, 100.0), 0.0)
         reset_text = _format_unix_timestamp(entry.get("resets_at"))
+        if not reset_text:
+            reset_text = str(entry.get("resets_text") or "").strip()
         line = f"{label}: `{remaining_percent:.1f}% remaining`"
         if reset_text:
             line += f" (resets `{reset_text}`)"
