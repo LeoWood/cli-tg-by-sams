@@ -9,8 +9,8 @@ import pytest
 from src.bot.handlers.callback import (
     _do_adopt_session,
     _resume_select_project,
-    handle_engine_callback,
     handle_effort_callback,
+    handle_engine_callback,
     handle_model_callback,
     handle_quick_action_callback,
     handle_resume_callback,
@@ -25,6 +25,7 @@ from src.bot.handlers.command import (
     switch_engine,
 )
 from src.bot.resume_tokens import ResumeTokenManager
+from src.bot.utils import codex_models
 from src.bot.utils.cli_engine import ENGINE_CODEX, ENGINE_STATE_KEY, get_cli_integration
 from src.services.session_service import SessionService
 
@@ -40,6 +41,32 @@ def _build_settings(approved_directory: Path) -> SimpleNamespace:
         approved_directory=approved_directory,
         use_sdk=False,
         resume_scan_cache_ttl_seconds=30,
+    )
+
+
+@pytest.fixture(autouse=True)
+def _stable_codex_model_candidates(monkeypatch):
+    """Keep Codex model keyboards deterministic during unit tests."""
+
+    def _fake_discover(
+        *,
+        selected_model: str | None,
+        resolved_model: str | None = None,
+        **_: object,
+    ) -> list[str]:
+        candidates: list[str] = []
+        for value in (resolved_model, selected_model, "gpt-5.4", "gpt-5.3-codex"):
+            normalized = str(value or "").strip()
+            if not normalized or normalized.lower() in {"default", "current"}:
+                continue
+            if normalized not in candidates:
+                candidates.append(normalized)
+        return candidates
+
+    monkeypatch.setattr(
+        codex_models,
+        "discover_codex_model_candidates",
+        _fake_discover,
     )
 
 
@@ -1244,7 +1271,9 @@ async def test_resume_command_prefers_current_project_sessions(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_resume_command_tries_current_project_even_if_not_in_project_list(tmp_path):
+async def test_resume_command_tries_current_project_even_if_not_in_project_list(
+    tmp_path,
+):
     """`/resume` should still try current project sessions before picker fallback."""
     approved = tmp_path / "approved"
     approved.mkdir()

@@ -19,8 +19,8 @@ from ...services.session_interaction_service import SessionInteractionService
 from ...services.session_lifecycle_service import SessionLifecycleService
 from ...services.session_service import SessionService
 from ...utils.beijing_time import format_datetime_beijing
-from ..inbound_task_queue import InboundTaskQueue
 from ..features.session_export import ExportFormat
+from ..inbound_task_queue import InboundTaskQueue
 from ..utils.cli_engine import (
     DEFAULT_CLI_ENGINE,
     ENGINE_CLAUDE,
@@ -31,6 +31,9 @@ from ..utils.cli_engine import (
     get_engine_capabilities,
     normalize_cli_engine,
     set_active_cli_engine,
+)
+from ..utils.codex_models import (
+    build_codex_model_keyboard as _build_codex_model_keyboard,
 )
 from ..utils.command_menu import sync_chat_command_menu
 from ..utils.recent_projects import build_recent_projects_message, scan_recent_projects
@@ -44,10 +47,10 @@ from ..utils.telegram_send import (
 )
 from ..utils.ui_adapter import build_reply_markup_from_spec
 from .message import (
-    dispatch_next_queued_task_if_idle,
     _resolve_model_override,
     _resolve_reasoning_effort_override,
     build_permission_handler,
+    dispatch_next_queued_task_if_idle,
 )
 
 logger = structlog.get_logger()
@@ -357,7 +360,9 @@ async def _handle_queue_callback(
                 )
 
         await query.answer(
-            "已请求插队，正在中断当前任务..." if cancelled else "已插队，任务将立即执行。"
+            "已请求插队，正在中断当前任务..."
+            if cancelled
+            else "已插队，任务将立即执行。"
         )
         await _cleanup_queue_prompt_message(query=query)
 
@@ -589,34 +594,6 @@ def _build_engine_selector_keyboard(
         return None
 
     return InlineKeyboardMarkup([buttons])
-
-
-def _build_codex_model_keyboard(*, selected_model: str | None) -> InlineKeyboardMarkup:
-    """Build inline keyboard for Codex model selection callbacks."""
-    selected = str(selected_model or "").strip()
-    candidates: list[str] = []
-    for candidate in (
-        selected,
-        "gpt-5.3-codex",
-        "gpt-5.1-codex-mini",
-        "gpt-5",
-    ):
-        value = str(candidate or "").strip().replace("`", "")
-        if not value or value.lower() in {"default", "current"}:
-            continue
-        if value not in candidates:
-            candidates.append(value)
-
-    rows: list[list[InlineKeyboardButton]] = []
-    for value in candidates:
-        label = f"✅ {value}" if value == selected else value
-        rows.append([InlineKeyboardButton(label, callback_data=f"model:codex:{value}")])
-
-    default_label = "✅ default" if not selected else "default"
-    rows.append(
-        [InlineKeyboardButton(default_label, callback_data="model:codex:default")]
-    )
-    return InlineKeyboardMarkup(rows)
 
 
 def _normalize_reasoning_effort_label(raw: str) -> str:
@@ -1603,6 +1580,17 @@ async def handle_model_callback(
             selected = selected_raw.replace("`", "")
             scope_state["claude_model"] = selected
 
+        session_id = str(scope_state.get("claude_session_id") or "").strip()
+        resolved_model = ""
+        if session_id:
+            codex_snapshot = SessionService.get_cached_codex_snapshot(session_id)
+            if codex_snapshot is None:
+                codex_snapshot = SessionService._probe_codex_session_snapshot(
+                    session_id
+                )
+            if isinstance(codex_snapshot, dict):
+                resolved_model = str(codex_snapshot.get("resolved_model") or "").strip()
+
         await _edit_query_message_resilient(
             query,
             "✅ 已更新 Codex 模型设置。\n"
@@ -1610,7 +1598,8 @@ async def handle_model_callback(
             "你也可以手动输入：`/model <model_name>`",
             parse_mode="Markdown",
             reply_markup=_build_codex_model_keyboard(
-                selected_model=str(scope_state.get("claude_model") or "").strip()
+                selected_model=str(scope_state.get("claude_model") or "").strip(),
+                resolved_model=resolved_model,
             ),
         )
         return

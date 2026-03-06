@@ -31,6 +31,9 @@ from ..utils.cli_engine import (
     normalize_cli_engine,
     set_active_cli_engine,
 )
+from ..utils.codex_models import (
+    build_codex_model_keyboard as _build_codex_model_keyboard,
+)
 from ..utils.command_menu import sync_chat_command_menu
 from ..utils.recent_projects import build_recent_projects_message, scan_recent_projects
 from ..utils.resume_ui import build_resume_project_selector
@@ -344,37 +347,6 @@ def _build_engine_selector_keyboard(
         return None
 
     return InlineKeyboardMarkup([buttons])
-
-
-def _build_codex_model_keyboard(
-    *, selected_model: str | None, resolved_model: str | None = None
-) -> InlineKeyboardMarkup:
-    """Build inline keyboard for Codex model selection."""
-    selected = str(selected_model or "").strip()
-    candidates: list[str] = []
-    for candidate in (
-        resolved_model,
-        selected,
-        "gpt-5.3-codex",
-        "gpt-5.1-codex-mini",
-        "gpt-5",
-    ):
-        value = str(candidate or "").strip().replace("`", "")
-        if not value or value.lower() in {"default", "current"}:
-            continue
-        if value not in candidates:
-            candidates.append(value)
-
-    rows: list[list[InlineKeyboardButton]] = []
-    for value in candidates:
-        label = f"✅ {value}" if value == selected else value
-        rows.append([InlineKeyboardButton(label, callback_data=f"model:codex:{value}")])
-
-    default_label = "✅ default" if not selected else "default"
-    rows.append(
-        [InlineKeyboardButton(default_label, callback_data="model:codex:default")]
-    )
-    return InlineKeyboardMarkup(rows)
 
 
 def _build_codex_effort_keyboard(
@@ -1894,7 +1866,9 @@ async def queue_status_command(
     )
     inbound_queue = context.bot_data.get("inbound_task_queue")
     if not isinstance(inbound_queue, InboundTaskQueue):
-        await _reply_update_message_resilient(update, context, "Queue is not available.")
+        await _reply_update_message_resilient(
+            update, context, "Queue is not available."
+        )
         return
 
     queued_items = await inbound_queue.list_scope(scope_key=scope_key, user_id=user_id)
@@ -1945,7 +1919,9 @@ async def dequeue_command(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     )
     inbound_queue = context.bot_data.get("inbound_task_queue")
     if not isinstance(inbound_queue, InboundTaskQueue):
-        await _reply_update_message_resilient(update, context, "Queue is not available.")
+        await _reply_update_message_resilient(
+            update, context, "Queue is not available."
+        )
         return
 
     args = [str(arg).strip() for arg in (context.args or []) if str(arg).strip()]
