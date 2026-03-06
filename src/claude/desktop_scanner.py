@@ -32,6 +32,7 @@ class DesktopSessionCandidate:
     is_probably_active: bool  # now - mtime <= active_window
     first_message: str  # first user message preview
     last_user_message: str  # latest user message preview from file tail
+    previous_user_message: str  # second latest user message preview from file tail
 
 
 @dataclass
@@ -309,7 +310,7 @@ class DesktopSessionScanner:
 
         # --- Tail scan: last timestamp ---
         last_event_at: Optional[datetime] = None
-        last_user_message: str = ""
+        recent_user_messages: list[str] = []
         tail_lines = self._read_tail_lines(jsonl_path, max_lines=200)
         for line in reversed(tail_lines):
             line = line.strip()
@@ -325,16 +326,21 @@ class DesktopSessionScanner:
             if ts and last_event_at is None:
                 last_event_at = self._parse_iso_timestamp(ts)
 
-            if not last_user_message and record.get("type") == "user":
+            if len(recent_user_messages) < 2 and record.get("type") == "user":
                 message = record.get("message")
                 content = (
                     message.get("content", "") if isinstance(message, dict) else ""
                 )
                 if isinstance(content, str) and content.strip():
-                    last_user_message = content.strip()[:120]
+                    recent_user_messages.append(content.strip()[:120])
 
-            if last_event_at is not None and last_user_message:
+            if last_event_at is not None and len(recent_user_messages) >= 2:
                 break
+
+        last_user_message = recent_user_messages[0] if recent_user_messages else ""
+        previous_user_message = (
+            recent_user_messages[1] if len(recent_user_messages) > 1 else ""
+        )
 
         # --- File mtime ---
         try:
@@ -355,4 +361,5 @@ class DesktopSessionScanner:
             is_probably_active=is_active,
             first_message=first_message,
             last_user_message=last_user_message,
+            previous_user_message=previous_user_message,
         )

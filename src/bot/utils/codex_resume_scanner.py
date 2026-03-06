@@ -17,6 +17,7 @@ logger = structlog.get_logger()
 
 # Default Codex sessions directory
 CODEX_SESSIONS_DIR = Path.home() / ".codex" / "sessions"
+CODEX_SESSION_INDEX_PATH = Path.home() / ".codex" / "session_index.jsonl"
 
 
 @dataclass
@@ -29,8 +30,10 @@ class CodexSessionCandidate:
     last_event_at: Optional[datetime]
     file_mtime: datetime
     is_probably_active: bool
+    thread_name: str
     first_message: str
     last_user_message: str
+    previous_user_message: str
 
 
 @dataclass
@@ -39,6 +42,8 @@ class _ScanCache:
 
     projects: Optional[List[Path]] = None
     projects_ts: float = 0.0
+    thread_names: Optional[Dict[str, str]] = None
+    thread_names_ts: float = 0.0
     sessions: Dict[str, Tuple[List[CodexSessionCandidate], float]] = field(
         default_factory=dict
     )
@@ -52,10 +57,16 @@ class CodexSessionScanner:
         approved_directory: Path,
         cache_ttl_sec: int = 30,
         sessions_dir: Optional[Path] = None,
+        session_index_path: Optional[Path] = None,
     ):
         self._approved = approved_directory.resolve()
         self._cache_ttl = cache_ttl_sec
         self._sessions_dir = sessions_dir or CODEX_SESSIONS_DIR
+        self._session_index_path = (
+            session_index_path
+            if session_index_path is not None
+            else self._sessions_dir.parent / CODEX_SESSION_INDEX_PATH.name
+        )
         self._cache = _ScanCache()
 
     async def list_projects(self) -> List[Path]:
@@ -124,6 +135,7 @@ class CodexSessionScanner:
 
         candidates: List[CodexSessionCandidate] = []
         now_ts = time.time()
+        thread_names = self._load_thread_names()
 
         if not self._sessions_dir.is_dir():
             return []
@@ -134,6 +146,7 @@ class CodexSessionScanner:
                 target_cwd=resolved_cwd,
                 now_ts=now_ts,
                 active_window_sec=active_window_sec,
+                thread_names=thread_names,
             )
             if parsed is not None:
                 candidates.append(parsed)
@@ -150,6 +163,40 @@ class CodexSessionScanner:
     def clear_cache(self) -> None:
         """Invalidate all cached scan results."""
         self._cache = _ScanCache()
+
+    def _load_thread_names(self) -> Dict[str, str]:
+        """Load session_id -> thread_name mapping from Codex session index."""
+        now = time.monotonic()
+        cached = self._cache.thread_names
+        if cached is not None and now - self._cache.thread_names_ts < self._cache_ttl:
+            return dict(cached)
+
+        mapping: Dict[str, str] = {}
+        index_path = self._session_index_path
+        try:
+            with open(index_path, "r", encoding="utf-8") as fh:
+                for line in fh:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        record = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    if not isinstance(record, dict):
+                        continue
+                    session_id = str(record.get("id") or "").strip()
+                    thread_name = " ".join(
+                        str(record.get("thread_name") or "").split()
+                    ).strip()
+                    if session_id and thread_name:
+                        mapping[session_id] = thread_name
+        except OSError:
+            mapping = {}
+
+        self._cache.thread_names = mapping
+        self._cache.thread_names_ts = now
+        return dict(mapping)
 
     @staticmethod
     def _parse_iso_timestamp(ts_str: str) -> Optional[datetime]:
@@ -250,6 +297,7 @@ class CodexSessionScanner:
         target_cwd: Path,
         now_ts: float,
         active_window_sec: int,
+        thread_names: Dict[str, str],
     ) -> Optional[CodexSessionCandidate]:
         """Parse one Codex session jsonl and return candidate if cwd matches."""
         meta = self._extract_meta_from_head(jsonl_path)
@@ -262,7 +310,7 @@ class CodexSessionScanner:
         first_message = self._extract_first_message(jsonl_path)
 
         last_event_at: Optional[datetime] = None
-        last_user_message = ""
+        recent_user_messages: list[str] = []
         tail_lines = self._read_tail_lines(jsonl_path, max_lines=200)
         for line in reversed(tail_lines):
             line = line.strip()
@@ -278,15 +326,20 @@ class CodexSessionScanner:
             if ts and last_event_at is None:
                 last_event_at = self._parse_iso_timestamp(str(ts))
 
-            if not last_user_message and record.get("type") == "event_msg":
+            if len(recent_user_messages) < 2 and record.get("type") == "event_msg":
                 payload = record.get("payload")
                 if isinstance(payload, dict) and payload.get("type") == "user_message":
                     message = str(payload.get("message") or "").strip()
                     if message:
-                        last_user_message = message[:120]
+                        recent_user_messages.append(message[:120])
 
-            if last_event_at is not None and last_user_message:
+            if last_event_at is not None and len(recent_user_messages) >= 2:
                 break
+
+        last_user_message = recent_user_messages[0] if recent_user_messages else ""
+        previous_user_message = (
+            recent_user_messages[1] if len(recent_user_messages) > 1 else ""
+        )
 
         try:
             mtime = jsonl_path.stat().st_mtime
@@ -302,6 +355,8 @@ class CodexSessionScanner:
             last_event_at=last_event_at,
             file_mtime=file_mtime,
             is_probably_active=is_active,
+            thread_name=thread_names.get(session_id, ""),
             first_message=first_message,
             last_user_message=last_user_message,
+            previous_user_message=previous_user_message,
         )

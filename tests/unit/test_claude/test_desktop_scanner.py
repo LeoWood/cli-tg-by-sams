@@ -10,7 +10,12 @@ from src.claude.desktop_scanner import DesktopSessionScanner
 
 
 def _write_session_jsonl(
-    path, cwd, session_id, first_message="hello", last_message=None
+    path,
+    cwd,
+    session_id,
+    first_message="hello",
+    previous_message=None,
+    last_message=None,
 ):
     """Write a minimal valid session JSONL file."""
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -22,7 +27,7 @@ def _write_session_jsonl(
             "timestamp": "2026-02-12T12:00:00.000Z",
         },
     ]
-    if last_message:
+    if previous_message:
         lines.append(
             {
                 "type": "assistant",
@@ -33,8 +38,23 @@ def _write_session_jsonl(
         lines.append(
             {
                 "type": "user",
-                "message": {"content": last_message},
+                "message": {"content": previous_message},
                 "timestamp": "2026-02-12T12:00:02.000Z",
+            }
+        )
+    if last_message:
+        lines.append(
+            {
+                "type": "assistant",
+                "message": {"content": "ok"},
+                "timestamp": "2026-02-12T12:00:03.000Z",
+            }
+        )
+        lines.append(
+            {
+                "type": "user",
+                "message": {"content": last_message},
+                "timestamp": "2026-02-12T12:00:04.000Z",
             }
         )
     with open(path, "w", encoding="utf-8") as f:
@@ -114,6 +134,7 @@ async def test_list_sessions_extracts_last_user_message(tmp_path):
         project,
         "session-a",
         first_message="first prompt",
+        previous_message="previous prompt",
         last_message="latest prompt",
     )
 
@@ -127,3 +148,4 @@ async def test_list_sessions_extracts_last_user_message(tmp_path):
     assert len(sessions) == 1
     assert sessions[0].first_message == "first prompt"
     assert sessions[0].last_user_message == "latest prompt"
+    assert sessions[0].previous_user_message == "previous prompt"
