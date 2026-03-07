@@ -36,7 +36,11 @@ from ..utils.scope_state import (
     get_scope_state,
     get_scope_state_from_update,
 )
-from ..utils.telegram_send import normalize_message_thread_id, send_message_resilient
+from ..utils.telegram_send import (
+    is_transient_network_error,
+    normalize_message_thread_id,
+    send_message_resilient,
+)
 
 logger = structlog.get_logger()
 
@@ -799,6 +803,7 @@ async def _send_chat_action_heartbeat(
     interval_seconds: float = _CHAT_ACTION_HEARTBEAT_INTERVAL_SECONDS,
     message_thread_id: Optional[int] = None,
     chat_type: Optional[str] = None,
+    on_send_failure: Optional[Callable[[Exception], Awaitable[bool] | bool]] = None,
 ) -> None:
     """Keep Telegram chat action visible during long-running processing."""
     wait_timeout = max(interval_seconds, 0.1)
@@ -819,6 +824,12 @@ async def _send_chat_action_heartbeat(
                 action=action,
                 error=str(e),
             )
+            if on_send_failure is not None:
+                should_stop = on_send_failure(e)
+                if asyncio.iscoroutine(should_stop):
+                    should_stop = await should_stop
+                if should_stop:
+                    break
         try:
             await asyncio.wait_for(stop_event.wait(), timeout=wait_timeout)
         except asyncio.TimeoutError:
@@ -2499,6 +2510,9 @@ async def handle_text_message(
     progress_msg: Any | None = None
     all_progress_lines: list[str] = []
     frozen_messages: list[Any] = []
+    noncritical_transport_disabled = False
+    noncritical_transport_failures = 0
+    noncritical_transport_disabled_until = 0.0
 
     try:
         # Check rate limit with estimated cost for text processing
@@ -2605,6 +2619,76 @@ async def handle_text_message(
             )
             return
 
+        # Resolve active CLI engine integration and storage from context
+        active_engine, cli_integration = get_cli_integration(
+            bot_data=context.bot_data,
+            scope_state=scope_state,
+        )
+        storage = context.bot_data.get("storage")
+        noncritical_failure_threshold = max(
+            1, int(getattr(settings, "telegram_noncritical_failure_threshold", 3) or 3)
+        )
+        noncritical_cooldown_seconds = max(
+            1.0,
+            float(
+                getattr(settings, "telegram_noncritical_cooldown_seconds", 60.0) or 60.0
+            ),
+        )
+
+        def _noncritical_transport_blocked() -> bool:
+            nonlocal noncritical_transport_disabled, noncritical_transport_failures
+
+            if (
+                noncritical_transport_disabled
+                and time.monotonic() >= noncritical_transport_disabled_until
+            ):
+                noncritical_transport_disabled = False
+                noncritical_transport_failures = 0
+            return noncritical_transport_disabled
+
+        async def _handle_noncritical_telegram_failure(
+            source: str, error: Exception
+        ) -> bool:
+            nonlocal noncritical_transport_disabled
+            nonlocal noncritical_transport_failures
+            nonlocal noncritical_transport_disabled_until
+
+            _noncritical_transport_blocked()
+
+            if not (
+                is_transient_network_error(error) or _is_timeout_error(error)
+            ):
+                return False
+
+            noncritical_transport_failures += 1
+            should_disable = (
+                noncritical_transport_failures >= noncritical_failure_threshold
+            )
+            if should_disable:
+                noncritical_transport_disabled = True
+                noncritical_transport_disabled_until = (
+                    time.monotonic() + noncritical_cooldown_seconds
+                )
+                typing_stop_event.set()
+                logger.warning(
+                    "Disabled non-critical Telegram updates after repeated network failures",
+                    source=source,
+                    failure_count=noncritical_transport_failures,
+                    threshold=noncritical_failure_threshold,
+                    cooldown_seconds=noncritical_cooldown_seconds,
+                    error=str(error),
+                )
+                return True
+
+            logger.warning(
+                "Transient Telegram failure on non-critical update",
+                source=source,
+                failure_count=noncritical_transport_failures,
+                threshold=noncritical_failure_threshold,
+                error=str(error),
+            )
+            return False
+
         # Keep typing indicator alive while the thinking/progress flow is running.
         typing_heartbeat_task = asyncio.create_task(
             _send_chat_action_heartbeat(
@@ -2613,15 +2697,11 @@ async def handle_text_message(
                 stop_event=typing_stop_event,
                 message_thread_id=getattr(update.message, "message_thread_id", None),
                 chat_type=getattr(update.effective_chat, "type", None),
+                on_send_failure=lambda error: _handle_noncritical_telegram_failure(
+                    "typing_heartbeat", error
+                ),
             )
         )
-
-        # Resolve active CLI engine integration and storage from context
-        active_engine, cli_integration = get_cli_integration(
-            bot_data=context.bot_data,
-            scope_state=scope_state,
-        )
-        storage = context.bot_data.get("storage")
 
         if not cli_integration:
             await _reply_text_resilient(
@@ -2686,8 +2766,11 @@ async def handle_text_message(
 
         async def _flush_pending_progress(force: bool = False) -> None:
             nonlocal progress_msg, last_progress_text, pending_progress_text, last_progress_edit_ts
+            nonlocal noncritical_transport_failures
 
             async with progress_flush_lock:
+                if _noncritical_transport_blocked():
+                    return
                 if not pending_progress_text:
                     return
 
@@ -2707,6 +2790,8 @@ async def handle_text_message(
 
                 async def _refresh_with_new_message() -> None:
                     nonlocal progress_msg, last_progress_edit_ts
+                    if _noncritical_transport_blocked():
+                        return
                     try:
                         await progress_msg.edit_reply_markup(reply_markup=None)
                     except Exception:
@@ -2717,6 +2802,7 @@ async def handle_text_message(
                         parse_mode="Markdown",
                         reply_markup=cancel_keyboard,
                     )
+                    noncritical_transport_failures = 0
                     last_progress_edit_ts = stream_loop.time()
 
                 try:
@@ -2725,6 +2811,7 @@ async def handle_text_message(
                         parse_mode="Markdown",
                         reply_markup=cancel_keyboard,
                     )
+                    noncritical_transport_failures = 0
                     last_progress_text = text_to_send
                     last_progress_edit_ts = stream_loop.time()
                 except Exception as e:
@@ -2740,6 +2827,7 @@ async def handle_text_message(
                             text_to_send,
                             reply_markup=cancel_keyboard,
                         )
+                        noncritical_transport_failures = 0
                         last_progress_text = text_to_send
                         last_progress_edit_ts = stream_loop.time()
                     except Exception as exc:
@@ -2750,8 +2838,18 @@ async def handle_text_message(
                             return
                         timeout_error = timeout_error or _is_timeout_error(exc)
                     if timeout_error:
+                        disabled = await _handle_noncritical_telegram_failure(
+                            "progress_edit", fallback_error or e
+                        )
+                        if disabled:
+                            return
                         await _refresh_with_new_message()
                         last_progress_text = text_to_send
+                        return
+                    disabled = await _handle_noncritical_telegram_failure(
+                        "progress_edit", fallback_error or e
+                    )
+                    if disabled:
                         return
                     logger.warning(
                         "Failed to update progress message",
@@ -2761,6 +2859,9 @@ async def handle_text_message(
 
         def _schedule_progress_flush() -> None:
             nonlocal progress_flush_task
+
+            if _noncritical_transport_blocked():
+                return
 
             if progress_flush_task and not progress_flush_task.done():
                 return
@@ -2991,7 +3092,7 @@ async def handle_text_message(
             if task_registry:
                 await task_registry.remove(user_id, scope_key=scope_key)
             # Preserve thinking process with cancelled label
-            if all_progress_lines:
+            if all_progress_lines and not _noncritical_transport_blocked():
                 summary_text = "[Cancelled] " + _generate_thinking_summary(
                     all_progress_lines
                 )
@@ -3019,7 +3120,7 @@ async def handle_text_message(
                     )
                 except Exception:
                     pass
-            else:
+            elif not _noncritical_transport_blocked():
                 try:
                     await progress_msg.edit_text("Task cancelled.", reply_markup=None)
                 except Exception:
@@ -3106,7 +3207,7 @@ async def handle_text_message(
         has_thinking_summary = False
 
         # Collapse progress message into summary with expand button
-        if all_progress_lines:
+        if all_progress_lines and not _noncritical_transport_blocked():
             summary_text = _build_collapsed_thinking_summary(
                 all_progress_lines,
                 context_tag,
@@ -3138,7 +3239,7 @@ async def handle_text_message(
                     await progress_msg.delete()
                 except Exception:
                     pass
-        else:
+        elif not _noncritical_transport_blocked():
             try:
                 await progress_msg.delete()
             except Exception:
@@ -3265,7 +3366,7 @@ async def handle_text_message(
         # Clean up progress message: collapse to summary if possible
         try:
             if progress_msg is not None:
-                if all_progress_lines:
+                if all_progress_lines and not _noncritical_transport_blocked():
                     summary_text = "[Error] " + _generate_thinking_summary(
                         all_progress_lines
                     )
@@ -3298,7 +3399,7 @@ async def handle_text_message(
                         await progress_msg.edit_text(
                             summary_text, parse_mode="Markdown"
                         )
-                else:
+                elif not _noncritical_transport_blocked():
                     await progress_msg.delete()
         except Exception as cleanup_error:
             logger.warning(

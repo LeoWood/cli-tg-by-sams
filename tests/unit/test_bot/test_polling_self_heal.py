@@ -8,6 +8,7 @@ import pytest
 
 from src.bot import core as core_module
 from src.bot.core import ClaudeCodeBot
+from src.exceptions import ClaudeCodeTelegramError
 
 
 def test_polling_error_callback_flags_restart_after_threshold() -> None:
@@ -272,3 +273,60 @@ async def test_restart_polling_skips_when_circuit_breaker_open() -> None:
     updater.stop.assert_not_awaited()
     updater.start_polling.assert_not_awaited()
     bot._trigger_escalated_restart.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_restart_polling_timeout_fails_fast_and_escalates() -> None:
+    """Hung polling restart should escalate and raise instead of staying fake-alive."""
+
+    gate = asyncio.Event()
+
+    async def _hung_stop() -> None:
+        await gate.wait()
+
+    updater = SimpleNamespace(
+        running=True,
+        stop=AsyncMock(side_effect=_hung_stop),
+        start_polling=AsyncMock(),
+    )
+    bot = ClaudeCodeBot(
+        settings=SimpleNamespace(webhook_url=None),
+        dependencies={},
+    )
+    bot.app = SimpleNamespace(updater=updater)
+    bot._trigger_escalated_restart = AsyncMock(return_value=True)  # type: ignore[method-assign]
+    bot._get_polling_restart_timeout_seconds = lambda: 0.01  # type: ignore[method-assign]
+
+    with pytest.raises(ClaudeCodeTelegramError, match="Unrecoverable polling"):
+        await bot._restart_polling(reason="timeout_case")
+
+    updater.stop.assert_awaited_once()
+    updater.start_polling.assert_not_awaited()
+    bot._trigger_escalated_restart.assert_awaited_once_with(
+        reason="fatal:timeout_case"
+    )
+    assert bot._fast_fail_shutdown_requested is True
+
+
+@pytest.mark.asyncio
+async def test_stop_skips_graceful_shutdown_after_fast_fail() -> None:
+    """Fast-fail shutdown path should not block on updater/application shutdown."""
+    updater = SimpleNamespace(running=True, stop=AsyncMock())
+    app = SimpleNamespace(
+        updater=updater,
+        stop=AsyncMock(),
+        shutdown=AsyncMock(),
+    )
+    bot = ClaudeCodeBot(
+        settings=SimpleNamespace(webhook_url=None),
+        dependencies={},
+    )
+    bot.app = app
+    bot.is_running = True
+    bot._fast_fail_shutdown_requested = True
+
+    await bot.stop()
+
+    updater.stop.assert_not_awaited()
+    app.stop.assert_not_awaited()
+    app.shutdown.assert_not_awaited()

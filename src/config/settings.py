@@ -294,6 +294,33 @@ class Settings(BaseSettings):
         ge=0.0,
         le=86400.0,
     )
+    polling_restart_timeout_seconds: float = Field(
+        20.0,
+        description=(
+            "Timeout for a single polling self-recovery attempt; "
+            "on timeout the bot escalates to process restart/fail-fast"
+        ),
+        ge=1.0,
+        le=300.0,
+    )
+    telegram_noncritical_failure_threshold: int = Field(
+        3,
+        description=(
+            "Consecutive Telegram network failures before disabling non-critical "
+            "updates such as typing heartbeat and progress edits"
+        ),
+        ge=1,
+        le=20,
+    )
+    telegram_noncritical_cooldown_seconds: float = Field(
+        60.0,
+        description=(
+            "Cooldown window after Telegram non-critical transport is disabled; "
+            "non-critical updates are skipped during this period"
+        ),
+        ge=1.0,
+        le=3600.0,
+    )
 
     # Monitoring
     log_level: str = Field("INFO", description="Logging level")

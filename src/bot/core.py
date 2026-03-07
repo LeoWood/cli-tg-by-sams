@@ -8,6 +8,7 @@ Features:
 """
 
 import asyncio
+import os
 import pickle
 import time
 from collections import deque
@@ -65,8 +66,10 @@ _DEFAULT_TELEGRAM_GET_UPDATES_POOL_TIMEOUT_SECONDS = 30.0
 _DEFAULT_TELEGRAM_GET_UPDATES_CONNECTION_POOL_SIZE = 16
 _DEFAULT_POLLING_UPDATE_STALL_SECONDS = 60.0
 _DEFAULT_POLLING_PENDING_UPDATE_STALL_SECONDS = 120.0
+_DEFAULT_POLLING_RESTART_TIMEOUT_SECONDS = 20.0
 _DEFAULT_TELEGRAM_USER_DATA_PERSISTENCE_PATH = Path("data/telegram-user-data.pkl")
 _USER_DATA_PERSISTENCE_UPDATE_INTERVAL_SECONDS = 10.0
+_DEFAULT_BOT_HEALTH_FILE = Path("logs/bot-health.txt")
 _STARTUP_RECOVERY_BROADCAST_TEXT = (
     "♻️ Bot 服务已恢复在线（全局重启完成）。\n" "你可以继续在当前会话发送消息。"
 )
@@ -102,6 +105,9 @@ class ClaudeCodeBot:
         self._last_update_id: Optional[int] = None
         self._last_pending_update_count: Optional[int] = None
         self._pending_update_nonzero_since_monotonic: float = 0.0
+        self._last_health_probe_success_epoch: float = 0.0
+        self._health_file_path: Path = self._resolve_bot_health_file_path()
+        self._fast_fail_shutdown_requested: bool = False
         # Update dedupe and persisted offset tracking
         self._update_dedupe_cache = UpdateDedupeCache(ttl_seconds=300, max_size=5000)
         self._update_offset_store: Optional[UpdateOffsetStore] = None
@@ -139,6 +145,104 @@ class ClaudeCodeBot:
             "polling_pending_update_stall_seconds",
             _DEFAULT_POLLING_PENDING_UPDATE_STALL_SECONDS,
             minimum=0.0,
+        )
+
+    def _get_polling_restart_timeout_seconds(self) -> float:
+        """Return hard timeout for one polling self-recovery attempt."""
+        return self._get_float_setting(
+            "polling_restart_timeout_seconds",
+            _DEFAULT_POLLING_RESTART_TIMEOUT_SECONDS,
+            minimum=1.0,
+        )
+
+    def _resolve_bot_health_file_path(self) -> Path:
+        """Resolve runtime health marker path under project logs."""
+        project_root = Path(__file__).resolve().parents[2]
+        return project_root / _DEFAULT_BOT_HEALTH_FILE
+
+    def _write_runtime_health_snapshot(
+        self,
+        *,
+        lifecycle_state: str,
+        updater_running: Optional[bool],
+        note: Optional[str] = None,
+    ) -> None:
+        """Persist a small health marker for status/supervisor checks."""
+        path = self._health_file_path
+        now_epoch = int(time.time())
+        last_update_epoch: Optional[int] = None
+        if self._last_update_monotonic > 0:
+            try:
+                age_seconds = max(0.0, time.monotonic() - self._last_update_monotonic)
+                last_update_epoch = max(0, int(now_epoch - age_seconds))
+            except Exception:
+                last_update_epoch = None
+
+        lines = [
+            f"pid={os.getpid()}",
+            f"lifecycle_state={lifecycle_state}",
+            f"is_running={1 if self.is_running else 0}",
+            (
+                f"updater_running={1 if updater_running else 0}"
+                if updater_running is not None
+                else "updater_running="
+            ),
+            f"polling_restart_requested={1 if self._polling_restart_requested else 0}",
+            f"watchdog_tick_count={self._watchdog_tick_count}",
+            f"last_watchdog_epoch={now_epoch if self.is_running else 0}",
+            (
+                f"last_health_probe_success_epoch={int(self._last_health_probe_success_epoch)}"
+                if self._last_health_probe_success_epoch > 0
+                else "last_health_probe_success_epoch=0"
+            ),
+            (
+                f"last_update_id={self._last_update_id}"
+                if self._last_update_id is not None
+                else "last_update_id="
+            ),
+            (
+                f"last_update_epoch={last_update_epoch}"
+                if last_update_epoch is not None
+                else "last_update_epoch="
+            ),
+            f"updated_epoch={now_epoch}",
+            f"note={note or ''}",
+        ]
+
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            tmp_path = path.with_suffix(f"{path.suffix}.tmp")
+            tmp_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+            tmp_path.replace(path)
+        except OSError as exc:
+            logger.debug(
+                "Failed to write bot health marker",
+                path=str(path),
+                error=str(exc),
+            )
+
+    async def _fail_fast_after_unrecoverable_polling_error(
+        self, *, reason: str, error: Exception
+    ) -> None:
+        """Escalate unrecoverable polling failures instead of staying fake-alive."""
+        updater = getattr(self.app, "updater", None) if self.app else None
+        self._fast_fail_shutdown_requested = True
+        self.is_running = False
+        self._write_runtime_health_snapshot(
+            lifecycle_state="unhealthy",
+            updater_running=bool(getattr(updater, "running", False)),
+            note=f"{reason}:{type(error).__name__}",
+        )
+        escalated = await self._trigger_escalated_restart(reason=f"fatal:{reason}")
+        logger.error(
+            "Unrecoverable polling failure detected; terminating process",
+            reason=reason,
+            error=str(error),
+            error_type=type(error).__name__,
+            escalated_restart_triggered=escalated,
+        )
+        raise ClaudeCodeTelegramError(
+            f"Unrecoverable polling self-recovery failure: {reason}: {error}"
         )
 
     def _resolve_user_data_persistence_path(self) -> Optional[Path]:
@@ -807,6 +911,11 @@ class ClaudeCodeBot:
             recovery_circuit_open_remaining_seconds=circuit_open_remaining_seconds,
             uptime_seconds=uptime_seconds,
         )
+        self._write_runtime_health_snapshot(
+            lifecycle_state="healthy" if updater_running else "degraded",
+            updater_running=updater_running,
+            note="watchdog_heartbeat",
+        )
 
     async def _run_polling_health_probe(self, *, now: float) -> None:
         """Periodically probe Telegram API and emit explicit health logs."""
@@ -843,6 +952,13 @@ class ClaudeCodeBot:
                 bot_username=getattr(me, "username", None),
                 pending_update_count=pending_update_count,
             )
+            self._last_health_probe_success_epoch = time.time()
+            updater = getattr(self.app, "updater", None)
+            self._write_runtime_health_snapshot(
+                lifecycle_state="healthy",
+                updater_running=bool(getattr(updater, "running", False)),
+                note="health_probe_ok",
+            )
         except Exception as exc:
             self._last_pending_update_count = None
             self._pending_update_nonzero_since_monotonic = 0.0
@@ -850,6 +966,12 @@ class ClaudeCodeBot:
                 "Polling health probe failed",
                 error=str(exc),
                 error_type=type(exc).__name__,
+            )
+            updater = getattr(self.app, "updater", None)
+            self._write_runtime_health_snapshot(
+                lifecycle_state="degraded",
+                updater_running=bool(getattr(updater, "running", False)),
+                note=f"health_probe_failed:{type(exc).__name__}",
             )
 
     async def _start_polling(self) -> None:
@@ -1051,10 +1173,24 @@ class ClaudeCodeBot:
             restart_attempts_in_window=len(self._polling_restart_attempts_monotonic),
         )
 
+        restart_timeout_seconds = self._get_polling_restart_timeout_seconds()
         try:
-            if updater.running:
-                await updater.stop()
-            await self._start_polling()
+            async with asyncio.timeout(restart_timeout_seconds):
+                if updater.running:
+                    await updater.stop()
+                await self._start_polling()
+        except TimeoutError as exc:
+            self._polling_restart_requested = True
+            logger.error(
+                "Polling self-recovery timed out",
+                reason=reason,
+                timeout_seconds=restart_timeout_seconds,
+                updater_running=updater.running,
+            )
+            await self._fail_fast_after_unrecoverable_polling_error(
+                reason=reason,
+                error=exc,
+            )
         except Exception as exc:
             self._polling_restart_requested = True
             logger.error(
@@ -1063,9 +1199,17 @@ class ClaudeCodeBot:
                 error=str(exc),
                 error_type=type(exc).__name__,
             )
-            return False
+            await self._fail_fast_after_unrecoverable_polling_error(
+                reason=reason,
+                error=exc,
+            )
 
         self._reset_polling_recovery_state()
+        self._write_runtime_health_snapshot(
+            lifecycle_state="healthy",
+            updater_running=bool(updater.running),
+            note=f"polling_restart_succeeded:{reason}",
+        )
         logger.info(
             "Polling self-recovery succeeded",
             reason=reason,
@@ -1216,6 +1360,7 @@ class ClaudeCodeBot:
 
         try:
             self.is_running = True
+            self._fast_fail_shutdown_requested = False
             now = asyncio.get_running_loop().time()
             self._started_monotonic = now
             self._last_watchdog_tick_monotonic = now
@@ -1226,12 +1371,23 @@ class ClaudeCodeBot:
             self._last_update_id = None
             self._last_pending_update_count = None
             self._pending_update_nonzero_since_monotonic = 0.0
+            self._last_health_probe_success_epoch = 0.0
+            self._write_runtime_health_snapshot(
+                lifecycle_state="starting",
+                updater_running=False,
+                note="booting",
+            )
 
             # Polling mode only (webhook mode is intentionally disabled).
             await self.app.initialize()
             await self.app.start()
             await self._start_polling()
             self._reset_polling_recovery_state()
+            self._write_runtime_health_snapshot(
+                lifecycle_state="healthy",
+                updater_running=True,
+                note="startup_complete",
+            )
             await self._broadcast_startup_recovery_notification()
 
             # Keep running until manually stopped
@@ -1243,6 +1399,14 @@ class ClaudeCodeBot:
             raise ClaudeCodeTelegramError(f"Failed to start bot: {str(e)}") from e
         finally:
             self.is_running = False
+            updater = getattr(self.app, "updater", None) if self.app else None
+            self._write_runtime_health_snapshot(
+                lifecycle_state=(
+                    "unhealthy" if self._fast_fail_shutdown_requested else "stopped"
+                ),
+                updater_running=bool(getattr(updater, "running", False)),
+                note="start_loop_exited",
+            )
 
     async def stop(self) -> None:
         """Gracefully stop the bot."""
@@ -1268,6 +1432,17 @@ class ClaudeCodeBot:
 
         try:
             self.is_running = False  # Stop the main loop first
+
+            if self._fast_fail_shutdown_requested:
+                logger.warning(
+                    "Skipping graceful Telegram shutdown due to unrecoverable polling failure"
+                )
+                self._write_runtime_health_snapshot(
+                    lifecycle_state="unhealthy",
+                    updater_running=False,
+                    note="fast_fail_shutdown",
+                )
+                return
 
             # Best effort: notify users and clear stale "Cancel" buttons
             # before the app is torn down.
@@ -1296,6 +1471,11 @@ class ClaudeCodeBot:
                 await self.app.shutdown()
 
             logger.info("Bot stopped successfully")
+            self._write_runtime_health_snapshot(
+                lifecycle_state="stopped",
+                updater_running=False,
+                note="graceful_shutdown_complete",
+            )
         except Exception as e:
             logger.error("Error stopping bot", error=str(e))
             raise ClaudeCodeTelegramError(f"Failed to stop bot: {str(e)}") from e
