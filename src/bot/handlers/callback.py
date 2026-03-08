@@ -811,6 +811,7 @@ async def handle_callback_query(
             )
         return
 
+    action: str | None = None
     try:
         # Parse callback data
         if ":" in data:
@@ -909,6 +910,22 @@ async def handle_callback_query(
             user_id=user_id,
             callback_data=data,
         )
+        bot_runtime = context.bot_data.get("bot_runtime")
+        report_transport_failure = getattr(
+            bot_runtime, "report_telegram_transport_failure", None
+        )
+        if callable(report_transport_failure):
+            try:
+                report_transport_failure(
+                    error=e,
+                    source=f"callback:{action or 'unknown'}",
+                )
+            except Exception:
+                logger.debug(
+                    "Failed to report callback transport failure",
+                    user_id=user_id,
+                    callback_data=data,
+                )
 
         try:
             await _edit_query_message_resilient(

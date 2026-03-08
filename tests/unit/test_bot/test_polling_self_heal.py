@@ -21,6 +21,41 @@ def test_polling_error_callback_flags_restart_after_threshold() -> None:
     assert bot._polling_restart_requested is True
 
 
+def test_transport_failure_report_flags_restart_after_threshold() -> None:
+    """Repeated Telegram transport failures should also flag self-recovery."""
+    bot = ClaudeCodeBot(settings=SimpleNamespace(), dependencies={})
+
+    for _ in range(core_module._POLLING_RECOVERY_ERROR_THRESHOLD):
+        bot.report_telegram_transport_failure(
+            error=RuntimeError("Pool timeout: request timed out"),
+            source="unit_test",
+        )
+
+    assert bot._polling_restart_requested is True
+
+
+@pytest.mark.asyncio
+async def test_polling_health_probe_failure_flags_restart_after_threshold() -> None:
+    """Health probe transport failures should flow into the same recovery gate."""
+    bot = ClaudeCodeBot(
+        settings=SimpleNamespace(webhook_url=None),
+        dependencies={},
+    )
+    bot.app = SimpleNamespace(
+        updater=SimpleNamespace(running=True),
+        bot=SimpleNamespace(
+            get_me=AsyncMock(side_effect=RuntimeError("Pool timeout: request timed out")),
+            get_webhook_info=AsyncMock(),
+        ),
+    )
+
+    for idx in range(core_module._POLLING_RECOVERY_ERROR_THRESHOLD):
+        bot._last_health_probe_monotonic = -1000.0
+        await bot._run_polling_health_probe(now=1000.0 + (idx * 61.0))
+
+    assert bot._polling_restart_requested is True
+
+
 @pytest.mark.asyncio
 async def test_restart_polling_stops_then_starts_updater() -> None:
     """Polling restart should stop current updater and start a new polling loop."""

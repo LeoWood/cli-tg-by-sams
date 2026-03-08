@@ -39,7 +39,7 @@ from .inbound_task_queue import InboundTaskQueue
 from .utils.cli_engine import get_default_cli_engine
 from .utils.command_menu import build_bot_commands_for_engine
 from .utils.scope_state import SCOPE_STATE_CONTAINER_KEY
-from .utils.telegram_send import send_message_resilient
+from .utils.telegram_send import is_transient_network_error, send_message_resilient
 from .utils.update_dedupe import UpdateDedupeCache
 from .utils.update_offset_store import UpdateOffsetStore
 
@@ -108,6 +108,9 @@ class ClaudeCodeBot:
         self._last_health_probe_success_epoch: float = 0.0
         self._health_file_path: Path = self._resolve_bot_health_file_path()
         self._fast_fail_shutdown_requested: bool = False
+        self._telegram_transport_error_count: int = 0
+        self._telegram_transport_error_window_start: float = 0.0
+        self._last_telegram_transport_error_log: float = 0.0
         # Update dedupe and persisted offset tracking
         self._update_dedupe_cache = UpdateDedupeCache(ttl_seconds=300, max_size=5000)
         self._update_offset_store: Optional[UpdateOffsetStore] = None
@@ -159,6 +162,58 @@ class ClaudeCodeBot:
         """Resolve runtime health marker path under project logs."""
         project_root = Path(__file__).resolve().parents[2]
         return project_root / _DEFAULT_BOT_HEALTH_FILE
+
+    def _reset_telegram_transport_failure_state(self) -> None:
+        """Reset transient Telegram transport failure counters."""
+        self._telegram_transport_error_count = 0
+        self._telegram_transport_error_window_start = 0.0
+
+    def report_telegram_transport_failure(self, *, error: Exception, source: str) -> bool:
+        """Track transient Telegram transport failures and flag polling recovery."""
+        if not is_transient_network_error(error):
+            return False
+
+        now = time.monotonic()
+        if (
+            self._telegram_transport_error_window_start <= 0
+            or now - self._telegram_transport_error_window_start > 60.0
+        ):
+            self._telegram_transport_error_count = 0
+            self._telegram_transport_error_window_start = now
+
+        self._telegram_transport_error_count += 1
+
+        if (
+            self._telegram_transport_error_count >= _POLLING_RECOVERY_ERROR_THRESHOLD
+            and not self._polling_restart_requested
+        ):
+            self._polling_restart_requested = True
+            logger.warning(
+                "Polling self-recovery flagged due to repeated Telegram transport failures",
+                source=source,
+                error_count_in_window=self._telegram_transport_error_count,
+                threshold=_POLLING_RECOVERY_ERROR_THRESHOLD,
+                error_type=type(error).__name__,
+            )
+
+        if now - self._last_telegram_transport_error_log >= 30.0:
+            self._last_telegram_transport_error_log = now
+            logger.warning(
+                "Telegram transport failure observed",
+                source=source,
+                error=str(error),
+                error_type=type(error).__name__,
+                error_count_in_window=self._telegram_transport_error_count,
+                polling_restart_requested=self._polling_restart_requested,
+            )
+
+        updater = getattr(self.app, "updater", None) if self.app else None
+        self._write_runtime_health_snapshot(
+            lifecycle_state="degraded",
+            updater_running=bool(getattr(updater, "running", False)),
+            note=f"transport_failure:{source}:{type(error).__name__}",
+        )
+        return self._polling_restart_requested
 
     def _write_runtime_health_snapshot(
         self,
@@ -630,6 +685,7 @@ class ClaudeCodeBot:
 
             # Add settings
             context.bot_data["settings"] = self.settings
+            context.bot_data["bot_runtime"] = self
 
             return await handler(update, context)
 
@@ -673,6 +729,7 @@ class ClaudeCodeBot:
             for key, value in self.deps.items():
                 context.bot_data[key] = value
             context.bot_data["settings"] = self.settings
+            context.bot_data["bot_runtime"] = self
 
             # Create a dummy handler that does nothing.
             # Middleware performs all pre-handler checks itself.
@@ -953,6 +1010,7 @@ class ClaudeCodeBot:
                 pending_update_count=pending_update_count,
             )
             self._last_health_probe_success_epoch = time.time()
+            self._reset_telegram_transport_failure_state()
             updater = getattr(self.app, "updater", None)
             self._write_runtime_health_snapshot(
                 lifecycle_state="healthy",
@@ -967,11 +1025,9 @@ class ClaudeCodeBot:
                 error=str(exc),
                 error_type=type(exc).__name__,
             )
-            updater = getattr(self.app, "updater", None)
-            self._write_runtime_health_snapshot(
-                lifecycle_state="degraded",
-                updater_running=bool(getattr(updater, "running", False)),
-                note=f"health_probe_failed:{type(exc).__name__}",
+            self.report_telegram_transport_failure(
+                error=exc,
+                source="health_probe",
             )
 
     async def _start_polling(self) -> None:
@@ -1174,12 +1230,17 @@ class ClaudeCodeBot:
         )
 
         restart_timeout_seconds = self._get_polling_restart_timeout_seconds()
+
+        async def _restart_sequence() -> None:
+            if updater.running:
+                await updater.stop()
+            await self._start_polling()
+
         try:
-            async with asyncio.timeout(restart_timeout_seconds):
-                if updater.running:
-                    await updater.stop()
-                await self._start_polling()
-        except TimeoutError as exc:
+            await asyncio.wait_for(
+                _restart_sequence(), timeout=restart_timeout_seconds
+            )
+        except asyncio.TimeoutError as exc:
             self._polling_restart_requested = True
             logger.error(
                 "Polling self-recovery timed out",
@@ -1205,6 +1266,7 @@ class ClaudeCodeBot:
             )
 
         self._reset_polling_recovery_state()
+        self._reset_telegram_transport_failure_state()
         self._write_runtime_health_snapshot(
             lifecycle_state="healthy",
             updater_running=bool(updater.running),
@@ -1587,6 +1649,10 @@ class ClaudeCodeBot:
         }
 
         error_type = type(error)
+        self.report_telegram_transport_failure(
+            error=error,
+            source="global_error_handler",
+        )
         user_message = error_messages.get(
             error_type, "❌ An unexpected error occurred. Please try again."
         )

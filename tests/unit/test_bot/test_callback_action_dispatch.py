@@ -1,7 +1,7 @@
 """Tests for generic action callback dispatch."""
 
 from types import SimpleNamespace
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, Mock
 
 import pytest
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup
@@ -69,6 +69,52 @@ async def test_handle_action_callback_wraps_main_menu_actions(monkeypatch):
     assert isinstance(
         dispatched_query, callback_handler._PreserveSourceMessageQueryProxy
     )
+
+
+@pytest.mark.asyncio
+async def test_callback_dispatch_reports_transport_failure(monkeypatch):
+    """Callback transport failures should be reported to the runtime recovery gate."""
+    report_transport_failure = Mock()
+    monkeypatch.setattr(
+        callback_handler,
+        "_is_callback_query_authenticated",
+        AsyncMock(return_value=True),
+    )
+    monkeypatch.setattr(
+        callback_handler,
+        "handle_action_callback",
+        AsyncMock(side_effect=RuntimeError("Pool timeout: request timed out")),
+    )
+    monkeypatch.setattr(
+        callback_handler,
+        "_edit_query_message_resilient",
+        AsyncMock(return_value=None),
+    )
+    monkeypatch.setattr(
+        callback_handler,
+        "_reply_query_message_resilient",
+        AsyncMock(return_value=None),
+    )
+
+    query = SimpleNamespace(
+        from_user=SimpleNamespace(id=12345),
+        data="action:new_session",
+        answer=AsyncMock(),
+    )
+    update = SimpleNamespace(callback_query=query)
+    context = SimpleNamespace(
+        bot_data={
+            "bot_runtime": SimpleNamespace(
+                report_telegram_transport_failure=report_transport_failure
+            )
+        }
+    )
+
+    await callback_handler.handle_callback_query(update, context)
+
+    report_transport_failure.assert_called_once()
+    call_kwargs = report_transport_failure.call_args.kwargs
+    assert call_kwargs["source"] == "callback:action"
 
 
 @pytest.mark.asyncio
