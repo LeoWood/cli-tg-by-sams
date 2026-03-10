@@ -1678,6 +1678,99 @@ def _get_stream_merge_key(update_obj: Any) -> Optional[str]:
     return None
 
 
+def _compact_command_for_thinking(command: str) -> str:
+    """Extract a brief command label for thinking details."""
+    raw = str(command or "").strip()
+    if not raw:
+        return "(empty)"
+
+    shell_match = re.search(r"-lc\s+(['\"])(?P<body>.*)\1$", raw)
+    if shell_match:
+        raw = shell_match.group("body").strip()
+
+    raw = re.split(r"\s*(?:&&|\|\||;)\s*", raw, maxsplit=1)[0].strip() or raw
+    first_line = raw.splitlines()[0].strip() if raw else "(empty)"
+    if len(first_line) > 80:
+        first_line = first_line[:77] + "..."
+    return first_line or "(empty)"
+
+
+def _build_thinking_detail_entry(
+    update_obj: Any,
+) -> tuple[Optional[str], Optional[str], bool]:
+    """Build readable thinking details, keeping narration and suppressing noisy logs."""
+    metadata = update_obj.metadata or {}
+
+    if (
+        update_obj.type == "assistant"
+        and update_obj.content
+        and not update_obj.tool_calls
+    ):
+        content = str(update_obj.content).strip()
+        if not content:
+            return None, None, False
+        return _escape_md(content), "assistant_content", False
+
+    if update_obj.type == "assistant" and update_obj.tool_calls:
+        summaries = []
+        for tc in update_obj.tool_calls:
+            name = tc.get("name", "unknown")
+            inp = tc.get("input", {})
+            summaries.append(_escape_md(_extract_tool_summary(name, inp)))
+        if summaries:
+            return "\n".join(f"🔧 {s}" for s in summaries), None, False
+        return None, None, False
+
+    if update_obj.type == "progress":
+        if metadata.get("subtype") == "turn.started":
+            return None, None, False
+
+        if metadata.get("item_type") == "command_execution":
+            status = str(metadata.get("status") or "").strip().lower()
+            exit_code = metadata.get("exit_code")
+            command = str(metadata.get("command") or update_obj.content or "").strip()
+            safe_command = _escape_md(_compact_command_for_thinking(command))
+            if status in {"failed", "error", "cancelled"} or (
+                isinstance(exit_code, int) and exit_code != 0
+            ):
+                suffix = (
+                    f" \\(exit {int(exit_code)}\\)"
+                    if isinstance(exit_code, int)
+                    else ""
+                )
+                return (
+                    f"❌ *Command {status or 'failed'}*{suffix}\n`{safe_command}`",
+                    None,
+                    True,
+                )
+            return None, None, True
+
+        content = str(update_obj.content or "").strip()
+        if not content:
+            return None, None, False
+        return f"🔄 {_escape_md(content)}", None, False
+
+    if update_obj.type == "tool_result":
+        if update_obj.is_error():
+            safe_error = _escape_md(update_obj.get_error_message())
+            tool_name = "Unknown"
+            if metadata.get("tool_use_id"):
+                tool_name = metadata.get("tool_name", "Tool")
+            return f"❌ *{_escape_md(tool_name)} failed*\n\n{safe_error}", None, False
+        return None, None, False
+
+    if update_obj.type == "error":
+        safe_error = _escape_md(update_obj.get_error_message())
+        return f"❌ *Error*\n\n{safe_error}", None, False
+
+    if update_obj.type == "system" and metadata.get("subtype") == "model_resolved":
+        model = str(metadata.get("model") or "").strip()
+        if model:
+            return f"🧠 *Using model:* {_escape_md(model)}", None, False
+
+    return None, None, False
+
+
 def _is_high_priority_stream_update(update_obj: Any) -> bool:
     """Whether a stream update should bypass debounce and flush immediately."""
     if update_obj.type in {"error", "tool_result"}:
@@ -2618,7 +2711,6 @@ async def handle_text_message(
                 prompt_message=queue_prompt_message,
             )
             return
-
         # Resolve active CLI engine integration and storage from context
         active_engine, cli_integration = get_cli_integration(
             bot_data=context.bot_data,
@@ -2655,9 +2747,7 @@ async def handle_text_message(
 
             _noncritical_transport_blocked()
 
-            if not (
-                is_transient_network_error(error) or _is_timeout_error(error)
-            ):
+            if not (is_transient_network_error(error) or _is_timeout_error(error)):
                 return False
 
             noncritical_transport_failures += 1
@@ -2748,6 +2838,8 @@ async def handle_text_message(
         progress_lines: list[str] = []
         progress_merge_keys: list[Optional[str]] = []
         all_progress_lines: list[str] = []  # 完整思考过程（不受溢出 clear 影响）
+        all_progress_merge_keys: list[Optional[str]] = []
+        all_progress_barrier_pending = False
         frozen_messages: list = []  # 被冻结的旧进度消息
         last_progress_text = ""
         pending_progress_text: Optional[str] = None
@@ -2889,6 +2981,7 @@ async def handle_text_message(
         async def stream_handler(update_obj):
             nonlocal progress_msg, last_progress_text, pending_progress_text
             nonlocal last_progress_edit_ts
+            nonlocal all_progress_barrier_pending
             try:
                 progress_text = await _format_progress_update(update_obj)
                 if not progress_text:
@@ -2901,13 +2994,27 @@ async def handle_text_message(
                     progress_text=progress_text,
                     merge_key=merge_key,
                 )
-                # Only collect non-content updates as thinking process
-                if not (
-                    update_obj.type == "assistant"
-                    and update_obj.content
-                    and not update_obj.tool_calls
-                ):
-                    all_progress_lines.append(progress_text)
+                detail_text, detail_merge_key, detail_boundary = (
+                    _build_thinking_detail_entry(update_obj)
+                )
+                if detail_text:
+                    if (
+                        all_progress_barrier_pending
+                        and detail_merge_key
+                        and all_progress_merge_keys
+                    ):
+                        all_progress_lines.append(detail_text)
+                        all_progress_merge_keys.append(detail_merge_key)
+                    else:
+                        _append_progress_line_with_merge(
+                            progress_lines=all_progress_lines,
+                            progress_merge_keys=all_progress_merge_keys,
+                            progress_text=detail_text,
+                            merge_key=detail_merge_key,
+                        )
+                    all_progress_barrier_pending = False
+                elif detail_boundary:
+                    all_progress_barrier_pending = True
                 full_text = _with_engine_badge("\n".join(progress_lines), active_engine)
 
                 # If accumulated text exceeds Telegram limit, freeze current
@@ -3358,7 +3465,6 @@ async def handle_text_message(
                 args=[message_text[:100]],  # First 100 chars
                 success=True,
             )
-
         logger.info("Text message processed successfully", user_id=user_id)
 
     except Exception as e:
@@ -3983,6 +4089,8 @@ async def handle_photo(
         try:
             last_status_text = ""
             thinking_lines: list[str] = []
+            thinking_merge_keys: list[Optional[str]] = []
+            thinking_barrier_pending = False
             cancel_keyboard = InlineKeyboardMarkup(
                 [[InlineKeyboardButton("Cancel", callback_data="cancel:task")]]
             )
@@ -4138,6 +4246,7 @@ async def handle_photo(
 
             async def _image_stream_handler(update_obj) -> None:
                 nonlocal stream_mode, pending_stream_text
+                nonlocal thinking_barrier_pending
                 try:
                     progress_text = await _format_progress_update(update_obj)
                     if not progress_text:
@@ -4165,14 +4274,27 @@ async def handle_photo(
                         return
                     pending_stream_text = full_text
 
-                    # Keep behavior aligned with text flow:
-                    # assistant plain content is not part of thinking details.
-                    if not (
-                        update_obj.type == "assistant"
-                        and update_obj.content
-                        and not update_obj.tool_calls
-                    ):
-                        thinking_lines.append(progress_text)
+                    detail_text, detail_merge_key, detail_boundary = (
+                        _build_thinking_detail_entry(update_obj)
+                    )
+                    if detail_text:
+                        if (
+                            thinking_barrier_pending
+                            and detail_merge_key
+                            and thinking_merge_keys
+                        ):
+                            thinking_lines.append(detail_text)
+                            thinking_merge_keys.append(detail_merge_key)
+                        else:
+                            _append_progress_line_with_merge(
+                                progress_lines=thinking_lines,
+                                progress_merge_keys=thinking_merge_keys,
+                                progress_text=detail_text,
+                                merge_key=detail_merge_key,
+                            )
+                        thinking_barrier_pending = False
+                    elif detail_boundary:
+                        thinking_barrier_pending = True
 
                     if _is_high_priority_stream_update(update_obj):
                         await _cancel_stream_flush_task()

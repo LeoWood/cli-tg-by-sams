@@ -39,6 +39,7 @@ from ..utils.resume_history import ResumeHistoryMessage, load_resume_history_pre
 from ..utils.resume_summary import (
     build_resume_button_label,
     build_resume_button_labels,
+    build_resume_session_summary,
     normalize_resume_preview,
 )
 from ..utils.resume_ui import build_resume_project_selector
@@ -145,6 +146,23 @@ def _build_main_quick_actions_reply_markup() -> InlineKeyboardMarkup:
     """Build the shared three-button quick actions menu."""
     return build_reply_markup_from_spec(
         SessionInteractionService.build_main_quick_actions_keyboard()
+    )
+
+
+def _build_resume_post_actions_reply_markup() -> InlineKeyboardMarkup:
+    """Build a focused action row for a newly resumed session."""
+    return InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton(
+                    "📜 最近5轮", callback_data="resume:recent_current"
+                ),
+                InlineKeyboardButton("🆕 新开话题", callback_data="action:new_session"),
+            ],
+            [
+                InlineKeyboardButton("📊 状态", callback_data="action:status"),
+            ],
+        ]
     )
 
 
@@ -504,13 +522,14 @@ def _build_resume_session_button_label(candidate) -> str:
 def _build_resume_history_preview_text(
     messages: list[ResumeHistoryMessage],
     *,
+    title: str = "最近历史预览",
     max_len: int = 72,
 ) -> str:
     """Build markdown-friendly resume history preview block."""
     if not messages:
         return ""
 
-    lines = ["*最近历史预览*"]
+    lines = [f"*{_escape_markdown(title)}*"]
     for message in messages:
         role = "你" if message.role == "user" else "助手"
         preview = _escape_markdown(
@@ -518,6 +537,53 @@ def _build_resume_history_preview_text(
         )
         lines.append(f"• *{role}*: {preview}")
     return "\n".join(lines)
+
+
+def _build_resume_context_summary_text(
+    messages: list[ResumeHistoryMessage],
+    *,
+    max_len: int = 72,
+) -> str:
+    """Build a compact resume summary block from recent history."""
+    if not messages:
+        return (
+            "*恢复摘要*\n"
+            "• *主题*: 无预览\n"
+            "• *最后用户请求*: 暂无\n"
+            "• *最后助手结论*: 暂无"
+        )
+
+    user_messages = [
+        msg.content for msg in messages if msg.role == "user" and msg.content
+    ]
+    assistant_messages = [
+        msg.content for msg in messages if msg.role == "assistant" and msg.content
+    ]
+
+    first_user_message = user_messages[0] if user_messages else messages[0].content
+    last_user_message = user_messages[-1] if user_messages else ""
+    previous_user_message = user_messages[-2] if len(user_messages) >= 2 else ""
+    topic = build_resume_session_summary(
+        thread_name="",
+        first_message=first_user_message,
+        last_user_message=last_user_message,
+        previous_user_message=previous_user_message,
+        max_len=max_len,
+    )
+    last_user = normalize_resume_preview(last_user_message or "暂无", max_len=max_len)
+    last_assistant = normalize_resume_preview(
+        assistant_messages[-1] if assistant_messages else "暂无",
+        max_len=max_len,
+    )
+
+    return "\n".join(
+        [
+            "*恢复摘要*",
+            f"• *主题*: {_escape_markdown(topic)}",
+            f"• *最后用户请求*: {_escape_markdown(last_user)}",
+            f"• *最后助手结论*: {_escape_markdown(last_assistant)}",
+        ]
+    )
 
 
 def _build_engine_selector_keyboard(
@@ -2769,14 +2835,52 @@ async def handle_thinking_callback(
 
 
 def _truncate_thinking(lines: list[str], max_chars: int = 3800) -> str:
-    """Keep recent progress lines from the end, total length under max_chars."""
-    result = []
+    """Keep recent lines, prioritizing textual reasoning over command logs."""
+
+    def _is_primary_line(line: str) -> bool:
+        stripped = line.strip()
+        return not (
+            stripped.startswith("❌ *Command ")
+            or stripped.startswith("🔧 *Running command*")
+            or stripped.startswith("✅ *Command completed*")
+        )
+
+    budget = max(max_chars - 50, 1)
+    selected_indices: set[int] = set()
     total = 0
-    for line in reversed(lines):
-        if total + len(line) + 1 > max_chars - 50:
-            break
-        result.insert(0, line)
-        total += len(line) + 1
+
+    def _try_collect(indices: list[int]) -> None:
+        nonlocal total
+        for idx in indices:
+            if idx in selected_indices:
+                continue
+            line = lines[idx]
+            needed = len(line) + 1
+            if total + needed > budget:
+                continue
+            selected_indices.add(idx)
+            total += needed
+
+    primary_indices = [
+        idx for idx in range(len(lines) - 1, -1, -1) if _is_primary_line(lines[idx])
+    ]
+    secondary_indices = [
+        idx for idx in range(len(lines) - 1, -1, -1) if idx not in primary_indices
+    ]
+
+    _try_collect(primary_indices)
+    _try_collect(secondary_indices)
+
+    result = [lines[idx] for idx in sorted(selected_indices)]
+
+    if not result:
+        result = []
+        total = 0
+        for line in reversed(lines):
+            if total + len(line) + 1 > budget:
+                break
+            result.insert(0, line)
+            total += len(line) + 1
 
     skipped = len(lines) - len(result)
     if skipped > 0:
@@ -2865,6 +2969,14 @@ async def handle_resume_callback(query, param, context):
             context=context,
             show_all=(show_sub == "show_all"),
             engine=target_engine,
+        )
+        return
+
+    if param == "recent_current":
+        await _reply_recent_history_for_active_resume_session(
+            query=query,
+            context=context,
+            settings=settings,
         )
         return
 
@@ -2988,6 +3100,63 @@ async def _resume_render_project_list(
         message_text,
         parse_mode="Markdown",
         reply_markup=keyboard,
+    )
+
+
+async def _reply_recent_history_for_active_resume_session(
+    *,
+    query,
+    context: ContextTypes.DEFAULT_TYPE,
+    settings: Settings,
+) -> None:
+    """Reply with recent history for the currently bound resumed session."""
+    user_id = query.from_user.id
+    _, scope_state = _get_scope_state_for_query(query, context)
+    session_id = str(scope_state.get("claude_session_id") or "").strip()
+    if not session_id:
+        await _reply_query_message_resilient(
+            query,
+            context,
+            "当前没有已恢复的会话，先运行 /resume 选择一个会话。",
+        )
+        return
+
+    project_cwd = Path(
+        scope_state.get("current_directory", settings.approved_directory)
+    )
+    engine = get_active_cli_engine(scope_state)
+    scanner = _get_or_create_resume_scanner(
+        context=context,
+        settings=settings,
+        engine=engine,
+    )
+    storage = context.bot_data.get("storage")
+    history_preview = await load_resume_history_preview(
+        session_id=session_id,
+        user_id=user_id,
+        project_cwd=project_cwd,
+        engine=engine,
+        limit=10,
+        storage=storage,
+        scanner=scanner,
+    )
+
+    if not history_preview:
+        await _reply_query_message_resilient(
+            query,
+            context,
+            "当前会话暂无可展示的最近历史。",
+        )
+        return
+
+    await _reply_query_message_resilient(
+        query,
+        context,
+        _build_resume_history_preview_text(
+            history_preview,
+            title="最近5轮",
+        ),
+        parse_mode="Markdown",
     )
 
 
@@ -3441,20 +3610,19 @@ async def _do_adopt_session(
         except ValueError:
             rel = project_cwd.name
 
-        history_block = ""
-        if history_preview:
-            history_block = "\n\n" + _build_resume_history_preview_text(history_preview)
+        summary_block = "\n\n" + _build_resume_context_summary_text(history_preview)
 
         await _edit_query_message_resilient(
             query,
-            f"**Session Resumed**\n\n"
+            f"**会话已恢复**\n\n"
             f"Engine: `{engine}`\n"
             f"Session: `{adopted.session_id[:8]}...`\n"
             f"Directory: `{rel}/`"
-            f"{history_block}\n\n"
-            f"Send a message to continue where you left off.",
+            f"{summary_block}\n\n"
+            "下一条消息会直接接着这个 session 继续，无需重复粘贴历史。\n"
+            "需要细节时，可以点“最近5轮”。",
             parse_mode="Markdown",
-            reply_markup=_build_main_quick_actions_reply_markup(),
+            reply_markup=_build_resume_post_actions_reply_markup(),
         )
 
         audit_logger: AuditLogger = context.bot_data.get("audit_logger")

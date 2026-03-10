@@ -9,6 +9,7 @@ import pytest
 
 from src.bot.handlers.message import (
     _append_progress_line_with_merge,
+    _build_thinking_detail_entry,
     _build_collapsed_thinking_summary,
     _build_context_tag,
     _build_session_context_summary,
@@ -268,6 +269,64 @@ def test_high_priority_stream_update_detection():
     assert _is_high_priority_stream_update(system_init) is True
     assert _is_high_priority_stream_update(system_model) is True
     assert _is_high_priority_stream_update(plain_progress) is False
+
+
+def test_build_thinking_detail_entry_keeps_assistant_raw_content():
+    """Thinking details should prefer assistant narration over wrapper labels."""
+    assistant_content = _FakeUpdate(
+        type="assistant",
+        content="先检查远端，再决定是否 push\n再确认当前工作区是否有新增改动。",
+        tool_calls=None,
+    )
+
+    text, merge_key, barrier = _build_thinking_detail_entry(assistant_content)
+
+    assert "先检查远端" in text
+    assert "Codex is working" not in text
+    assert merge_key == "assistant_content"
+    assert barrier is False
+
+
+def test_build_thinking_detail_entry_omits_successful_command_logs():
+    """Successful command execution should not crowd thinking details."""
+    command_update = _FakeUpdate(
+        type="progress",
+        content="/bin/zsh -lc 'git status --short --branch'",
+        metadata={
+            "item_type": "command_execution",
+            "status": "completed",
+            "command": "/bin/zsh -lc 'git status --short --branch'",
+            "exit_code": 0,
+        },
+    )
+
+    text, merge_key, barrier = _build_thinking_detail_entry(command_update)
+
+    assert text is None
+    assert merge_key is None
+    assert barrier is True
+
+
+def test_build_thinking_detail_entry_keeps_failed_command_brief():
+    """Failed command should remain visible, but only as a compact summary."""
+    command_update = _FakeUpdate(
+        type="progress",
+        content="/bin/zsh -lc 'git push origin master'",
+        metadata={
+            "item_type": "command_execution",
+            "status": "failed",
+            "command": "/bin/zsh -lc 'git push origin master'",
+            "exit_code": 128,
+        },
+    )
+
+    text, merge_key, barrier = _build_thinking_detail_entry(command_update)
+
+    assert "Command failed" in text
+    assert "git push origin master" in text
+    assert "/bin/zsh -lc" not in text
+    assert merge_key is None
+    assert barrier is True
 
 
 def test_noop_edit_error_detection():

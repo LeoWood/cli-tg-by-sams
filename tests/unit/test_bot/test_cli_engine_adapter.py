@@ -1390,7 +1390,7 @@ async def test_do_adopt_session_uses_engine_specific_integration(tmp_path):
 
 @pytest.mark.asyncio
 async def test_do_adopt_session_renders_history_preview_after_resume(tmp_path):
-    """Resume success message should include recent history preview when available."""
+    """Resume success message should include summary and next actions."""
     approved = tmp_path / "approved"
     approved.mkdir()
     project = approved / "proj2"
@@ -1462,8 +1462,88 @@ async def test_do_adopt_session_renders_history_preview_after_resume(tmp_path):
     )
 
     rendered = query.edit_message_text.await_args.args[0]
-    assert "Session Resumed" in rendered
-    assert "最近历史预览" in rendered
+    reply_markup = query.edit_message_text.await_args.kwargs["reply_markup"]
+    callback_ids = [
+        button.callback_data for row in reply_markup.inline_keyboard for button in row
+    ]
+
+    assert "会话已恢复" in rendered
+    assert "恢复摘要" in rendered
+    assert "最后用户请求" in rendered
+    assert "最后助手结论" in rendered
+    assert "下一条消息会直接接着这个 session 继续" in rendered
+    assert "second user" in rendered
+    assert "resume:recent_current" in callback_ids
+    assert "action:new_session" in callback_ids
+    assert "action:status" in callback_ids
+
+
+@pytest.mark.asyncio
+async def test_resume_recent_current_replies_with_recent_history(tmp_path):
+    """`resume:recent_current` should show recent history for active session."""
+    approved = tmp_path / "approved"
+    approved.mkdir()
+    project = approved / "proj-recent"
+    project.mkdir()
+    user_id = 4102
+    chat_id = 5102
+    scope_key = _scope_key(user_id, chat_id)
+    session_id = "resume-recent-session"
+
+    session_file = tmp_path / "session-recent.jsonl"
+    session_file.write_text(
+        "\n".join(
+            [
+                '{"type":"session_meta","payload":{"id":"resume-recent-session","cwd":"%s"}}'
+                % str(project).replace("\\", "\\\\"),
+                '{"type":"event_msg","payload":{"type":"user_message","message":"first user"}}',
+                '{"type":"event_msg","payload":{"type":"assistant_message","message":"first assistant"}}',
+                '{"type":"event_msg","payload":{"type":"user_message","message":"second user"}}',
+                '{"type":"event_msg","payload":{"type":"assistant_message","message":"second assistant"}}',
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    query = SimpleNamespace(
+        from_user=SimpleNamespace(id=user_id),
+        message=SimpleNamespace(
+            chat=SimpleNamespace(id=chat_id),
+            message_thread_id=None,
+            reply_text=AsyncMock(),
+        ),
+        edit_message_text=AsyncMock(),
+    )
+    settings = _build_settings(approved)
+    context = SimpleNamespace(
+        bot_data={
+            "settings": settings,
+            "codex_desktop_scanner": SimpleNamespace(
+                list_sessions=AsyncMock(
+                    return_value=[
+                        SimpleNamespace(
+                            session_id=session_id, source_file=session_file
+                        ),
+                    ]
+                )
+            ),
+            "resume_token_manager": ResumeTokenManager(),
+        },
+        user_data={
+            "scope_state": {
+                scope_key: {
+                    ENGINE_STATE_KEY: "codex",
+                    "claude_session_id": session_id,
+                    "current_directory": project,
+                }
+            }
+        },
+    )
+
+    await handle_resume_callback(query, "recent_current", context)
+
+    rendered = query.message.reply_text.await_args.args[0]
+    assert "最近5轮" in rendered
     assert "*你*:" in rendered
     assert "*助手*:" in rendered
-    assert "second user" in rendered
+    assert "second assistant" in rendered

@@ -5,7 +5,7 @@ from unittest.mock import AsyncMock
 
 import pytest
 
-from src.bot.handlers.callback import handle_thinking_callback
+from src.bot.handlers.callback import _truncate_thinking, handle_thinking_callback
 
 
 @pytest.mark.asyncio
@@ -51,6 +51,25 @@ async def test_thinking_expand_truncates_when_content_is_too_long() -> None:
     call = query.edit_message_text.await_args
     rendered = call.args[0]
     assert len(rendered) <= 3800
+    assert "earlier entries omitted" in rendered
+
+
+def test_truncate_thinking_prioritizes_textual_reasoning_lines() -> None:
+    """Truncation should prefer assistant narration over pure command noise."""
+    lines = [
+        "🤖 *Codex is working...*\n\n先确认当前分支和远端，再决定是否直接 push。",
+        "🔧 *Running command*\n\n`git remote -v`",
+        "✅ *Command completed* \\(exit 0\\)\n\n`git remote -v`",
+        "🔧 *Running command*\n\n`git status --short --branch`",
+        "✅ *Command completed* \\(exit 0\\)\n\n`git status --short --branch`",
+        "🔧 *Running command*\n\n`git push origin master`",
+        "❌ *Command failed* \\(exit 128\\)\n\n`git push origin master`",
+    ]
+
+    rendered = _truncate_thinking(lines, max_chars=220)
+
+    assert "先确认当前分支和远端" in rendered
+    assert "git push origin master" in rendered
     assert "earlier entries omitted" in rendered
 
 
