@@ -7,6 +7,7 @@ from unittest.mock import AsyncMock
 import pytest
 
 from src.bot.handlers.command import ops_status_command
+from src.monitoring import RuntimeMetrics
 
 
 def _build_update(user_id: int, chat_id: int) -> SimpleNamespace:
@@ -42,10 +43,25 @@ async def test_opsstatus_reports_healthy_snapshot(tmp_path, monkeypatch):
 
     update = _build_update(user_id=801, chat_id=901)
     audit_logger = SimpleNamespace(log_command=AsyncMock())
+    runtime_metrics = RuntimeMetrics(enabled=False, host="127.0.0.1", port=9464)
+    runtime_metrics.set_gauge("clitg_bot_running", 1.0)
+    runtime_metrics.set_gauge("clitg_polling_up", 1.0)
+    runtime_metrics.set_gauge("clitg_polling_restart_requested", 0.0)
+    runtime_metrics.set_gauge("clitg_watchdog_tick_age_seconds", 2.5)
+    runtime_metrics.set_gauge("clitg_last_health_probe_age_seconds", 5.0)
+    runtime_metrics.set_gauge("clitg_pending_update_count", 3.0)
+    runtime_metrics.set_gauge("clitg_storage_up", 1.0)
+    runtime_metrics.set_gauge("clitg_active_tasks", 2.0)
     context = SimpleNamespace(
         bot_data={
             "settings": SimpleNamespace(approved_directory=tmp_path),
             "audit_logger": audit_logger,
+            "runtime_metrics": runtime_metrics,
+            "cli_integrations": {
+                "claude": SimpleNamespace(
+                    process_manager=SimpleNamespace(active_processes={"a": object()})
+                )
+            },
         },
         user_data={},
     )
@@ -83,6 +99,11 @@ async def test_opsstatus_reports_healthy_snapshot(tmp_path, monkeypatch):
     assert "healthy=yes" in rendered
     assert "bot_process_count=1" in rendered
     assert "event=restart_succeeded" in rendered
+    assert "metrics_enabled=no" in rendered
+    assert "metrics_address=http://127.0.0.1:9464/metricsz" in rendered
+    assert "metrics_raw_address=http://127.0.0.1:9464/metrics" in rendered
+    assert "metrics_active_tasks=2" in rendered
+    assert "metrics_cli_active_processes=1" in rendered
 
     assert capture.await_count == 2
     assert capture.await_args_list[0].args[:3] == (

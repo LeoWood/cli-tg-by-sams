@@ -34,6 +34,7 @@ from telegram.ext import (
 from ..claude.task_registry import TaskRegistry
 from ..config.settings import Settings
 from ..exceptions import ClaudeCodeTelegramError
+from ..monitoring import RuntimeMetrics
 from .features.registry import FeatureRegistry
 from .inbound_task_queue import InboundTaskQueue
 from .utils.cli_engine import get_default_cli_engine
@@ -116,6 +117,58 @@ class ClaudeCodeBot:
         self._update_offset_store: Optional[UpdateOffsetStore] = None
         self._startup_min_update_id: Optional[int] = None
 
+    def _get_runtime_metrics(self) -> Optional[RuntimeMetrics]:
+        """Return shared runtime metrics service when available."""
+        metrics = self.deps.get("runtime_metrics")
+        return metrics if isinstance(metrics, RuntimeMetrics) else None
+
+    def _sync_runtime_metrics(
+        self,
+        *,
+        updater_running: Optional[bool] = None,
+        now_monotonic: Optional[float] = None,
+    ) -> None:
+        """Refresh common runtime gauges."""
+        metrics = self._get_runtime_metrics()
+        if metrics is None:
+            return
+
+        now = (
+            float(now_monotonic)
+            if isinstance(now_monotonic, (int, float))
+            else time.monotonic()
+        )
+        metrics.set_gauge("clitg_bot_running", 1.0 if self.is_running else 0.0)
+        if updater_running is not None:
+            metrics.set_gauge("clitg_polling_up", 1.0 if updater_running else 0.0)
+        metrics.set_gauge(
+            "clitg_polling_restart_requested",
+            1.0 if self._polling_restart_requested else 0.0,
+        )
+        metrics.set_gauge(
+            "clitg_watchdog_tick_age_seconds",
+            (
+                max(0.0, now - self._last_watchdog_tick_monotonic)
+                if self._last_watchdog_tick_monotonic > 0
+                else 0.0
+            ),
+        )
+        metrics.set_gauge(
+            "clitg_last_health_probe_age_seconds",
+            (
+                max(0.0, time.time() - self._last_health_probe_success_epoch)
+                if self._last_health_probe_success_epoch > 0
+                else 0.0
+            ),
+        )
+        metrics.set_gauge(
+            "clitg_pending_update_count",
+            float(self._last_pending_update_count or 0),
+        )
+        cli_integrations = self.deps.get("cli_integrations")
+        if isinstance(cli_integrations, dict):
+            metrics.refresh_active_cli_processes(cli_integrations)
+
     def _get_float_setting(self, name: str, default: float, *, minimum: float) -> float:
         """Read numeric setting with defensive fallback for tests/runtime."""
         raw_value = getattr(self.settings, name, default)
@@ -168,7 +221,9 @@ class ClaudeCodeBot:
         self._telegram_transport_error_count = 0
         self._telegram_transport_error_window_start = 0.0
 
-    def report_telegram_transport_failure(self, *, error: Exception, source: str) -> bool:
+    def report_telegram_transport_failure(
+        self, *, error: Exception, source: str
+    ) -> bool:
         """Track transient Telegram transport failures and flag polling recovery."""
         if not is_transient_network_error(error):
             return False
@@ -208,6 +263,16 @@ class ClaudeCodeBot:
             )
 
         updater = getattr(self.app, "updater", None) if self.app else None
+        metrics = self._get_runtime_metrics()
+        if metrics is not None:
+            metrics.increment_counter(
+                "clitg_telegram_transport_failures_total",
+                labels={"source": source},
+            )
+            self._sync_runtime_metrics(
+                updater_running=bool(getattr(updater, "running", False)),
+                now_monotonic=now,
+            )
         self._write_runtime_health_snapshot(
             lifecycle_state="degraded",
             updater_running=bool(getattr(updater, "running", False)),
@@ -454,7 +519,7 @@ class ClaudeCodeBot:
         self.deps["features"] = self.feature_registry
 
         # Initialize task registry for cancel support
-        self.deps["task_registry"] = TaskRegistry()
+        self.deps["task_registry"] = TaskRegistry(metrics=self._get_runtime_metrics())
         self.deps["inbound_task_queue"] = InboundTaskQueue(
             max_per_scope=int(
                 getattr(self.settings, "inbound_queue_max_per_scope", 20) or 20
@@ -973,6 +1038,7 @@ class ClaudeCodeBot:
             updater_running=updater_running,
             note="watchdog_heartbeat",
         )
+        self._sync_runtime_metrics(updater_running=updater_running, now_monotonic=now)
 
     async def _run_polling_health_probe(self, *, now: float) -> None:
         """Periodically probe Telegram API and emit explicit health logs."""
@@ -1012,6 +1078,25 @@ class ClaudeCodeBot:
             self._last_health_probe_success_epoch = time.time()
             self._reset_telegram_transport_failure_state()
             updater = getattr(self.app, "updater", None)
+            storage = self.deps.get("storage")
+            storage_ok = True
+            if storage is not None:
+                try:
+                    storage_ok = bool(await storage.health_check())
+                except Exception as storage_error:
+                    storage_ok = False
+                    logger.warning(
+                        "Storage health check failed during polling probe",
+                        error=str(storage_error),
+                        error_type=type(storage_error).__name__,
+                    )
+            metrics = self._get_runtime_metrics()
+            if metrics is not None:
+                metrics.set_gauge("clitg_storage_up", 1.0 if storage_ok else 0.0)
+                self._sync_runtime_metrics(
+                    updater_running=bool(getattr(updater, "running", False)),
+                    now_monotonic=now,
+                )
             self._write_runtime_health_snapshot(
                 lifecycle_state="healthy",
                 updater_running=bool(getattr(updater, "running", False)),
@@ -1029,6 +1114,15 @@ class ClaudeCodeBot:
                 error=exc,
                 source="health_probe",
             )
+            metrics = self._get_runtime_metrics()
+            if metrics is not None:
+                metrics.set_gauge("clitg_storage_up", 0.0)
+                self._sync_runtime_metrics(
+                    updater_running=bool(
+                        getattr(getattr(self.app, "updater", None), "running", False)
+                    ),
+                    now_monotonic=now,
+                )
 
     async def _start_polling(self) -> None:
         """Start Telegram polling with shared options."""
@@ -1219,6 +1313,12 @@ class ClaudeCodeBot:
 
         self._last_polling_restart_monotonic = now
         self._polling_restart_attempts_monotonic.append(now)
+        metrics = self._get_runtime_metrics()
+        if metrics is not None:
+            metrics.increment_counter(
+                "clitg_polling_restarts_total",
+                labels={"reason": reason},
+            )
         logger.warning(
             "Attempting polling self-recovery",
             reason=reason,
@@ -1237,9 +1337,7 @@ class ClaudeCodeBot:
             await self._start_polling()
 
         try:
-            await asyncio.wait_for(
-                _restart_sequence(), timeout=restart_timeout_seconds
-            )
+            await asyncio.wait_for(_restart_sequence(), timeout=restart_timeout_seconds)
         except asyncio.TimeoutError as exc:
             self._polling_restart_requested = True
             logger.error(
@@ -1272,6 +1370,7 @@ class ClaudeCodeBot:
             updater_running=bool(updater.running),
             note=f"polling_restart_succeeded:{reason}",
         )
+        self._sync_runtime_metrics(updater_running=bool(updater.running))
         logger.info(
             "Polling self-recovery succeeded",
             reason=reason,
@@ -1439,6 +1538,7 @@ class ClaudeCodeBot:
                 updater_running=False,
                 note="booting",
             )
+            self._sync_runtime_metrics(updater_running=False, now_monotonic=now)
 
             # Polling mode only (webhook mode is intentionally disabled).
             await self.app.initialize()
@@ -1450,6 +1550,7 @@ class ClaudeCodeBot:
                 updater_running=True,
                 note="startup_complete",
             )
+            self._sync_runtime_metrics(updater_running=True, now_monotonic=now)
             await self._broadcast_startup_recovery_notification()
 
             # Keep running until manually stopped
@@ -1468,6 +1569,9 @@ class ClaudeCodeBot:
                 ),
                 updater_running=bool(getattr(updater, "running", False)),
                 note="start_loop_exited",
+            )
+            self._sync_runtime_metrics(
+                updater_running=bool(getattr(updater, "running", False)),
             )
 
     async def stop(self) -> None:
@@ -1504,6 +1608,7 @@ class ClaudeCodeBot:
                     updater_running=False,
                     note="fast_fail_shutdown",
                 )
+                self._sync_runtime_metrics(updater_running=False)
                 return
 
             # Best effort: notify users and clear stale "Cancel" buttons
@@ -1538,6 +1643,7 @@ class ClaudeCodeBot:
                 updater_running=False,
                 note="graceful_shutdown_complete",
             )
+            self._sync_runtime_metrics(updater_running=False)
         except Exception as e:
             logger.error("Error stopping bot", error=str(e))
             raise ClaudeCodeTelegramError(f"Failed to stop bot: {str(e)}") from e

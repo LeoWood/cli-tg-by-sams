@@ -14,6 +14,7 @@ from telegram.ext import ContextTypes
 
 from ...claude.task_registry import TaskRegistry
 from ...config.settings import Settings
+from ...monitoring import RuntimeMetrics
 from ...security.audit import AuditLogger
 from ...security.validators import SecurityValidator
 from ...services.session_interaction_service import SessionInteractionService
@@ -2134,6 +2135,8 @@ async def ops_status_command(
     project_root = _get_project_root()
     tmux_script = project_root / "scripts" / "tmux-bot.sh"
     restart_events_file = project_root / "logs" / "restart-events.log"
+    runtime_metrics = context.bot_data.get("runtime_metrics")
+    cli_integrations = context.bot_data.get("cli_integrations")
 
     logger.info(
         "Ops status requested",
@@ -2182,6 +2185,11 @@ async def ops_status_command(
 
         process_count = len(process_lines)
         process_preview = process_lines[:20] or ["(no matching bot process)"]
+        metrics_snapshot = None
+        if isinstance(runtime_metrics, RuntimeMetrics):
+            if isinstance(cli_integrations, dict):
+                runtime_metrics.refresh_active_cli_processes(cli_integrations)
+            metrics_snapshot = runtime_metrics.status_snapshot()
 
         if restart_events_file.exists():
             restart_events = restart_events_file.read_text(
@@ -2237,6 +2245,30 @@ async def ops_status_command(
                 *restart_tail,
             ]
         )
+        if metrics_snapshot is not None:
+            report_lines.extend(
+                [
+                    "",
+                    "metrics:",
+                    f"metrics_enabled={'yes' if metrics_snapshot['enabled'] else 'no'}",
+                    f"metrics_address={metrics_snapshot['address']}",
+                    f"metrics_raw_address={metrics_snapshot['raw_address']}",
+                    f"metrics_bot_running={int(metrics_snapshot['bot_running'])}",
+                    f"metrics_polling_up={int(metrics_snapshot['polling_up'])}",
+                    "metrics_polling_restart_requested="
+                    f"{int(metrics_snapshot['polling_restart_requested'])}",
+                    "metrics_watchdog_tick_age_seconds="
+                    f"{metrics_snapshot['watchdog_tick_age_seconds']:.2f}",
+                    "metrics_last_health_probe_age_seconds="
+                    f"{metrics_snapshot['last_health_probe_age_seconds']:.2f}",
+                    "metrics_pending_update_count="
+                    f"{int(metrics_snapshot['pending_update_count'])}",
+                    f"metrics_storage_up={int(metrics_snapshot['storage_up'])}",
+                    f"metrics_active_tasks={int(metrics_snapshot['active_tasks'])}",
+                    "metrics_cli_active_processes="
+                    f"{int(metrics_snapshot['cli_active_processes'])}",
+                ]
+            )
 
         report = "\n".join(report_lines)
         chunks = _split_text_chunks(report, max_chars=3400)

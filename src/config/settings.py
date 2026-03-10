@@ -321,6 +321,20 @@ class Settings(BaseSettings):
         ge=1.0,
         le=3600.0,
     )
+    metrics_enabled: bool = Field(
+        False,
+        description="Enable local read-only metrics HTTP endpoint",
+    )
+    metrics_host: str = Field(
+        "127.0.0.1",
+        description="Listen host for the metrics HTTP endpoint",
+    )
+    metrics_port: int = Field(
+        9464,
+        description="Listen port for the metrics HTTP endpoint",
+        ge=1,
+        le=65535,
+    )
 
     # Monitoring
     log_level: str = Field("INFO", description="Logging level")

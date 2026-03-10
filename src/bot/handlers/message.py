@@ -69,6 +69,7 @@ _INBOUND_QUEUE_DISPATCH_LOCKS_KEY = "inbound_queue_dispatch_locks"
 _INBOUND_QUEUE_PREVIEW_MAX_LENGTH = 120
 _INBOUND_QUEUE_PROMPT_CHAT_ID_KEY = "queue_prompt_chat_id"
 _INBOUND_QUEUE_PROMPT_MESSAGE_ID_KEY = "queue_prompt_message_id"
+_INBOUND_QUEUE_ENQUEUED_MONOTONIC_KEY = "queue_enqueued_monotonic"
 _AUTO_IMAGE_SUFFIXES = {".png", ".jpg", ".jpeg", ".webp", ".gif", ".bmp"}
 _AUTO_FILE_SUFFIXES = {
     ".txt",
@@ -2475,6 +2476,9 @@ async def dispatch_next_queued_task_if_idle(
                     _queued_fragment_count=max(1, queued_fragment_count),
                     _queued_prompt_chat_id=queued_prompt_chat_id,
                     _queued_prompt_message_id=queued_prompt_message_id,
+                    _queued_enqueued_monotonic=payload.get(
+                        _INBOUND_QUEUE_ENQUEUED_MONOTONIC_KEY
+                    ),
                 )
             )
             logger.info(
@@ -2540,6 +2544,7 @@ async def handle_text_message(
     _queued_fragment_count: int = 1,
     _queued_prompt_chat_id: Optional[int] = None,
     _queued_prompt_message_id: Optional[int] = None,
+    _queued_enqueued_monotonic: Optional[float] = None,
 ) -> None:
     """Handle regular text messages as Claude prompts."""
     user_id = update.effective_user.id
@@ -2556,6 +2561,7 @@ async def handle_text_message(
     # Get services
     rate_limiter: Optional[RateLimiter] = context.bot_data.get("rate_limiter")
     audit_logger: Optional[AuditLogger] = context.bot_data.get("audit_logger")
+    runtime_metrics = context.bot_data.get("runtime_metrics")
     queue_dispatch_needed = False
     queued_prompt_chat_id = (
         _queued_prompt_chat_id if isinstance(_queued_prompt_chat_id, int) else None
@@ -2596,6 +2602,27 @@ async def handle_text_message(
     logger.info(
         "Processing text message", user_id=user_id, message_length=len(message_text)
     )
+    request_processing_started_monotonic = time.monotonic()
+    request_message_epoch: Optional[float] = None
+    message_date = getattr(update.message, "date", None)
+    if message_date is not None:
+        timestamp_fn = getattr(message_date, "timestamp", None)
+        if callable(timestamp_fn):
+            try:
+                request_message_epoch = float(timestamp_fn())
+            except (TypeError, ValueError, OSError):
+                request_message_epoch = None
+    telegram_delivery_seconds = (
+        max(0.0, time.time() - request_message_epoch)
+        if request_message_epoch is not None
+        else None
+    )
+    queue_wait_seconds = (
+        max(0.0, request_processing_started_monotonic - _queued_enqueued_monotonic)
+        if isinstance(_queued_enqueued_monotonic, (int, float))
+        and _queued_enqueued_monotonic > 0
+        else 0.0
+    )
 
     typing_stop_event = asyncio.Event()
     typing_heartbeat_task: Optional[asyncio.Task] = None
@@ -2606,16 +2633,30 @@ async def handle_text_message(
     noncritical_transport_disabled = False
     noncritical_transport_failures = 0
     noncritical_transport_disabled_until = 0.0
+    metrics_finalize_request = True
+    failure_stage: Optional[str] = None
+    cli_exec_seconds: Optional[float] = None
+    preprocess_seconds: Optional[float] = None
+    reply_send_seconds: Optional[float] = None
+    end_to_first_reply_seconds: Optional[float] = None
+    first_reply_sent = False
+    request_result = "failure"
 
     try:
         # Check rate limit with estimated cost for text processing
         estimated_cost = _estimate_text_processing_cost(message_text)
+        active_engine, cli_integration = get_cli_integration(
+            bot_data=context.bot_data,
+            scope_state=scope_state,
+        )
+        storage = context.bot_data.get("storage")
 
         if rate_limiter:
             allowed, limit_message = await rate_limiter.check_rate_limit(
                 user_id, estimated_cost
             )
             if not allowed:
+                failure_stage = "rate_limit"
                 await _reply_text_resilient(update.message, f"⏱️ {limit_message}")
                 return
 
@@ -2636,6 +2677,12 @@ async def handle_text_message(
                             "message_text": message_text,
                             "source_message_id": input_message_id,
                             "fragment_count": fragment_count,
+                            _INBOUND_QUEUE_ENQUEUED_MONOTONIC_KEY: (
+                                _queued_enqueued_monotonic
+                                if isinstance(_queued_enqueued_monotonic, (int, float))
+                                and _queued_enqueued_monotonic > 0
+                                else time.monotonic()
+                            ),
                         }
                         if queued_prompt_chat_id is not None:
                             requeue_payload[_INBOUND_QUEUE_PROMPT_CHAT_ID_KEY] = (
@@ -2658,10 +2705,12 @@ async def handle_text_message(
                             user_id=user_id,
                             scope_key=scope_key,
                         )
+                metrics_finalize_request = False
                 return
 
             inbound_queue = _get_inbound_task_queue(context)
             if inbound_queue is None:
+                failure_stage = "busy"
                 await _reply_text_resilient(
                     update.message,
                     "A task is already running. Use /cancel to cancel it.",
@@ -2675,6 +2724,7 @@ async def handle_text_message(
                     "message_text": message_text,
                     "source_message_id": input_message_id,
                     "fragment_count": fragment_count,
+                    _INBOUND_QUEUE_ENQUEUED_MONOTONIC_KEY: time.monotonic(),
                 }
                 queue_item, ahead_count = await inbound_queue.enqueue(
                     user_id=user_id,
@@ -2692,7 +2742,10 @@ async def handle_text_message(
                     ),
                     reply_to_message_id=input_message_id,
                 )
+                failure_stage = "queue_full"
                 return
+            if hasattr(runtime_metrics, "increment_text_requests_queued"):
+                runtime_metrics.increment_text_requests_queued(engine=active_engine)
 
             queue_prompt_message = await _reply_text_resilient(
                 update.message,
@@ -2710,13 +2763,8 @@ async def handle_text_message(
                 payload=queue_payload,
                 prompt_message=queue_prompt_message,
             )
+            metrics_finalize_request = False
             return
-        # Resolve active CLI engine integration and storage from context
-        active_engine, cli_integration = get_cli_integration(
-            bot_data=context.bot_data,
-            scope_state=scope_state,
-        )
-        storage = context.bot_data.get("storage")
         noncritical_failure_threshold = max(
             1, int(getattr(settings, "telegram_noncritical_failure_threshold", 3) or 3)
         )
@@ -2794,6 +2842,7 @@ async def handle_text_message(
         )
 
         if not cli_integration:
+            failure_stage = "engine_unavailable"
             await _reply_text_resilient(
                 update.message,
                 _with_engine_badge(
@@ -3125,6 +3174,10 @@ async def handle_text_message(
                 ),
             )
 
+        cli_exec_started_monotonic = time.monotonic()
+        preprocess_seconds = max(
+            0.0, cli_exec_started_monotonic - request_processing_started_monotonic
+        )
         queue_dispatch_needed = True
         task = asyncio.create_task(_run_claude())
 
@@ -3143,7 +3196,12 @@ async def handle_text_message(
         command_succeeded = False
         blocked_local_image_fallback = False
         try:
-            claude_response = await task
+            try:
+                claude_response = await task
+            finally:
+                cli_exec_seconds = max(
+                    0.0, time.monotonic() - cli_exec_started_monotonic
+                )
             command_succeeded = True
 
             # Mark task as completed
@@ -3195,6 +3253,7 @@ async def handle_text_message(
 
         except asyncio.CancelledError:
             logger.info("Claude task cancelled by user", user_id=user_id)
+            failure_stage = "cancelled"
             await _cancel_progress_flush_task()
             if task_registry:
                 await task_registry.remove(user_id, scope_key=scope_key)
@@ -3253,6 +3312,7 @@ async def handle_text_message(
                 user_id=user_id,
                 blocked_tools=e.blocked_tools,
             )
+            failure_stage = "tool_validation"
             # Error message already formatted, create FormattedMessage
             from ..utils.formatting import FormattedMessage
 
@@ -3264,6 +3324,7 @@ async def handle_text_message(
                 user_id=user_id,
                 engine=active_engine,
             )
+            failure_stage = "cli_exec"
             if task_registry:
                 await task_registry.fail(user_id, scope_key=scope_key)
             # Format error and create FormattedMessage
@@ -3368,6 +3429,9 @@ async def handle_text_message(
 
         # Send formatted responses (may be multiple messages)
         for i, message in enumerate(formatted_messages):
+            first_send_started_monotonic = (
+                time.monotonic() if i == 0 and not first_reply_sent else None
+            )
             try:
                 msg_text = message.text
                 reply_to_id = input_message_id if i == 0 else None
@@ -3396,6 +3460,15 @@ async def handle_text_message(
                     bot=context.bot,
                     chat_type=getattr(update.effective_chat, "type", None),
                 )
+                if first_send_started_monotonic is not None:
+                    reply_send_seconds = max(
+                        0.0, time.monotonic() - first_send_started_monotonic
+                    )
+                    first_reply_sent = True
+                    if command_succeeded and request_message_epoch is not None:
+                        end_to_first_reply_seconds = max(
+                            0.0, time.time() - request_message_epoch
+                        )
 
                 # Small delay between messages to avoid rate limits
                 if i < len(formatted_messages) - 1:
@@ -3405,6 +3478,8 @@ async def handle_text_message(
                 logger.error(
                     "Failed to send response message", error=str(e), message_index=i
                 )
+                if i == 0 and failure_stage is None:
+                    failure_stage = "reply_send"
                 # Try to send error message
                 await _reply_text_resilient(
                     update.message,
@@ -3465,10 +3540,14 @@ async def handle_text_message(
                 args=[message_text[:100]],  # First 100 chars
                 success=True,
             )
+
+        request_result = "success" if first_reply_sent else "failure"
         logger.info("Text message processed successfully", user_id=user_id)
 
     except Exception as e:
         resolved_engine = locals().get("active_engine", ENGINE_CLAUDE)
+        if failure_stage is None:
+            failure_stage = "handler_exception"
         # Clean up progress message: collapse to summary if possible
         try:
             if progress_msg is not None:
@@ -3567,6 +3646,54 @@ async def handle_text_message(
 
         logger.exception("Error processing text message", error=str(e), user_id=user_id)
     finally:
+        resolved_engine = locals().get("active_engine", ENGINE_CLAUDE)
+        if metrics_finalize_request and hasattr(
+            runtime_metrics, "increment_text_requests_total"
+        ):
+            runtime_metrics.increment_text_requests_total(
+                engine=resolved_engine,
+                result=request_result,
+            )
+            if telegram_delivery_seconds is not None:
+                runtime_metrics.observe_text_latency(
+                    "clitg_text_telegram_delivery_seconds",
+                    engine=resolved_engine,
+                    seconds=telegram_delivery_seconds,
+                )
+            runtime_metrics.observe_text_latency(
+                "clitg_text_queue_wait_seconds",
+                engine=resolved_engine,
+                seconds=queue_wait_seconds,
+            )
+            if preprocess_seconds is not None:
+                runtime_metrics.observe_text_latency(
+                    "clitg_text_preprocess_seconds",
+                    engine=resolved_engine,
+                    seconds=preprocess_seconds,
+                )
+            if cli_exec_seconds is not None:
+                runtime_metrics.observe_text_latency(
+                    "clitg_text_cli_exec_seconds",
+                    engine=resolved_engine,
+                    seconds=cli_exec_seconds,
+                )
+            if reply_send_seconds is not None:
+                runtime_metrics.observe_text_latency(
+                    "clitg_text_reply_send_seconds",
+                    engine=resolved_engine,
+                    seconds=reply_send_seconds,
+                )
+            if request_result == "success" and end_to_first_reply_seconds is not None:
+                runtime_metrics.observe_text_latency(
+                    "clitg_text_end_to_first_reply_seconds",
+                    engine=resolved_engine,
+                    seconds=end_to_first_reply_seconds,
+                )
+            if request_result != "success":
+                runtime_metrics.increment_text_request_failure(
+                    engine=resolved_engine,
+                    stage=failure_stage or "unknown",
+                )
         typing_stop_event.set()
         if typing_heartbeat_task and not typing_heartbeat_task.done():
             typing_heartbeat_task.cancel()

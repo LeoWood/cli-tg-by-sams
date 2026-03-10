@@ -27,6 +27,7 @@ from src.claude.permissions import PermissionManager
 from src.claude.sdk_integration import ClaudeSDKManager
 from src.config.settings import Settings
 from src.exceptions import ConfigurationError
+from src.monitoring import RuntimeMetrics
 from src.security.audit import AuditLogger, SQLiteAuditStorage
 from src.security.auth import (
     AuthenticationManager,
@@ -227,6 +228,12 @@ async def create_application(config: Settings) -> Dict[str, Any]:
     session_interaction_service = SessionInteractionService()
     event_service = EventService(storage)
     session_service = SessionService(storage=storage, event_service=event_service)
+    runtime_metrics = RuntimeMetrics(
+        enabled=bool(getattr(config, "metrics_enabled", False)),
+        host=str(getattr(config, "metrics_host", "127.0.0.1") or "127.0.0.1"),
+        port=int(getattr(config, "metrics_port", 9464) or 9464),
+    )
+    runtime_metrics.set_gauge("clitg_storage_up", 1.0)
 
     # Create Claude manager based on configuration
     if config.use_sdk:
@@ -303,6 +310,7 @@ async def create_application(config: Settings) -> Dict[str, Any]:
         "session_service": session_service,
         "cli_integrations": cli_integrations,
         "cc_switch_manager": cc_switch_manager,
+        "runtime_metrics": runtime_metrics,
     }
 
     bot = ClaudeCodeBot(config, dependencies)
@@ -315,6 +323,7 @@ async def create_application(config: Settings) -> Dict[str, Any]:
         "cli_integrations": cli_integrations,
         "storage": storage,
         "config": config,
+        "runtime_metrics": runtime_metrics,
     }
 
 
@@ -327,6 +336,7 @@ async def run_application(app: Dict[str, Any]) -> None:
         "claude": claude_integration
     }
     storage: Storage = app["storage"]
+    runtime_metrics: RuntimeMetrics = app["runtime_metrics"]
     process_started_monotonic = time.monotonic()
 
     # Set up signal handlers for graceful shutdown
@@ -354,6 +364,7 @@ async def run_application(app: Dict[str, Any]) -> None:
     try:
         # Start the bot
         logger.info("Starting CLITG")
+        runtime_metrics.start_http_server()
 
         # Run bot in background task
         bot_task = asyncio.create_task(bot.start())
@@ -399,7 +410,12 @@ async def run_application(app: Dict[str, Any]) -> None:
                 result = shutdown()
                 if asyncio.iscoroutine(result):
                     await result
+            runtime_metrics.refresh_active_cli_processes(cli_integrations)
+            runtime_metrics.set_gauge("clitg_bot_running", 0.0)
+            runtime_metrics.set_gauge("clitg_polling_up", 0.0)
+            runtime_metrics.set_gauge("clitg_storage_up", 0.0)
             await storage.close()
+            runtime_metrics.stop_http_server()
         except Exception as e:
             logger.error("Error during shutdown", error=str(e))
 

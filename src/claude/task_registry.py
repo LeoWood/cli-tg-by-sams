@@ -9,11 +9,14 @@ import copy
 import enum
 from dataclasses import dataclass, field
 from datetime import datetime
-from typing import Dict, Optional
+from typing import TYPE_CHECKING, Dict, Optional
 
 import structlog
 
 logger = structlog.get_logger()
+
+if TYPE_CHECKING:
+    from ..monitoring import RuntimeMetrics
 
 
 class TaskState(enum.Enum):
@@ -38,9 +41,19 @@ class ActiveTask:
 class TaskRegistry:
     """Manage active Claude tasks per user. Thread-safe via asyncio.Lock."""
 
-    def __init__(self):
+    def __init__(self, metrics: Optional["RuntimeMetrics"] = None):
         self._tasks: Dict[str, ActiveTask] = {}
         self._lock = asyncio.Lock()
+        self._metrics = metrics
+
+    def _sync_metrics_unlocked(self) -> None:
+        """Refresh active-task gauge from current state."""
+        if self._metrics is None:
+            return
+        running_count = sum(
+            1 for active in self._tasks.values() if active.state == TaskState.RUNNING
+        )
+        self._metrics.set_gauge("clitg_active_tasks", running_count)
 
     def _task_key(self, user_id: int, scope_key: Optional[str]) -> str:
         """Get internal task key (scope-first, user fallback)."""
@@ -68,6 +81,7 @@ class TaskRegistry:
                 chat_id=chat_id,
                 scope_key=scope_key,
             )
+            self._sync_metrics_unlocked()
 
     async def cancel(self, user_id: int, scope_key: Optional[str] = None) -> bool:
         """Cancel the user's active task. Returns True if cancelled."""
@@ -88,6 +102,7 @@ class TaskRegistry:
 
             if not cancelled:
                 return False
+            self._sync_metrics_unlocked()
             logger.info("Task cancelled", user_id=user_id, scope_key=scope_key)
             return True
 
@@ -102,6 +117,7 @@ class TaskRegistry:
                 active = self._tasks.get(key)
                 if active and active.state == TaskState.RUNNING:
                     active.state = TaskState.COMPLETED
+            self._sync_metrics_unlocked()
 
     async def fail(self, user_id: int, scope_key: Optional[str] = None) -> None:
         async with self._lock:
@@ -114,14 +130,17 @@ class TaskRegistry:
                 active = self._tasks.get(key)
                 if active and active.state == TaskState.RUNNING:
                     active.state = TaskState.FAILED
+            self._sync_metrics_unlocked()
 
     async def remove(self, user_id: int, scope_key: Optional[str] = None) -> None:
         async with self._lock:
             if scope_key:
                 self._tasks.pop(self._task_key(user_id, scope_key), None)
+                self._sync_metrics_unlocked()
                 return
             for key in self._user_task_keys(user_id):
                 self._tasks.pop(key, None)
+            self._sync_metrics_unlocked()
 
     async def get(
         self, user_id: int, scope_key: Optional[str] = None
