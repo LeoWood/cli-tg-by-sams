@@ -9,6 +9,8 @@ LOG_TAIL_LINES="${BOT_LOG_TAIL_LINES:-120}"
 DETACHED_RESTART_LOG="${BOT_DETACHED_RESTART_LOG:-$PROJECT_ROOT/logs/restart-detached.log}"
 BOT_HEALTH_FILE="${BOT_HEALTH_FILE:-$PROJECT_ROOT/logs/bot-health.txt}"
 BOT_HEALTH_STALE_SECONDS="${BOT_HEALTH_STALE_SECONDS:-90}"
+BOT_START_RETRY_DELAYS_SECONDS="${BOT_START_RETRY_DELAYS_SECONDS:-3 30 180 600 1800}"
+BOT_START_RETRY_JITTER_PERCENT="${BOT_START_RETRY_JITTER_PERCENT:-10}"
 DEFAULT_PATH_PREFIX="/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
 export PATH="$DEFAULT_PATH_PREFIX:${PATH:-}"
 
@@ -97,8 +99,62 @@ for raw_line in path.read_text(encoding="utf-8", errors="replace").splitlines():
 PY
 }
 
-start_bot() {
-  require_tmux
+write_shell_health_snapshot() {
+  local lifecycle_state="$1"
+  local updater_running="$2"
+  local note="$3"
+  local now_epoch
+  local tmp_file
+  now_epoch="$(date +%s)"
+  tmp_file="${BOT_HEALTH_FILE}.tmp"
+
+  mkdir -p "$(dirname "$BOT_HEALTH_FILE")"
+  {
+    printf 'pid=\n'
+    printf 'lifecycle_state=%s\n' "$lifecycle_state"
+    printf 'is_running=0\n'
+    printf 'updater_running=%s\n' "$updater_running"
+    printf 'polling_restart_requested=0\n'
+    printf 'watchdog_tick_count=0\n'
+    printf 'last_watchdog_epoch=%s\n' "$now_epoch"
+    printf 'last_health_probe_success_epoch=\n'
+    printf 'last_update_id=\n'
+    printf 'last_update_epoch=\n'
+    printf 'updated_epoch=%s\n' "$now_epoch"
+    printf 'note=%s\n' "$note"
+  } >"$tmp_file"
+  mv "$tmp_file" "$BOT_HEALTH_FILE"
+}
+
+compute_retry_delay_seconds() {
+  local base_delay="$1"
+  local jitter_percent="$BOT_START_RETRY_JITTER_PERCENT"
+  local max_delta
+  local delta
+  local adjusted
+
+  if [[ ! "$jitter_percent" =~ ^[0-9]+$ ]] || [[ "$jitter_percent" -le 0 ]]; then
+    printf '%s\n' "$base_delay"
+    return
+  fi
+
+  max_delta=$(( base_delay * jitter_percent / 100 ))
+  if [[ "$max_delta" -le 0 ]]; then
+    printf '%s\n' "$base_delay"
+    return
+  fi
+
+  delta=$(( RANDOM % (max_delta * 2 + 1) - max_delta ))
+  adjusted=$(( base_delay + delta ))
+  if [[ "$adjusted" -lt 1 ]]; then
+    adjusted=1
+  fi
+  printf '%s\n' "$adjusted"
+}
+
+launch_bot_once() {
+  local entry="./scripts/restart-bot.sh"
+  local count
 
   cd "$PROJECT_ROOT"
 
@@ -106,7 +162,6 @@ start_bot() {
   "$TMUX_BIN" kill-session -t "$SESSION_NAME" >/dev/null 2>&1 || true
   cleanup_residual_processes
 
-  local entry="./scripts/restart-bot.sh"
   if [[ "${BOT_DEBUG:-}" == "1" ]]; then
     entry="./scripts/restart-bot.sh --debug"
   fi
@@ -115,16 +170,53 @@ start_bot() {
 
   sleep "$STARTUP_WAIT_SECONDS"
 
-  local count
   count="$(bot_process_count)"
   if [[ "$count" -ne 1 ]]; then
     log "startup check failed: expected 1 bot process, found $count"
-    list_bot_processes
-    exit 1
+    if [[ "$count" -gt 0 ]]; then
+      list_bot_processes
+    fi
+    return 1
   fi
 
   log "started in tmux session '$SESSION_NAME' (single instance confirmed)"
   list_bot_processes
+  return 0
+}
+
+start_bot() {
+  local -a retry_delays=()
+  local retry_delay
+  local computed_delay
+  local retry_index=0
+
+  require_tmux
+  read -r -a retry_delays <<< "$BOT_START_RETRY_DELAYS_SECONDS"
+
+  if launch_bot_once; then
+    return 0
+  fi
+
+  for retry_delay in "${retry_delays[@]}"; do
+    if [[ ! "$retry_delay" =~ ^[0-9]+$ ]] || [[ "$retry_delay" -lt 1 ]]; then
+      log "skipping invalid startup retry delay: $retry_delay"
+      continue
+    fi
+
+    retry_index=$((retry_index + 1))
+    computed_delay="$(compute_retry_delay_seconds "$retry_delay")"
+    log "retrying bot startup after failure (retry $retry_index/${#retry_delays[@]}, base delay: ${retry_delay}s, actual delay: ${computed_delay}s)"
+    sleep "$computed_delay"
+
+    if launch_bot_once; then
+      log "startup recovered on retry $retry_index/${#retry_delays[@]}"
+      return 0
+    fi
+  done
+
+  write_shell_health_snapshot "unhealthy" "0" "startup_retries_exhausted"
+  log "startup failed after 1 initial attempt and ${#retry_delays[@]} retries"
+  exit 1
 }
 
 stop_bot() {
