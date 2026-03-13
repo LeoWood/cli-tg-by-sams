@@ -17,6 +17,7 @@ import structlog
 
 from src import __version__
 from src.bot.core import ClaudeCodeBot
+from src.bot.utils.cc_switch import CCSwitchManager
 from src.claude import (
     ClaudeIntegration,
     ClaudeProcessManager,
@@ -46,8 +47,6 @@ from src.services import (
 )
 from src.storage.facade import Storage
 from src.storage.session_storage import SQLiteSessionStorage
-
-from src.bot.utils.cc_switch import CCSwitchManager
 
 _TELEGRAM_BOT_TOKEN_IN_URL_RE = re.compile(
     r"(https?://api\.telegram\.org/bot)([^/\s]+)"
@@ -284,6 +283,38 @@ async def create_application(config: Settings) -> Dict[str, Any]:
             logger.warning(
                 "ENABLE_CODEX_CLI is true but codex binary not found; "
                 "skip codex adapter"
+            )
+
+    if config.enable_gemini_cli:
+        gemini_cli_path = str(config.gemini_cli_path or "").strip() or shutil.which(
+            "gemini"
+        )
+        if gemini_cli_path:
+            gemini_config = config.model_copy(deep=True)
+            gemini_config.use_sdk = False
+            gemini_config.enable_mcp = False
+            gemini_config.claude_cli_path = gemini_cli_path
+            gemini_config.claude_binary_path = gemini_cli_path
+
+            gemini_session_storage = SQLiteSessionStorage(storage.db_manager)
+            gemini_session_manager = SessionManager(
+                gemini_config, gemini_session_storage
+            )
+            gemini_process_manager = ClaudeProcessManager(gemini_config)
+            gemini_integration = ClaudeIntegration(
+                config=gemini_config,
+                process_manager=gemini_process_manager,
+                sdk_manager=None,
+                session_manager=gemini_session_manager,
+                tool_monitor=tool_monitor,
+                permission_manager=permission_manager,
+            )
+            cli_integrations["gemini"] = gemini_integration
+            logger.info("Gemini CLI adapter enabled", gemini_cli_path=gemini_cli_path)
+        else:
+            logger.warning(
+                "ENABLE_GEMINI_CLI is true but gemini binary not found; "
+                "skip gemini adapter"
             )
 
     # Initialize cc-switch provider manager

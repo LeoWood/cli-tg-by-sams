@@ -7,12 +7,14 @@ from typing import Any, Mapping
 
 ENGINE_CLAUDE = "claude"
 ENGINE_CODEX = "codex"
+ENGINE_GEMINI = "gemini"
 DEFAULT_CLI_ENGINE = ENGINE_CODEX
-SUPPORTED_CLI_ENGINES = (ENGINE_CLAUDE, ENGINE_CODEX)
+SUPPORTED_CLI_ENGINES = (ENGINE_CLAUDE, ENGINE_CODEX, ENGINE_GEMINI)
 ENGINE_STATE_KEY = "active_cli_engine"
 ENGINE_PRIMARY_STATUS_COMMAND: dict[str, str] = {
     ENGINE_CLAUDE: "context",
     ENGINE_CODEX: "status",
+    ENGINE_GEMINI: "status",
 }
 
 
@@ -36,13 +38,18 @@ ENGINE_CAPABILITIES: dict[str, EngineCapabilities] = {
         supports_codex_diag=True,
         supports_precise_context_probe=True,
     ),
+    ENGINE_GEMINI: EngineCapabilities(
+        supports_model_selection=True,
+        supports_codex_diag=False,
+        supports_precise_context_probe=False,
+    ),
 }
 
 COMMAND_ENGINE_VISIBILITY: dict[str, tuple[str, ...]] = {
     "context": (ENGINE_CLAUDE,),
     "codexdiag": (ENGINE_CODEX,),
     "effort": (ENGINE_CODEX,),
-    "status": (ENGINE_CODEX,),
+    "status": (ENGINE_CODEX, ENGINE_GEMINI),
     "provider": (ENGINE_CLAUDE,),
 }
 
@@ -60,6 +67,8 @@ def get_default_cli_engine(integrations: Mapping[str, Any] | None = None) -> str
     if isinstance(integrations, Mapping):
         if integrations.get(ENGINE_CODEX) is not None:
             return ENGINE_CODEX
+        if integrations.get(ENGINE_GEMINI) is not None:
+            return ENGINE_GEMINI
         if integrations.get(ENGINE_CLAUDE) is not None:
             return ENGINE_CLAUDE
     return DEFAULT_CLI_ENGINE
@@ -116,12 +125,20 @@ def get_cli_integration(
         if integration is not None:
             return fallback_engine, integration
 
-        integration = integrations.get(ENGINE_CLAUDE) or integrations.get(ENGINE_CODEX)
+        integration = (
+            integrations.get(ENGINE_CLAUDE)
+            or integrations.get(ENGINE_CODEX)
+            or integrations.get(ENGINE_GEMINI)
+        )
         if integration is not None:
             resolved_engine = (
                 ENGINE_CLAUDE
                 if integrations.get(ENGINE_CLAUDE) is not None
-                else ENGINE_CODEX
+                else (
+                    ENGINE_CODEX
+                    if integrations.get(ENGINE_CODEX) is not None
+                    else ENGINE_GEMINI
+                )
             )
             return resolved_engine, integration
 

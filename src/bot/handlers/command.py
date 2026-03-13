@@ -24,6 +24,7 @@ from ..inbound_task_queue import InboundTaskQueue
 from ..utils.cli_engine import (
     ENGINE_CLAUDE,
     ENGINE_CODEX,
+    ENGINE_GEMINI,
     SUPPORTED_CLI_ENGINES,
     get_active_cli_engine,
     get_cli_integration,
@@ -36,6 +37,9 @@ from ..utils.codex_models import (
     build_codex_model_keyboard as _build_codex_model_keyboard,
 )
 from ..utils.command_menu import sync_chat_command_menu
+from ..utils.gemini_models import (
+    build_gemini_model_keyboard as _build_gemini_model_keyboard,
+)
 from ..utils.recent_projects import build_recent_projects_message, scan_recent_projects
 from ..utils.resume_summary import build_resume_button_labels
 from ..utils.resume_ui import build_resume_project_selector
@@ -265,11 +269,15 @@ def _get_or_create_resume_scanner(
 ):
     """Get engine-specific desktop session scanner."""
     from ...bot.utils.codex_resume_scanner import CodexSessionScanner
+    from ...bot.utils.gemini_resume_scanner import GeminiSessionScanner
     from ...claude.desktop_scanner import DesktopSessionScanner
 
-    scanner_key = (
-        "codex_desktop_scanner" if engine == ENGINE_CODEX else "desktop_scanner"
-    )
+    if engine == ENGINE_CODEX:
+        scanner_key = "codex_desktop_scanner"
+    elif engine == ENGINE_GEMINI:
+        scanner_key = "gemini_desktop_scanner"
+    else:
+        scanner_key = "desktop_scanner"
     scanner = context.bot_data.get(scanner_key)
     if scanner is None:
         scanner = (
@@ -278,9 +286,16 @@ def _get_or_create_resume_scanner(
                 cache_ttl_sec=settings.resume_scan_cache_ttl_seconds,
             )
             if engine == ENGINE_CODEX
-            else DesktopSessionScanner(
-                approved_directory=settings.approved_directory,
-                cache_ttl_sec=settings.resume_scan_cache_ttl_seconds,
+            else (
+                GeminiSessionScanner(
+                    approved_directory=settings.approved_directory,
+                    cache_ttl_sec=settings.resume_scan_cache_ttl_seconds,
+                )
+                if engine == ENGINE_GEMINI
+                else DesktopSessionScanner(
+                    approved_directory=settings.approved_directory,
+                    cache_ttl_sec=settings.resume_scan_cache_ttl_seconds,
+                )
             )
         )
         context.bot_data[scanner_key] = scanner
@@ -289,7 +304,11 @@ def _get_or_create_resume_scanner(
 
 def _engine_display_name(engine: str) -> str:
     """Human-readable engine name."""
-    return "Codex" if engine == ENGINE_CODEX else "Claude"
+    if engine == ENGINE_CODEX:
+        return "Codex"
+    if engine == ENGINE_GEMINI:
+        return "Gemini"
+    return "Claude"
 
 
 def _normalize_reasoning_effort_label(raw: str) -> str:
@@ -498,11 +517,12 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         f"• `/cd <dir>` - Change directory\n"
         f"• `/projects` - Show available projects\n"
         f"{status_line}\n"
-        f"• `/engine [claude|codex]` - Switch CLI engine\n"
+        f"• `/engine [claude|codex|gemini]` - Switch CLI engine\n"
         f"• `/actions` - Show quick actions\n"
         f"• `/git` - Git repository commands\n"
         f"• `/queue` - Show pending queued tasks\n"
         f"• `/dequeue <id>` - Remove queued task\n"
+        f"• `/stats [session|user|system]` - Show detailed analytics\n"
         f"• `/restartbot` - Restart bot service (admin)\n"
         f"• `/opsstatus` - Show bot runtime ops status\n"
         f"{diagnostics_line}\n"
@@ -577,6 +597,9 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
             "• `/effort [low|medium|high|xhigh|default]`"
             " - View or set Codex reasoning effort\n"
         )
+    elif active_engine == ENGINE_GEMINI:
+        model_line = "• `/model [name|default]` - View or set Gemini model\n"
+        effort_line = ""
     elif capabilities.supports_model_selection:
         model_line = "• `/model` - View or switch Claude model\n"
         effort_line = ""
@@ -597,10 +620,11 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         "• `/end` - End current session and clear context\n"
         f"{status_line}\n"
         f"{status_alias_line}\n"
-        "• `/engine [claude|codex]` - Switch active CLI engine\n"
+        "• `/engine [claude|codex|gemini]` - Switch active CLI engine\n"
         "• `/queue` - Show pending queued tasks\n"
         "• `/dequeue <id>` - Remove queued task\n"
         "• `/provider` - Switch API provider (cc-switch)\n"
+        "• `/stats [session|user|system]` - Show detailed analytics\n"
         "• `/restartbot` - Restart bot service (admin)\n"
         "• `/opsstatus` - Show bot runtime ops status\n"
         f"{model_line}{effort_line}"
@@ -675,7 +699,7 @@ async def switch_engine(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
             f"当前引擎：`{active_engine}`\n"
             f"支持引擎：`{supported}`\n\n"
             "点击下方按钮即可切换；切换后会继续引导你选择最近目录与会话。\n"
-            "也可手动输入：`/engine codex` 或 `/engine claude`"
+            "也可手动输入：`/engine codex`、`/engine gemini` 或 `/engine claude`"
         )
         if selector_keyboard is None:
             selector_text += "\n\n⚠️ 当前未检测到可用引擎，请检查配置。"
@@ -2730,6 +2754,58 @@ async def model_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         )
         return
 
+    if active_engine == ENGINE_GEMINI:
+        session_id = str(scope_state.get("claude_session_id") or "").strip()
+        gemini_snapshot: dict | None = None
+        if session_id:
+            gemini_snapshot = SessionService._probe_gemini_session_snapshot(session_id)
+
+        current_model = str(scope_state.get("claude_model") or "").strip()
+        resolved_model = ""
+        if isinstance(gemini_snapshot, dict):
+            resolved_model = str(gemini_snapshot.get("resolved_model") or "").strip()
+
+        requested_model = " ".join(context.args or []).strip()
+        if requested_model:
+            requested_norm = requested_model.lower()
+            if requested_norm in {"default", "clear", "reset"}:
+                scope_state.pop("claude_model", None)
+                selected_model = "default"
+            else:
+                selected_model = requested_model.replace("`", "")
+                scope_state["claude_model"] = selected_model
+
+            await _reply_update_message_resilient(
+                update,
+                context,
+                "✅ 已更新 Gemini 模型设置。\n"
+                f"当前设置：`{selected_model}`\n\n"
+                "该设置会用于后续 Gemini 请求（通过 `--model` 传递）。\n"
+                "恢复默认：`/model default`",
+                parse_mode="Markdown",
+                reply_markup=_build_gemini_model_keyboard(
+                    selected_model=str(scope_state.get("claude_model") or "").strip(),
+                    resolved_model=resolved_model,
+                ),
+            )
+            return
+
+        model_display = resolved_model or current_model or "default"
+        await _reply_update_message_resilient(
+            update,
+            context,
+            "ℹ️ 当前引擎：`gemini`\n"
+            f"当前模型：`{model_display}`\n\n"
+            "可直接切换：`/model <model_name>`，或点下方按钮选择。\n"
+            "恢复默认：`/model default`",
+            parse_mode="Markdown",
+            reply_markup=_build_gemini_model_keyboard(
+                selected_model=current_model,
+                resolved_model=resolved_model,
+            ),
+        )
+        return
+
     if not capabilities.supports_model_selection:
 
         await _reply_update_message_resilient(
@@ -2882,6 +2958,148 @@ async def effort_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     )
 
 
+async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle /stats command for user, session, and system analytics."""
+    user_id = update.effective_user.id
+    settings: Settings = context.bot_data["settings"]
+    storage = context.bot_data.get("storage")
+    if not storage:
+        await _reply_update_message_resilient(
+            update, context, "❌ Storage not available."
+        )
+        return
+
+    args = [
+        str(arg).strip().lower() for arg in (context.args or []) if str(arg).strip()
+    ]
+    subcommand = args[0] if args else "session"
+
+    if subcommand == "system":
+        # Admin check: restrict to allowed users if setting exists
+        if settings.allowed_users and user_id not in settings.allowed_users:
+            await _reply_update_message_resilient(
+                update, context, "❌ 无权查看系统全局统计。"
+            )
+            return
+
+        data = await storage.get_admin_dashboard()
+        stats = data.get("system_stats", {})
+
+        report = [
+            "📊 **系统全局统计**",
+            "",
+            f"👥 总用户数: `{stats.get('total_users', 0)}`",
+            f"🔄 总会话数: `{stats.get('total_sessions', 0)}`",
+            f"💬 总消息数: `{stats.get('total_messages', 0)}`",
+            f"💰 总成本: `${stats.get('total_cost', 0.0):.4f}`",
+            f"⏱️ 平均耗时: `{stats.get('avg_duration', 0.0) / 1000:.2f}s`",
+            f"🔥 7天活跃用户: `{stats.get('active_users_7d', 0)}`",
+            "",
+            "🛠️ **热门工具使用**",
+        ]
+
+        tool_stats = data.get("tool_stats", [])[:10]
+        for tool in tool_stats:
+            report.append(f"• `{tool['tool_name']}`: {tool['usage_count']} 次")
+
+        if not tool_stats:
+            report.append("_(无工具使用记录)_")
+
+        await _reply_update_message_resilient(
+            update, context, "\n".join(report), parse_mode="Markdown"
+        )
+
+    elif subcommand == "user":
+        data = await storage.get_user_dashboard(user_id)
+        if not data:
+            await _reply_update_message_resilient(
+                update, context, "❌ 未找到用户统计数据。"
+            )
+            return
+
+        stats = data.get("stats", {}).get("summary", {})
+
+        report = [
+            "👤 **个人使用统计**",
+            "",
+            f"🔄 总会话数: `{stats.get('total_sessions', 0)}`",
+            f"💬 总消息数: `{stats.get('total_messages', 0)}`",
+            f"💰 总成本: `${stats.get('total_cost', 0.0):.4f}`",
+            f"⏱️ 平均耗时: `{stats.get('avg_duration', 0.0) / 1000:.2f}s`",
+            f"📅 最后活跃: `{stats.get('last_activity') or 'N/A'}`",
+            "",
+            "🛠️ **个人常用工具**",
+        ]
+
+        top_tools = data.get("stats", {}).get("top_tools", [])
+        for tool in top_tools:
+            report.append(f"• `{tool['tool_name']}`: {tool['usage_count']} 次")
+
+        if not top_tools:
+            report.append("_(无工具使用记录)_")
+
+        await _reply_update_message_resilient(
+            update, context, "\n".join(report), parse_mode="Markdown"
+        )
+
+    else:  # session
+        _, scope_state = get_scope_state_from_update(
+            user_data=context.user_data,
+            update=update,
+            default_directory=settings.approved_directory,
+        )
+        session_id = scope_state.get("claude_session_id")
+
+        if not session_id:
+            await _reply_update_message_resilient(
+                update,
+                context,
+                "ℹ️ 当前无活跃会话统计。请先发送消息或使用 `/continue` 恢复会话。",
+            )
+            return
+
+        history = await storage.get_session_history(session_id)
+        if not history or not history.get("session"):
+            await _reply_update_message_resilient(
+                update, context, "❌ 未找到会话历史统计数据。"
+            )
+            return
+
+        session = history.get("session", {})
+
+        report = [
+            "📱 **当前会话统计**",
+            "",
+            f"🆔 ID: `{session_id[:8]}...`",
+            f"📂 目录: `{session.get('project_path', 'N/A')}`",
+            f"💬 消息数: `{session.get('message_count', 0)}`",
+            f"🔄 轮次: `{session.get('total_turns', 0)}`",
+            f"💰 累计成本: `${session.get('total_cost', 0.0):.4f}`",
+            f"⏱️ 创建时间: `{session.get('created_at')}`",
+            f"📅 最后使用: `{session.get('last_used')}`",
+            "",
+            "🛠️ **会话工具调用**",
+        ]
+
+        tool_usage = history.get("tool_usage", [])
+        tool_counts = {}
+        for t in tool_usage:
+            name = t.get("tool_name")
+            tool_counts[name] = tool_counts.get(name, 0) + 1
+
+        for name, count in sorted(
+            tool_counts.items(), key=lambda x: x[1], reverse=True
+        ):
+            report.append(f"• `{name}`: {count} 次")
+
+        if not tool_counts:
+            report.append("_(无工具调用记录)_")
+
+        await _reply_update_message_resilient(
+            update, context, "\n".join(report), parse_mode="Markdown"
+        )
+
+
 async def resume_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Handle /resume command - resume a desktop session for active engine."""
     user_id = update.effective_user.id
@@ -2892,7 +3110,7 @@ async def resume_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         default_directory=settings.approved_directory,
     )
     active_engine = get_active_cli_engine(scope_state)
-    engine_label = "Codex" if active_engine == ENGINE_CODEX else "Claude"
+    engine_label = _engine_display_name(active_engine)
 
     scanner = _get_or_create_resume_scanner(
         context=context,

@@ -264,6 +264,84 @@ def test_build_command_for_codex_resume_without_prompt_uses_default(
     ]
 
 
+def test_build_command_for_gemini_uses_headless_stream_json_flags(
+    tmp_path, monkeypatch
+):
+    """Gemini CLI should use prompt/resume/stream-json flags in headless mode."""
+    manager = _build_manager(
+        tmp_path,
+        gemini_approval_mode="yolo",
+    )
+    monkeypatch.setattr(
+        "src.claude.sdk_integration.find_claude_cli",
+        lambda _: "/opt/homebrew/bin/gemini",
+    )
+
+    cmd = manager._build_command(
+        prompt="hello gemini",
+        session_id="gemini-session-1",
+        continue_session=True,
+        model="gemini-2.5-pro",
+    )
+
+    assert cmd == [
+        "/opt/homebrew/bin/gemini",
+        "--prompt",
+        "hello gemini",
+        "--output-format",
+        "stream-json",
+        "--approval-mode",
+        "yolo",
+        "--resume",
+        "gemini-session-1",
+        "--model",
+        "gemini-2.5-pro",
+    ]
+
+
+def test_parse_result_for_gemini_stream_json_payload(tmp_path):
+    """Gemini result payload should map stats/session/model into unified response."""
+    manager = _build_manager(tmp_path)
+    result = {
+        "type": "result",
+        "status": "success",
+        "stats": {
+            "total_tokens": 8049,
+            "input_tokens": 7935,
+            "output_tokens": 1,
+            "cached": 0,
+            "duration_ms": 5890,
+            "tool_calls": 0,
+        },
+    }
+    messages = [
+        {
+            "type": "init",
+            "session_id": "gemini-session-1",
+            "model": "auto-gemini-3",
+        },
+        {
+            "type": "message",
+            "role": "assistant",
+            "content": "OK",
+        },
+    ]
+
+    response = manager._parse_result(result, messages)
+
+    assert response.session_id == "gemini-session-1"
+    assert response.content == "OK"
+    assert response.duration_ms == 5890
+    assert response.model_usage == {
+        "resolvedModel": "auto-gemini-3",
+        "inputTokens": 7935,
+        "outputTokens": 1,
+        "cacheReadInputTokens": 0,
+        "cacheCreationInputTokens": 0,
+        "total_tokens": 8049,
+    }
+
+
 def test_build_command_for_codex_exec_without_prompt_uses_default(
     tmp_path, monkeypatch
 ):
@@ -483,9 +561,7 @@ async def test_start_process_unsets_claudecode_env(tmp_path, monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_execute_command_kills_process_tree_when_cancelled(
-    tmp_path, monkeypatch
-):
+async def test_execute_command_kills_process_tree_when_cancelled(tmp_path, monkeypatch):
     """Cancellation should terminate the spawned CLI process tree."""
     manager = _build_manager(tmp_path)
     fake_process = SimpleNamespace(pid=4321, returncode=None, stdin=None)

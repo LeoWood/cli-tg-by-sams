@@ -26,8 +26,8 @@ from .exceptions import (
     ClaudeMCPError,
     ClaudeParsingError,
     ClaudeProcessError,
-    ClaudeToolValidationError,
     ClaudeTimeoutError,
+    ClaudeToolValidationError,
 )
 
 logger = structlog.get_logger()
@@ -130,7 +130,7 @@ class ClaudeProcessManager:
             images=images,
         )
         cli_kind = self._detect_cli_kind(cmd[0])
-        cli_display_name = "Codex CLI" if cli_kind == "codex" else "Claude Code"
+        cli_display_name = self._cli_display_name(cli_kind)
         stdin_payload: Optional[str] = None
         if cli_kind == "codex" and images and not continue_session:
             # Codex exec with --image can ignore argv prompt in non-TTY subprocess mode.
@@ -280,7 +280,20 @@ class ClaudeProcessManager:
     def _detect_cli_kind(cli_path: str) -> str:
         """Detect CLI kind by executable name."""
         basename = os.path.basename(str(cli_path)).lower()
-        return "codex" if basename.startswith("codex") else "claude"
+        if basename.startswith("codex"):
+            return "codex"
+        if basename.startswith("gemini"):
+            return "gemini"
+        return "claude"
+
+    @staticmethod
+    def _cli_display_name(cli_kind: str) -> str:
+        """Return human-readable engine label for logs/errors."""
+        if cli_kind == "codex":
+            return "Codex CLI"
+        if cli_kind == "gemini":
+            return "Gemini CLI"
+        return "Claude Code"
 
     def _build_command(
         self,
@@ -302,6 +315,15 @@ class ClaudeProcessManager:
                 continue_session=continue_session,
                 model=model,
                 reasoning_effort=reasoning_effort,
+                images=images,
+            )
+        if cli_kind == "gemini":
+            return self._build_gemini_command(
+                cli_path=cli_path,
+                prompt=prompt,
+                session_id=session_id,
+                continue_session=continue_session,
+                model=model,
                 images=images,
             )
         return self._build_claude_command(
@@ -425,6 +447,48 @@ class ClaudeProcessManager:
                 cmd.append(default_text_prompt)
 
         logger.debug("Built Codex CLI command", command=cmd)
+        return cmd
+
+    def _build_gemini_command(
+        self,
+        *,
+        cli_path: str,
+        prompt: str,
+        session_id: Optional[str],
+        continue_session: bool,
+        model: Optional[str],
+        images: Optional[List[Dict[str, str]]] = None,
+    ) -> List[str]:
+        """Build Gemini CLI command."""
+        if images:
+            raise ClaudeProcessError(
+                "Gemini CLI image input is not supported in this bot MVP."
+            )
+
+        normalized_prompt = (
+            str(prompt or "").strip() or "Please continue where we left off"
+        )
+        approval_mode = str(
+            getattr(self.config, "gemini_approval_mode", "yolo") or "yolo"
+        ).strip()
+        if not approval_mode:
+            approval_mode = "yolo"
+
+        cmd = [
+            cli_path,
+            "--prompt",
+            normalized_prompt,
+            "--output-format",
+            "stream-json",
+            "--approval-mode",
+            approval_mode,
+        ]
+        if continue_session and session_id:
+            cmd.extend(["--resume", session_id])
+        if model:
+            cmd.extend(["--model", model])
+
+        logger.debug("Built Gemini CLI command", command=cmd)
         return cmd
 
     @staticmethod
@@ -671,8 +735,13 @@ class ClaudeProcessManager:
         if return_code != 0:
             stderr = await process.stderr.read()
             error_msg = stderr.decode("utf-8", errors="replace")
-            cli_display_name = "Codex CLI" if cli_kind == "codex" else "Claude Code"
-            provider_name = "Codex" if cli_kind == "codex" else "Claude AI"
+            cli_display_name = self._cli_display_name(cli_kind)
+            if cli_kind == "codex":
+                provider_name = "Codex"
+            elif cli_kind == "gemini":
+                provider_name = "Gemini"
+            else:
+                provider_name = "Claude AI"
             logger.error(
                 "Claude Code process failed",
                 return_code=return_code,
@@ -872,6 +941,9 @@ class ClaudeProcessManager:
         """Enhanced parsing with comprehensive message type support."""
         msg_type = msg.get("type")
 
+        if msg_type in {"init", "message", "tool_use"}:
+            return self._parse_gemini_stream_message(msg)
+
         # Add support for more message types
         if msg_type == "assistant":
             return self._parse_assistant_message(msg)
@@ -899,6 +971,95 @@ class ClaudeProcessManager:
         # Unknown message type - log and continue
         logger.debug("Unknown message type", msg_type=msg_type, msg=msg)
         return None
+
+    def _parse_gemini_stream_message(self, msg: Dict) -> Optional[StreamUpdate]:
+        """Parse Gemini stream-json events into unified stream updates."""
+        msg_type = str(msg.get("type") or "").strip()
+
+        if msg_type == "init":
+            return StreamUpdate(
+                type="system",
+                metadata={
+                    "subtype": "init",
+                    "model": msg.get("model"),
+                    "engine": "gemini",
+                },
+                timestamp=msg.get("timestamp"),
+                session_context={"session_id": msg.get("session_id")},
+            )
+
+        if msg_type == "message":
+            role = str(msg.get("role") or "").strip().lower()
+            content = self._extract_gemini_message_content(msg.get("content"))
+            metadata = {"engine": "gemini"}
+            if msg.get("delta") is not None:
+                metadata["delta"] = bool(msg.get("delta"))
+
+            if role == "assistant":
+                return StreamUpdate(
+                    type="assistant",
+                    content=content or None,
+                    metadata=metadata,
+                    timestamp=msg.get("timestamp"),
+                    session_context={"session_id": msg.get("session_id")},
+                )
+            if role == "user":
+                return StreamUpdate(
+                    type="user",
+                    content=content or None,
+                    metadata=metadata,
+                    timestamp=msg.get("timestamp"),
+                    session_context={"session_id": msg.get("session_id")},
+                )
+            return StreamUpdate(
+                type="progress",
+                content=content or None,
+                metadata={"role": role or None, **metadata},
+                timestamp=msg.get("timestamp"),
+                session_context={"session_id": msg.get("session_id")},
+            )
+
+        if msg_type == "tool_use":
+            tool_name = str(msg.get("name") or msg.get("tool_name") or "").strip()
+            tool_input = msg.get("input")
+            if not isinstance(tool_input, dict):
+                tool_input = {}
+            return StreamUpdate(
+                type="progress",
+                content=tool_name or None,
+                tool_calls=(
+                    [{"name": tool_name, "input": tool_input}] if tool_name else None
+                ),
+                metadata={
+                    "subtype": "tool_use",
+                    "engine": "gemini",
+                },
+                timestamp=msg.get("timestamp"),
+                session_context={"session_id": msg.get("session_id")},
+                progress={"operation": "tool_use"},
+            )
+
+        return None
+
+    @staticmethod
+    def _extract_gemini_message_content(value: Any) -> str:
+        """Best-effort flatten Gemini message content payloads."""
+        if isinstance(value, str):
+            return value.strip()
+        if isinstance(value, list):
+            parts = [
+                ClaudeProcessManager._extract_gemini_message_content(item)
+                for item in value
+            ]
+            return "\n".join(part for part in parts if part).strip()
+        if isinstance(value, dict):
+            for key in ("text", "content", "message"):
+                extracted = ClaudeProcessManager._extract_gemini_message_content(
+                    value.get(key)
+                )
+                if extracted:
+                    return extracted
+        return ""
 
     def _parse_codex_stream_message(self, msg: Dict) -> Optional[StreamUpdate]:
         """Parse Codex JSONL events into unified stream updates."""
@@ -1180,6 +1341,12 @@ class ClaudeProcessManager:
             return self._parse_codex_result(result, messages)
         if result.get("type") == "turn.failed":
             return self._parse_codex_failed_result(result, messages)
+        if (
+            result.get("type") == "result"
+            and isinstance(result.get("stats"), dict)
+            and "status" in result
+        ):
+            return self._parse_gemini_result(result, messages)
 
         # Extract tools used from messages
         tools_used = []
@@ -1237,6 +1404,84 @@ class ClaudeProcessManager:
             error_type=result.get("subtype") if result.get("is_error") else None,
             tools_used=tools_used,
             model_usage=result.get("modelUsage"),
+        )
+
+    def _parse_gemini_result(
+        self,
+        result: Dict[str, Any],
+        messages: List[Dict[str, Any]],
+    ) -> ClaudeResponse:
+        """Parse Gemini final result payload into unified response."""
+        session_id = str(result.get("session_id") or "").strip()
+        resolved_model = ""
+        assistant_parts: List[str] = []
+        tools_used: List[Dict[str, Any]] = []
+
+        for msg in messages:
+            msg_type = str(msg.get("type") or "").strip()
+            if msg_type == "init" and not session_id:
+                session_id = str(msg.get("session_id") or "").strip()
+                resolved_model = str(msg.get("model") or "").strip() or resolved_model
+                continue
+
+            if msg_type == "message":
+                role = str(msg.get("role") or "").strip().lower()
+                content = self._extract_gemini_message_content(msg.get("content"))
+                if role == "assistant" and content:
+                    assistant_parts.append(content)
+                continue
+
+            if msg_type == "tool_use":
+                tool_name = str(msg.get("name") or msg.get("tool_name") or "").strip()
+                if tool_name:
+                    tools_used.append(
+                        {
+                            "name": tool_name,
+                            "timestamp": msg.get("timestamp"),
+                        }
+                    )
+
+        stats = result.get("stats")
+        if not isinstance(stats, dict):
+            stats = {}
+
+        model_usage = {
+            "resolvedModel": resolved_model or None,
+            "inputTokens": int(stats.get("input_tokens", stats.get("input", 0)) or 0),
+            "outputTokens": int(
+                stats.get("output_tokens", stats.get("output", 0)) or 0
+            ),
+            "cacheReadInputTokens": int(stats.get("cached", 0) or 0),
+            "cacheCreationInputTokens": 0,
+            "total_tokens": int(stats.get("total_tokens", 0) or 0),
+        }
+        if not model_usage["resolvedModel"]:
+            model_usage.pop("resolvedModel")
+
+        content = "\n".join(part for part in assistant_parts if part).strip()
+        if not content:
+            status = str(result.get("status") or "").strip()
+            if status and status.lower() != "success":
+                content = status
+
+        is_error = str(result.get("status") or "").strip().lower() not in {
+            "",
+            "success",
+        }
+        error_type = None
+        if is_error:
+            error_type = str(result.get("status") or "").strip() or None
+
+        return ClaudeResponse(
+            content=content,
+            session_id=session_id,
+            cost=0.0,
+            duration_ms=int(stats.get("duration_ms", 0) or 0),
+            num_turns=1,
+            is_error=is_error,
+            error_type=error_type,
+            tools_used=tools_used,
+            model_usage=model_usage,
         )
 
     def _parse_codex_result(self, result: Dict, messages: List[Dict]) -> ClaudeResponse:

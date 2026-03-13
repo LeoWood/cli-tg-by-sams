@@ -27,6 +27,7 @@ from ..inbound_task_queue import InboundTaskQueue, QueueFullError
 from ..utils.cli_engine import (
     ENGINE_CLAUDE,
     ENGINE_CODEX,
+    ENGINE_GEMINI,
     get_cli_integration,
     get_engine_primary_status_command,
     normalize_cli_engine,
@@ -135,9 +136,7 @@ _NEGATIVE_REACTION_TOKENS = {
 _BOT_REACTION_PROCESSING = "👀"
 _BOT_REACTION_SUCCESS = "👍"
 _BOT_REACTION_FAILED = "👎"
-_TELEGRAM_REMOTE_CONTEXT_HINT = (
-    "Telegram remote session. User is not on this machine."
-)
+_TELEGRAM_REMOTE_CONTEXT_HINT = "Telegram remote session. User is not on this machine."
 
 
 def _escape_md(text: str) -> str:
@@ -778,20 +777,24 @@ def _stream_engine_label(update_obj: Any) -> str:
     engine = str(metadata.get("engine") or "").strip().lower()
     if engine == "codex":
         return "Codex"
+    if engine == "gemini":
+        return "Gemini"
     return "Claude"
 
 
 def _engine_label(engine: str | None) -> str:
     """Render normalized engine label for user-facing messages."""
-    normalized = normalize_cli_engine(engine)
+    normalized = str(engine or "").strip().lower()
     if normalized == ENGINE_CODEX:
         return "Codex"
+    if normalized == ENGINE_GEMINI:
+        return "Gemini"
     return "Claude"
 
 
 def _engine_badge(engine: str | None) -> str:
     """Render a compact engine badge for Telegram message bubbles."""
-    normalized = normalize_cli_engine(engine)
+    normalized = str(engine or "").strip().lower()
     marker = "⬜" if normalized == ENGINE_CODEX else "🟧"
     return f"{marker} `{_engine_label(normalized)} CLI`"
 
@@ -868,7 +871,7 @@ def _detect_integration_cli_kind(cli_integration: Any | None) -> str | None:
         detected = str(detect_cli_kind(resolve_cli_path()) or "").strip().lower()
     except Exception:
         return None
-    if detected in {"claude", "codex"}:
+    if detected in {"claude", "codex", "gemini"}:
         return detected
     return None
 
@@ -887,7 +890,7 @@ def _resolve_model_override(
         detected_kind = _detect_integration_cli_kind(cli_integration)
         if detected_kind:
             normalized_engine = normalize_cli_engine(detected_kind)
-    if normalized_engine == ENGINE_CODEX:
+    if normalized_engine in {ENGINE_CODEX, ENGINE_GEMINI}:
         return selected_model
     if _is_claude_model_name(selected_model):
         return selected_model
@@ -1576,8 +1579,18 @@ async def _format_progress_update(update_obj) -> Optional[str]:
 
     elif update_obj.type == "system":
         metadata = update_obj.metadata or {}
-        # Keep system init/model selection updates silent to reduce default prefix noise.
-        if metadata.get("subtype") in {"init", "model_resolved"}:
+        if metadata.get("subtype") == "init":
+            engine_label = _stream_engine_label(update_obj)
+            tools = metadata.get("tools")
+            tool_count = len(tools) if isinstance(tools, list) else 0
+            return (
+                f"🚀 *{engine_label} is preparing your request* "
+                f"with {tool_count} tools available"
+            )
+        if metadata.get("subtype") == "model_resolved":
+            model = str(metadata.get("model") or "").strip()
+            if model:
+                return f"🧠 *Using model:* {_escape_md(model)}"
             return None
 
     return None
@@ -1932,9 +1945,10 @@ def _resolve_collapsed_fallback_model(
     if usage_model:
         return usage_model
 
-    if normalize_cli_engine(active_engine) == ENGINE_CODEX and isinstance(
-        codex_snapshot, dict
-    ):
+    if normalize_cli_engine(active_engine) in {
+        ENGINE_CODEX,
+        ENGINE_GEMINI,
+    } and isinstance(codex_snapshot, dict):
         resolved_model = str(codex_snapshot.get("resolved_model") or "").strip()
         if resolved_model:
             return resolved_model
@@ -1942,7 +1956,7 @@ def _resolve_collapsed_fallback_model(
     selected_model = str(scope_state.get("claude_model") or "").strip()
     if not selected_model:
         return None
-    if normalize_cli_engine(active_engine) == ENGINE_CODEX:
+    if normalize_cli_engine(active_engine) in {ENGINE_CODEX, ENGINE_GEMINI}:
         return selected_model
     if _is_claude_model_name(selected_model):
         return selected_model

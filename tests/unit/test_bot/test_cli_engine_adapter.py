@@ -25,8 +25,13 @@ from src.bot.handlers.command import (
     switch_engine,
 )
 from src.bot.resume_tokens import ResumeTokenManager
-from src.bot.utils import codex_models
-from src.bot.utils.cli_engine import ENGINE_CODEX, ENGINE_STATE_KEY, get_cli_integration
+from src.bot.utils import codex_models, gemini_models
+from src.bot.utils.cli_engine import (
+    ENGINE_CODEX,
+    ENGINE_GEMINI,
+    ENGINE_STATE_KEY,
+    get_cli_integration,
+)
 from src.services.session_service import SessionService
 
 
@@ -67,6 +72,15 @@ def _stable_codex_model_candidates(monkeypatch):
         codex_models,
         "discover_codex_model_candidates",
         _fake_discover,
+    )
+    monkeypatch.setattr(
+        gemini_models,
+        "discover_gemini_model_candidates",
+        lambda **_: [
+            "gemini-3.1-pro-preview",
+            "gemini-2.5-pro",
+            "gemini-2.5-flash",
+        ],
     )
 
 
@@ -500,6 +514,50 @@ async def test_model_command_codex_formats_reasoning_effort_from_snapshot(
 
 
 @pytest.mark.asyncio
+async def test_model_command_shows_keyboard_for_gemini_engine(tmp_path, monkeypatch):
+    """Gemini /model without args should render runtime model and keyboard."""
+    approved = tmp_path / "approved"
+    approved.mkdir()
+    user_id = 10047
+    scope_key = _scope_key(user_id, user_id)
+    update = SimpleNamespace(
+        effective_user=SimpleNamespace(id=user_id),
+        effective_chat=SimpleNamespace(id=user_id),
+        effective_message=SimpleNamespace(message_thread_id=None),
+        message=SimpleNamespace(reply_text=AsyncMock()),
+    )
+    context = SimpleNamespace(
+        args=[],
+        bot_data={"settings": _build_settings(approved)},
+        user_data={
+            "scope_state": {
+                scope_key: {
+                    ENGINE_STATE_KEY: ENGINE_GEMINI,
+                    "claude_session_id": "gemini-session-1",
+                }
+            }
+        },
+    )
+    monkeypatch.setattr(
+        SessionService,
+        "_probe_gemini_session_snapshot",
+        staticmethod(lambda _sid: {"resolved_model": "gemini-3.1-pro-preview"}),
+    )
+
+    await model_command(update, context)
+
+    rendered = update.message.reply_text.await_args.args[0]
+    assert "当前引擎：`gemini`" in rendered
+    assert "当前模型：`gemini-3.1-pro-preview`" in rendered
+    keyboard = update.message.reply_text.await_args.kwargs[
+        "reply_markup"
+    ].inline_keyboard
+    callback_ids = [btn.callback_data for row in keyboard for btn in row]
+    assert "model:gemini:gemini-3.1-pro-preview" in callback_ids
+    assert "model:gemini:default" in callback_ids
+
+
+@pytest.mark.asyncio
 async def test_effort_command_shows_switch_hint_for_codex_engine(tmp_path):
     """Codex /effort without args should show current effort and switch hint."""
     approved = tmp_path / "approved"
@@ -705,6 +763,37 @@ async def test_model_callback_sets_model_for_codex_engine(tmp_path):
     keyboard = query.edit_message_text.await_args.kwargs["reply_markup"].inline_keyboard
     callback_ids = [btn.callback_data for row in keyboard for btn in row]
     assert "model:codex:default" in callback_ids
+
+
+@pytest.mark.asyncio
+async def test_model_callback_sets_model_for_gemini_engine(tmp_path):
+    """Gemini model callback should persist model and refresh keyboard."""
+    approved = tmp_path / "approved"
+    approved.mkdir()
+    user_id = 10064
+    scope_key = _scope_key(user_id, user_id)
+    query = SimpleNamespace(
+        from_user=SimpleNamespace(id=user_id),
+        message=SimpleNamespace(
+            chat=SimpleNamespace(id=user_id), message_thread_id=None
+        ),
+        edit_message_text=AsyncMock(),
+    )
+    context = SimpleNamespace(
+        bot_data={"settings": _build_settings(approved)},
+        user_data={"scope_state": {scope_key: {ENGINE_STATE_KEY: ENGINE_GEMINI}}},
+    )
+
+    await handle_model_callback(query, "gemini:gemini-2.5-pro", context)
+
+    scope_state = context.user_data["scope_state"][scope_key]
+    assert scope_state["claude_model"] == "gemini-2.5-pro"
+    rendered = query.edit_message_text.await_args.args[0]
+    assert "已更新 Gemini 模型设置" in rendered
+    assert "当前设置：`gemini-2.5-pro`" in rendered
+    keyboard = query.edit_message_text.await_args.kwargs["reply_markup"].inline_keyboard
+    callback_ids = [btn.callback_data for row in keyboard for btn in row]
+    assert "model:gemini:default" in callback_ids
 
 
 @pytest.mark.asyncio

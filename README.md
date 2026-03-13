@@ -90,6 +90,10 @@ ALLOWED_USERS=<你的 Telegram User ID>
 ENABLE_CODEX_CLI=true
 CODEX_CLI_PATH=/opt/homebrew/bin/codex
 
+# === 可选：Gemini 备选引擎 ===
+ENABLE_GEMINI_CLI=false
+GEMINI_CLI_PATH=/opt/homebrew/bin/gemini
+
 # 建议默认 false，避免 MCP 启动卡顿；需要 MCP 工具时再临时打开
 CODEX_ENABLE_MCP=false
 
@@ -182,15 +186,16 @@ claude auth status
 |------|------|------|
 | `/start` | 显示欢迎页与快捷入口 | 全部 |
 | `/help` | 查看完整命令说明 | 全部 |
-| `/engine [claude\|codex]` | 切换 CLI 引擎（也可不带参数走按钮） | 全部 |
+| `/engine [claude\|codex\|gemini]` | 切换 CLI 引擎（也可不带参数走按钮） | 全部 |
 | `/resume` | 恢复最近会话（默认按当前目录直达） | 全部 |
 | `/new` | 清除当前绑定并新建会话 | 全部 |
 | `/continue [message]` | 显式续接当前会话 | 全部 |
 | `/end` | 结束当前会话 | 全部 |
 | `/context [full]` | 查看会话上下文与用量 | 全部（Claude 主展示） |
-| `/status [full]` | `/context` 的兼容别名 | 全部（Codex 主展示） |
+| `/status [full]` | `/context` 的兼容别名 | 全部（Codex/Gemini 主展示） |
 | `/model` | Claude：按钮切换 Sonnet/Opus/Haiku | Claude |
 | `/model [name\|default]` | Codex：设置/清除 `--model` | Codex |
+| `/model [name\|default]` | Gemini：设置/清除 `--model` | Gemini |
 | `/effort [low\|medium\|high\|xhigh\|default]` | Codex：设置/清除思考深度 | Codex |
 | `/codexdiag [root\|<session_id>]` | 诊断 Codex MCP 调用情况 | Codex |
 | `/cd <path>` | 切换目录（带安全校验） | 全部 |
@@ -273,7 +278,9 @@ claude auth status
 | `ModuleNotFoundError` | 依赖未安装 | `poetry install` |
 | `No such file: claude` | CLI 路径错误 | 检查 `.env` 中 `CLAUDE_CLI_PATH` |
 | `ENABLE_CODEX_CLI is true but codex binary not found` | 未安装 Codex CLI 或路径错误 | 安装 Codex CLI，或在 `.env` 中设置 `CODEX_CLI_PATH` |
+| `ENABLE_GEMINI_CLI is true but gemini binary not found` | 未安装 Gemini CLI 或路径错误 | 安装 Gemini CLI，或在 `.env` 中设置 `GEMINI_CLI_PATH` |
 | `codex: command not found` | Codex CLI 未安装或不在 PATH | 安装 Codex CLI，并确保 `which codex` 有输出 |
+| `gemini: command not found` | Gemini CLI 未安装或不在 PATH | 安装 Gemini CLI，并确保 `which gemini` 有输出 |
 | `codex login status` 显示未登录 | Codex 认证未完成 | 执行 `codex login` 完成认证 |
 | `Can't parse entities` | 消息格式解析失败 | 检查响应中的特殊字符转义 |
 | `Authentication failed` | User ID 不在白名单 | 检查 `ALLOWED_USERS` |

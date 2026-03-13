@@ -600,6 +600,7 @@ class ClaudeCodeBot:
             ("dequeue", command.dequeue_command),
             ("restartbot", command.restart_bot_command),
             ("opsstatus", command.ops_status_command),
+            ("stats", command.stats_command),
             ("resume", command.resume_command),
             ("model", command.model_command),
             ("effort", command.effort_command),

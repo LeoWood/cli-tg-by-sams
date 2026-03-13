@@ -7,7 +7,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from .cli_engine import ENGINE_CODEX, normalize_cli_engine
+from .cli_engine import ENGINE_CODEX, ENGINE_GEMINI, normalize_cli_engine
 
 
 @dataclass(frozen=True)
@@ -103,6 +103,46 @@ def _parse_codex_record(record: dict[str, Any]) -> ResumeHistoryMessage | None:
         return None
 
     return None
+
+
+def _parse_recent_history_from_gemini_json(
+    *,
+    session_file: Path,
+    limit: int,
+) -> list[ResumeHistoryMessage]:
+    """Parse recent chat messages from one Gemini session JSON file."""
+    try:
+        raw = json.loads(session_file.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return []
+
+    messages = raw.get("messages")
+    if not isinstance(messages, list):
+        return []
+
+    parsed: list[ResumeHistoryMessage] = []
+    for message in messages:
+        if not isinstance(message, dict):
+            continue
+
+        role = str(message.get("type") or "").strip().lower()
+        if role == "gemini":
+            normalized_role = "assistant"
+        elif role == "user":
+            normalized_role = "user"
+        else:
+            continue
+
+        content = _sanitize_text(_extract_text(message.get("content")))
+        if not content:
+            continue
+        parsed.append(ResumeHistoryMessage(role=normalized_role, content=content))
+
+    if not parsed:
+        return []
+
+    safe_limit = max(1, min(limit, 20))
+    return parsed[-safe_limit:]
 
 
 def _read_tail_lines(
@@ -286,6 +326,12 @@ async def load_resume_history_preview(
     )
     if session_file is None:
         return []
+
+    if normalize_cli_engine(engine) == ENGINE_GEMINI or session_file.suffix == ".json":
+        return _parse_recent_history_from_gemini_json(
+            session_file=session_file,
+            limit=safe_limit,
+        )
 
     return _parse_recent_history_from_jsonl(
         session_file=session_file,

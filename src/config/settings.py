@@ -84,6 +84,10 @@ class Settings(BaseSettings):
         False,
         description="Enable Codex CLI adapter (subprocess mode)",
     )
+    enable_gemini_cli: bool = Field(
+        False,
+        description="Enable Gemini CLI adapter (subprocess mode)",
+    )
     codex_enable_mcp: bool = Field(
         False,
         description="Enable MCP servers for Codex CLI sessions",
@@ -91,6 +95,14 @@ class Settings(BaseSettings):
     codex_cli_path: Optional[str] = Field(
         None,
         description="Path to Codex CLI executable",
+    )
+    gemini_cli_path: Optional[str] = Field(
+        None,
+        description="Path to Gemini CLI executable",
+    )
+    gemini_approval_mode: str = Field(
+        "yolo",
+        description="Gemini CLI approval mode for headless subprocess runs",
     )
     claude_allowed_tools: Optional[List[str]] = Field(
         default=[

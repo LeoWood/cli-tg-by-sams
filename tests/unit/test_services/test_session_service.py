@@ -369,6 +369,67 @@ async def test_build_context_snapshot_codex_prefers_runtime_model_over_stale_sta
     assert "Model: `gpt-5.3-codex (X High)`" in rendered
 
 
+@pytest.mark.asyncio
+async def test_build_context_snapshot_gemini_uses_local_session_usage(monkeypatch):
+    """Gemini /status should render local session model usage from session JSON."""
+    approved = Path("/tmp/project")
+    process_manager = SimpleNamespace(
+        _resolve_cli_path=lambda: "/opt/homebrew/bin/gemini",
+        _detect_cli_kind=lambda _: "gemini",
+    )
+    claude_integration = SimpleNamespace(
+        process_manager=process_manager,
+        get_precise_context_usage=AsyncMock(return_value=None),
+        get_session_info=AsyncMock(
+            return_value={
+                "messages": 1,
+                "turns": 1,
+                "cost": 0.0,
+                "model_usage": None,
+            }
+        ),
+    )
+    monkeypatch.setattr(
+        SessionService,
+        "_probe_gemini_session_snapshot",
+        staticmethod(
+            lambda _session_id: {
+                "resolved_model": "gemini-3.1-pro-preview",
+                "messages": 3,
+                "turns": 3,
+                "model_usage": {
+                    "gemini-3.1-pro-preview": {
+                        "resolvedModel": "gemini-3.1-pro-preview",
+                        "inputTokens": 23245,
+                        "outputTokens": 396,
+                        "cacheReadInputTokens": 6278,
+                        "cacheCreationInputTokens": 0,
+                    }
+                },
+            }
+        ),
+    )
+
+    snapshot = await SessionService.build_context_snapshot(
+        user_id=3014,
+        session_id="gemini-session-1",
+        current_dir=approved,
+        approved_directory=approved,
+        current_model="default",
+        claude_integration=claude_integration,
+        allow_precise_context_probe=False,
+    )
+
+    rendered = "\n".join(snapshot.lines)
+    assert "Model: `gemini-3.1-pro-preview`" in rendered
+    assert "Messages: 3" in rendered
+    assert "Turns: 3" in rendered
+    assert "Context (gemini-3.1-pro-preview)" in rendered
+    assert "Tokens: `29,919`" in rendered
+    assert "Input: `23,245` | Output: `396`" in rendered
+    claude_integration.get_precise_context_usage.assert_not_awaited()
+
+
 def test_get_cached_codex_snapshot_respects_ttl(monkeypatch):
     """Cached Codex snapshot should obey TTL before expiring."""
     session_id = "rate-limit-cache"

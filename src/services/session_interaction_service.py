@@ -352,8 +352,8 @@ class SessionInteractionService:
         ],
     ]
     _INTEGRATION_UNAVAILABLE_TEXT = (
-        "❌ **Claude Integration Not Available**\n\n"
-        "Claude integration is not properly configured."
+        "❌ **CLI Integration Not Available**\n\n"
+        "The active CLI engine is not properly configured."
     )
     _CONTEXT_COMMAND_LOADING_TEXT = "⏳ 正在获取会话状态，请稍候..."
     _CONTEXT_CALLBACK_LOADING_TEXT = "**Session Context**\n\n⏳ 正在刷新状态，请稍候..."
@@ -380,6 +380,8 @@ class SessionInteractionService:
             return "New Claude Session"
         if normalized == "codex":
             return "New Codex Session"
+        if normalized == "gemini":
+            return "New Gemini Session"
         return "New AI Session"
 
     def get_integration_unavailable_text(self) -> str:
@@ -622,7 +624,7 @@ class SessionInteractionService:
             return SessionInteractionMessage(
                 text=(
                     "ℹ️ **No Active Session**\n\n"
-                    "There's no active Claude session to end.\n\n"
+                    "There's no active CLI session to end.\n\n"
                     "**What you can do:**\n"
                     "• Use the buttons below for next actions\n"
                     "• Check your session status/context\n"
@@ -634,7 +636,7 @@ class SessionInteractionService:
         return SessionInteractionMessage(
             text=(
                 "ℹ️ **No Active Session**\n\n"
-                "There's no active Claude session to end.\n\n"
+                "There's no active CLI session to end.\n\n"
                 "**What you can do:**\n"
                 "• Use `/new` to start a new session\n"
                 "• Use `/context` to check your session context\n"
@@ -668,7 +670,7 @@ class SessionInteractionService:
         return SessionInteractionMessage(
             text=(
                 f"✅ **{title}**\n\n"
-                "Your Claude session has been terminated.\n\n"
+                "Your CLI session has been terminated.\n\n"
                 "**Current Status:**\n"
                 f"• Directory: `{relative_path}`\n"
                 "• Session: None\n"
@@ -711,7 +713,7 @@ class SessionInteractionService:
         if for_callback:
             text = (
                 "❌ **No Session Found**\n\n"
-                f"No recent Claude session found in this directory.\n"
+                f"No recent CLI session found in this directory.\n"
                 f"Directory: `{self._relative_path_label(current_dir, approved_directory)}`\n\n"
                 f"**What you can do:**\n"
                 f"• Use the buttons below for next actions\n"
@@ -721,7 +723,7 @@ class SessionInteractionService:
         else:
             text = (
                 "❌ **No Session Found**\n\n"
-                f"No recent Claude session found in this directory.\n"
+                f"No recent CLI session found in this directory.\n"
                 f"Directory: `{self._relative_path_label(current_dir, approved_directory)}`\n\n"
                 f"**What you can do:**\n"
                 f"• Use `/new` to start a fresh session\n"

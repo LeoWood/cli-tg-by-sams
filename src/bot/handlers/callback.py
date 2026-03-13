@@ -23,6 +23,7 @@ from ..utils.cli_engine import (
     DEFAULT_CLI_ENGINE,
     ENGINE_CLAUDE,
     ENGINE_CODEX,
+    ENGINE_GEMINI,
     SUPPORTED_CLI_ENGINES,
     get_active_cli_engine,
     get_cli_integration,
@@ -34,6 +35,9 @@ from ..utils.codex_models import (
     build_codex_model_keyboard as _build_codex_model_keyboard,
 )
 from ..utils.command_menu import sync_chat_command_menu
+from ..utils.gemini_models import (
+    build_gemini_model_keyboard as _build_gemini_model_keyboard,
+)
 from ..utils.recent_projects import build_recent_projects_message, scan_recent_projects
 from ..utils.resume_history import ResumeHistoryMessage, load_resume_history_preview
 from ..utils.resume_summary import (
@@ -493,12 +497,20 @@ async def _cleanup_queue_prompt_message(*, query: Any) -> None:
 
 def _resume_engine_label(engine: str) -> str:
     """Render resume engine label."""
-    return "Codex" if engine == ENGINE_CODEX else "Claude"
+    if engine == ENGINE_CODEX:
+        return "Codex"
+    if engine == ENGINE_GEMINI:
+        return "Gemini"
+    return "Claude"
 
 
 def _engine_display_name(engine: str) -> str:
     """Render readable label for engine selector."""
-    return "Codex" if engine == ENGINE_CODEX else "Claude"
+    if engine == ENGINE_CODEX:
+        return "Codex"
+    if engine == ENGINE_GEMINI:
+        return "Gemini"
+    return "Claude"
 
 
 def _escape_markdown(text: str) -> str:
@@ -699,11 +711,15 @@ def _get_or_create_resume_scanner(
 ):
     """Get engine-specific desktop session scanner."""
     from ...bot.utils.codex_resume_scanner import CodexSessionScanner
+    from ...bot.utils.gemini_resume_scanner import GeminiSessionScanner
     from ...claude.desktop_scanner import DesktopSessionScanner
 
-    scanner_key = (
-        "codex_desktop_scanner" if engine == ENGINE_CODEX else "desktop_scanner"
-    )
+    if engine == ENGINE_CODEX:
+        scanner_key = "codex_desktop_scanner"
+    elif engine == ENGINE_GEMINI:
+        scanner_key = "gemini_desktop_scanner"
+    else:
+        scanner_key = "desktop_scanner"
     scanner = context.bot_data.get(scanner_key)
     if scanner is None:
         scanner = (
@@ -712,9 +728,16 @@ def _get_or_create_resume_scanner(
                 cache_ttl_sec=settings.resume_scan_cache_ttl_seconds,
             )
             if engine == ENGINE_CODEX
-            else DesktopSessionScanner(
-                approved_directory=settings.approved_directory,
-                cache_ttl_sec=settings.resume_scan_cache_ttl_seconds,
+            else (
+                GeminiSessionScanner(
+                    approved_directory=settings.approved_directory,
+                    cache_ttl_sec=settings.resume_scan_cache_ttl_seconds,
+                )
+                if engine == ENGINE_GEMINI
+                else DesktopSessionScanner(
+                    approved_directory=settings.approved_directory,
+                    cache_ttl_sec=settings.resume_scan_cache_ttl_seconds,
+                )
             )
         )
         context.bot_data[scanner_key] = scanner
@@ -1164,7 +1187,7 @@ async def _handle_help_action(query, context: ContextTypes.DEFAULT_TYPE) -> None
     """Handle help action."""
     _, scope_state = _get_scope_state_for_query(query, context)
     active_engine = get_active_cli_engine(scope_state)
-    engine_label = "Codex" if active_engine == ENGINE_CODEX else "Claude"
+    engine_label = _engine_display_name(active_engine)
     help_text = (
         "🤖 **Quick Help**\n\n"
         "**Navigation:**\n"
@@ -1635,6 +1658,50 @@ async def handle_model_callback(
         )
         return
 
+    if active_engine == ENGINE_GEMINI:
+        param_norm = str(param or "").strip().lower()
+        if param_norm.startswith("gemini:"):
+            selected_raw = str(param).split(":", 1)[1]
+        else:
+            selected_raw = str(param or "").strip()
+
+        if not selected_raw:
+            await _edit_query_message_resilient(
+                query,
+                "❌ 无效模型参数，请重新执行 `/model` 选择。",
+                parse_mode="Markdown",
+            )
+            return
+
+        if selected_raw.lower() in {"default", "clear", "reset", "auto"}:
+            scope_state.pop("claude_model", None)
+            selected = "default"
+        else:
+            selected = selected_raw.replace("`", "")
+            scope_state["claude_model"] = selected
+
+        session_id = str(scope_state.get("claude_session_id") or "").strip()
+        resolved_model = ""
+        if session_id:
+            gemini_snapshot = SessionService._probe_gemini_session_snapshot(session_id)
+            if isinstance(gemini_snapshot, dict):
+                resolved_model = str(
+                    gemini_snapshot.get("resolved_model") or ""
+                ).strip()
+
+        await _edit_query_message_resilient(
+            query,
+            "✅ 已更新 Gemini 模型设置。\n"
+            f"当前设置：`{selected}`\n\n"
+            "你也可以手动输入：`/model <model_name>`",
+            parse_mode="Markdown",
+            reply_markup=_build_gemini_model_keyboard(
+                selected_model=str(scope_state.get("claude_model") or "").strip(),
+                resolved_model=resolved_model,
+            ),
+        )
+        return
+
     capabilities = get_engine_capabilities(active_engine)
     if not capabilities.supports_model_selection:
         await _edit_query_message_resilient(
@@ -1651,6 +1718,14 @@ async def handle_model_callback(
         await _edit_query_message_resilient(
             query,
             "ℹ️ 当前引擎：`claude`\n" "请使用 Claude 模型按钮，或手动执行 `/model`。",
+            parse_mode="Markdown",
+        )
+        return
+    if param_norm.startswith("gemini:"):
+        await _edit_query_message_resilient(
+            query,
+            "ℹ️ 当前引擎：`claude`\n"
+            "请先切换：`/engine gemini`，再使用 Gemini 模型按钮。",
             parse_mode="Markdown",
         )
         return
@@ -2059,7 +2134,7 @@ async def _handle_start_coding_action(
     """Handle start coding action."""
     _, scope_state = _get_scope_state_for_query(query, context)
     active_engine = str(scope_state.get("cli_engine") or ENGINE_CODEX).strip().lower()
-    engine_label = "Codex" if active_engine == ENGINE_CODEX else "Claude"
+    engine_label = _engine_display_name(active_engine)
 
     await _edit_query_message_resilient(
         query,

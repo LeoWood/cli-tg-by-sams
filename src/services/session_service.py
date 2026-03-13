@@ -36,6 +36,8 @@ class SessionService:
 
     _codex_snapshot_cache: Dict[str, tuple[float, Dict[str, Any]]] = {}
     _codex_snapshot_ttl_seconds = 5
+    _gemini_snapshot_cache: Dict[str, tuple[float, Dict[str, Any]]] = {}
+    _gemini_snapshot_ttl_seconds = 5
     _codex_global_rate_limits_cache: Optional[tuple[float, Dict[str, Any]]] = None
     _codex_global_rate_limits_ttl_seconds = 0
 
@@ -45,7 +47,7 @@ class SessionService:
 
     @staticmethod
     def _resolve_cli_kind(claude_integration: Any) -> str:
-        """Best-effort resolve current CLI kind (`claude`/`codex`)."""
+        """Best-effort resolve current CLI kind (`claude`/`codex`/`gemini`)."""
         process_manager = getattr(claude_integration, "process_manager", None)
         resolve_cli_path = getattr(process_manager, "_resolve_cli_path", None)
         detect_cli_kind = getattr(process_manager, "_detect_cli_kind", None)
@@ -54,7 +56,7 @@ class SessionService:
                 detected = (
                     str(detect_cli_kind(resolve_cli_path()) or "").strip().lower()
                 )
-                if detected in {"claude", "codex"}:
+                if detected in {"claude", "codex", "gemini"}:
                     return detected
             except Exception:
                 pass
@@ -369,6 +371,102 @@ class SessionService:
         SessionService._codex_snapshot_cache[sid] = (now, dict(snapshot))
         return snapshot
 
+    @staticmethod
+    def _probe_gemini_session_snapshot(session_id: str) -> Optional[Dict[str, Any]]:
+        """Read latest Gemini local session snapshot for model and token usage."""
+        sid = str(session_id or "").strip()
+        if not sid:
+            return None
+
+        now = time.monotonic()
+        cache_entry = SessionService._gemini_snapshot_cache.get(sid)
+        if cache_entry:
+            cached_at, cached_snapshot = cache_entry
+            if now - cached_at <= SessionService._gemini_snapshot_ttl_seconds:
+                return dict(cached_snapshot)
+
+        sessions_root = Path.home() / ".gemini" / "tmp"
+        if not sessions_root.is_dir():
+            return None
+
+        latest_payload: Optional[Dict[str, Any]] = None
+        latest_mtime = -1.0
+        try:
+            candidates = sessions_root.rglob("session-*.json")
+        except OSError:
+            return None
+
+        for candidate in candidates:
+            try:
+                raw = json.loads(candidate.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError):
+                continue
+            if not isinstance(raw, dict):
+                continue
+            if str(raw.get("sessionId") or "").strip() != sid:
+                continue
+            try:
+                mtime = candidate.stat().st_mtime
+            except OSError:
+                mtime = 0.0
+            if mtime >= latest_mtime:
+                latest_payload = raw
+                latest_mtime = mtime
+
+        if not latest_payload:
+            return None
+
+        messages = latest_payload.get("messages")
+        if not isinstance(messages, list):
+            return None
+
+        model_usage: Dict[str, Dict[str, Any]] = {}
+        resolved_model = ""
+        user_turns = 0
+        assistant_turns = 0
+
+        for message in messages:
+            if not isinstance(message, dict):
+                continue
+
+            msg_type = str(message.get("type") or "").strip().lower()
+            if msg_type == "user":
+                user_turns += 1
+                continue
+            if msg_type != "gemini":
+                continue
+
+            assistant_turns += 1
+            model_name = str(message.get("model") or "").strip() or "gemini"
+            resolved_model = model_name
+            entry = model_usage.setdefault(
+                model_name,
+                {
+                    "resolvedModel": model_name,
+                    "inputTokens": 0,
+                    "outputTokens": 0,
+                    "cacheReadInputTokens": 0,
+                    "cacheCreationInputTokens": 0,
+                },
+            )
+            tokens = message.get("tokens")
+            if not isinstance(tokens, dict):
+                continue
+            entry["inputTokens"] += int(tokens.get("input", 0) or 0)
+            entry["outputTokens"] += int(tokens.get("output", 0) or 0)
+            entry["cacheReadInputTokens"] += int(tokens.get("cached", 0) or 0)
+
+        snapshot = {
+            "session_id": sid,
+            "resolved_model": resolved_model,
+            "model_usage": model_usage,
+            "messages": len(messages),
+            "turns": max(user_turns, assistant_turns),
+            "last_updated": latest_payload.get("lastUpdated"),
+        }
+        SessionService._gemini_snapshot_cache[sid] = (now, dict(snapshot))
+        return snapshot
+
     @classmethod
     def _probe_latest_codex_global_rate_limits(cls) -> Optional[Dict[str, Any]]:
         """Read the newest available Codex rate-limit snapshot across all sessions."""
@@ -611,6 +709,7 @@ class SessionService:
             if claude_integration:
                 codex_local_snapshot: Optional[Dict[str, Any]] = None
                 codex_global_rate_limits: Optional[Dict[str, Any]] = None
+                gemini_local_snapshot: Optional[Dict[str, Any]] = None
                 live_precise_context: Optional[Dict[str, Any]] = None
                 if cli_kind == "codex":
                     codex_local_snapshot = SessionService._probe_codex_session_snapshot(
@@ -618,6 +717,10 @@ class SessionService:
                     )
                     codex_global_rate_limits = (
                         SessionService._probe_latest_codex_global_rate_limits()
+                    )
+                elif cli_kind == "gemini":
+                    gemini_local_snapshot = (
+                        SessionService._probe_gemini_session_snapshot(session_id)
                     )
 
                 if allow_precise_context_probe and cli_kind != "codex":
@@ -701,6 +804,23 @@ class SessionService:
                     lines.extend(build_precise_context_status_lines(precise_context))
 
                 session_info = await claude_integration.get_session_info(session_id)
+                if isinstance(gemini_local_snapshot, dict):
+                    if not isinstance(session_info, dict):
+                        session_info = {}
+
+                    current_messages = int(session_info.get("messages", 0) or 0)
+                    current_turns = int(session_info.get("turns", 0) or 0)
+                    local_messages = int(gemini_local_snapshot.get("messages", 0) or 0)
+                    local_turns = int(gemini_local_snapshot.get("turns", 0) or 0)
+
+                    session_info["messages"] = max(current_messages, local_messages)
+                    session_info["turns"] = max(current_turns, local_turns)
+                    session_info["cost"] = session_info.get("cost", 0.0)
+
+                    local_model_usage = gemini_local_snapshot.get("model_usage")
+                    if isinstance(local_model_usage, dict) and local_model_usage:
+                        session_info["model_usage"] = local_model_usage
+
                 if session_info:
                     lines.append(f"Messages: {session_info.get('messages', 0)}")
                     lines.append(f"Turns: {session_info.get('turns', 0)}")
