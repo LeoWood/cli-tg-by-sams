@@ -467,17 +467,63 @@ async def test_start_process_unsets_claudecode_env(tmp_path, monkeypatch):
     manager = _build_manager(tmp_path)
     monkeypatch.setenv("CLAUDECODE", "nested-session")
 
-    captured_env = {}
+    captured_kwargs = {}
 
     async def _fake_create_subprocess_exec(*args, **kwargs):
-        captured_env.update(kwargs.get("env") or {})
+        captured_kwargs.update(kwargs)
         return SimpleNamespace()
 
     monkeypatch.setattr(asyncio, "create_subprocess_exec", _fake_create_subprocess_exec)
 
     await manager._start_process(["echo", "ok"], tmp_path)
 
+    captured_env = captured_kwargs.get("env") or {}
     assert "CLAUDECODE" not in captured_env
+    assert captured_kwargs["start_new_session"] is True
+
+
+@pytest.mark.asyncio
+async def test_execute_command_kills_process_tree_when_cancelled(
+    tmp_path, monkeypatch
+):
+    """Cancellation should terminate the spawned CLI process tree."""
+    manager = _build_manager(tmp_path)
+    fake_process = SimpleNamespace(pid=4321, returncode=None, stdin=None)
+    terminate_tree = AsyncMock()
+
+    monkeypatch.setattr(manager, "_start_process", AsyncMock(return_value=fake_process))
+    monkeypatch.setattr(
+        manager,
+        "_handle_process_output",
+        AsyncMock(side_effect=asyncio.CancelledError()),
+    )
+    monkeypatch.setattr(manager, "_terminate_process_tree", terminate_tree)
+
+    with pytest.raises(asyncio.CancelledError):
+        await manager.execute_command(
+            prompt="hello",
+            working_directory=tmp_path,
+        )
+
+    terminate_tree.assert_awaited_once_with(fake_process, reason="cancelled")
+    assert manager.active_processes == {}
+
+
+@pytest.mark.asyncio
+async def test_kill_all_processes_uses_tree_termination(tmp_path):
+    """Shutdown cleanup should terminate each tracked subprocess tree."""
+    manager = _build_manager(tmp_path)
+    proc_a = SimpleNamespace(pid=1001, returncode=None)
+    proc_b = SimpleNamespace(pid=1002, returncode=None)
+    manager.active_processes = {"a": proc_a, "b": proc_b}
+    manager._terminate_process_tree = AsyncMock()  # type: ignore[method-assign]
+
+    await manager.kill_all_processes()
+
+    manager._terminate_process_tree.assert_any_await(proc_a, reason="shutdown_cleanup")
+    manager._terminate_process_tree.assert_any_await(proc_b, reason="shutdown_cleanup")
+    assert manager._terminate_process_tree.await_count == 2
+    assert manager.active_processes == {}
 
 
 @pytest.mark.asyncio

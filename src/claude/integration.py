@@ -11,6 +11,7 @@ import asyncio
 import json
 import os
 import re
+import signal
 import uuid
 from asyncio.subprocess import Process
 from collections import deque
@@ -155,6 +156,7 @@ class ClaudeProcessManager:
             continue_session=continue_session,
         )
 
+        process: Optional[Process] = None
         try:
             if cli_kind == "codex":
                 await self._emit_codex_init_updates(
@@ -199,10 +201,8 @@ class ClaudeProcessManager:
             return result
 
         except asyncio.TimeoutError:
-            # Kill process on timeout
-            if process_id in self.active_processes:
-                self.active_processes[process_id].kill()
-                await self.active_processes[process_id].wait()
+            if process is not None:
+                await self._terminate_process_tree(process, reason="timeout")
 
             logger.error(
                 "Claude Code process timed out",
@@ -215,7 +215,15 @@ class ClaudeProcessManager:
                 f"{self.config.claude_timeout_seconds}s"
             )
 
+        except asyncio.CancelledError:
+            if process is not None:
+                await self._terminate_process_tree(process, reason="cancelled")
+            logger.info("Claude Code process cancelled", process_id=process_id)
+            raise
+
         except Exception as e:
+            if process is not None and getattr(process, "returncode", None) is None:
+                await self._terminate_process_tree(process, reason="process_error")
             logger.error(
                 "Claude Code process failed",
                 process_id=process_id,
@@ -472,9 +480,88 @@ class ClaudeProcessManager:
             stderr=asyncio.subprocess.PIPE,
             cwd=str(cwd),
             env=env,
+            # Give each CLI subprocess its own POSIX session so we can
+            # terminate the whole process tree on cancellation/timeouts.
+            start_new_session=(os.name != "nt"),
             # Limit memory usage
             limit=1024 * 1024 * 512,  # 512MB
         )
+
+    async def _terminate_process_tree(
+        self,
+        process: Process,
+        *,
+        reason: str,
+        grace_seconds: float = 3.0,
+    ) -> None:
+        """Terminate the subprocess and any descendants spawned under it."""
+        if getattr(process, "returncode", None) is not None:
+            return
+
+        pid = getattr(process, "pid", None)
+        use_process_group = bool(pid) and os.name != "nt" and hasattr(os, "killpg")
+
+        async def _wait_for_exit() -> bool:
+            try:
+                await asyncio.wait_for(process.wait(), timeout=grace_seconds)
+                return True
+            except asyncio.TimeoutError:
+                return False
+
+        def _send_terminate() -> None:
+            if use_process_group:
+                os.killpg(pid, signal.SIGTERM)
+                return
+            terminate = getattr(process, "terminate", None)
+            if callable(terminate):
+                terminate()
+                return
+            kill = getattr(process, "kill", None)
+            if callable(kill):
+                kill()
+
+        def _send_kill() -> None:
+            if use_process_group:
+                os.killpg(pid, signal.SIGKILL)
+                return
+            kill = getattr(process, "kill", None)
+            if callable(kill):
+                kill()
+
+        try:
+            _send_terminate()
+        except ProcessLookupError:
+            return
+        except Exception as exc:
+            logger.warning(
+                "Failed to send graceful subprocess termination",
+                pid=pid,
+                reason=reason,
+                error=str(exc),
+            )
+        else:
+            if await _wait_for_exit():
+                return
+
+        try:
+            _send_kill()
+        except ProcessLookupError:
+            return
+        except Exception as exc:
+            logger.warning(
+                "Failed to force-kill subprocess tree",
+                pid=pid,
+                reason=reason,
+                error=str(exc),
+            )
+            return
+
+        if not await _wait_for_exit():
+            logger.warning(
+                "Subprocess tree did not exit after forced kill",
+                pid=pid,
+                reason=reason,
+            )
 
     async def _handle_process_output(
         self,
@@ -522,8 +609,10 @@ class ClaudeProcessManager:
                             update_type=update.type,
                         )
                         if process.returncode is None:
-                            process.kill()
-                            await process.wait()
+                            await self._terminate_process_tree(
+                                process,
+                                reason="tool_validation_abort",
+                            )
                         raise
                     except Exception as e:
                         logger.warning(
@@ -1303,10 +1392,12 @@ class ClaudeProcessManager:
             "Killing all active Claude processes", count=len(self.active_processes)
         )
 
-        for process_id, process in self.active_processes.items():
+        for process_id, process in list(self.active_processes.items()):
             try:
-                process.kill()
-                await process.wait()
+                await self._terminate_process_tree(
+                    process,
+                    reason="shutdown_cleanup",
+                )
                 logger.info("Killed Claude process", process_id=process_id)
             except Exception as e:
                 logger.warning(

@@ -6,9 +6,11 @@ import math
 import threading
 import time
 from dataclasses import dataclass, field
+from html import escape
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any, Mapping, Optional, Sequence
+from urllib.parse import parse_qs, urlsplit
 
 import structlog
 
@@ -86,6 +88,18 @@ class _MetricState:
     definition: _MetricDefinition
     samples: dict[tuple[str, ...], float] = field(default_factory=dict)
     histograms: dict[tuple[str, ...], _HistogramSeries] = field(default_factory=dict)
+
+
+@dataclass(frozen=True)
+class _LatencySummaryRow:
+    """Presentation-friendly snapshot for one latency series."""
+
+    label: str
+    engine: str
+    count: int
+    avg_seconds: float
+    p50_seconds: Optional[float]
+    p90_seconds: Optional[float]
 
 
 class RuntimeMetrics:
@@ -335,12 +349,23 @@ class RuntimeMetrics:
 
             class _Handler(BaseHTTPRequestHandler):
                 def do_GET(self) -> None:  # noqa: N802
-                    if self.path == "/metrics":
+                    parsed_url = urlsplit(self.path)
+                    if parsed_url.path == "/metrics":
                         payload = registry.render_prometheus_text().encode("utf-8")
                         content_type = "text/plain; version=0.0.4; charset=utf-8"
-                    elif self.path == "/metricsz":
-                        payload = registry.render_human_summary().encode("utf-8")
-                        content_type = "text/plain; charset=utf-8"
+                    elif parsed_url.path == "/metricsz":
+                        summary_format = registry._select_summary_response_format(
+                            query_string=parsed_url.query,
+                            accept_header=self.headers.get("Accept"),
+                        )
+                        if summary_format == "html":
+                            payload = registry.render_human_summary_html().encode(
+                                "utf-8"
+                            )
+                            content_type = "text/html; charset=utf-8"
+                        else:
+                            payload = registry.render_human_summary().encode("utf-8")
+                            content_type = "text/plain; charset=utf-8"
                     else:
                         self.send_response(HTTPStatus.NOT_FOUND)
                         self.send_header("Content-Type", "text/plain; charset=utf-8")
@@ -350,6 +375,7 @@ class RuntimeMetrics:
 
                     self.send_response(HTTPStatus.OK)
                     self.send_header("Content-Type", content_type)
+                    self.send_header("Cache-Control", "no-store")
                     self.send_header("Content-Length", str(len(payload)))
                     self.end_headers()
                     self.wfile.write(payload)
@@ -626,6 +652,15 @@ class RuntimeMetrics:
     ) -> list[str]:
         """Build human-readable histogram summary lines."""
         lines: list[str] = []
+        for row in self._build_histogram_summary_rows(metric_name, label=label):
+            lines.append(self._format_latency_summary_row(row))
+        return lines
+
+    def _build_histogram_summary_rows(
+        self, metric_name: str, *, label: str
+    ) -> list[_LatencySummaryRow]:
+        """Build presentation-friendly histogram rows."""
+        rows: list[_LatencySummaryRow] = []
         for label_key, series, definition in sorted(
             self._iter_histogram_series(metric_name),
             key=lambda item: item[0],
@@ -640,40 +675,129 @@ class RuntimeMetrics:
             p90 = self._estimate_histogram_quantile(
                 series, buckets=definition.buckets, quantile=0.90
             )
-            summary = (
-                f"- {label} [{engine}]: count={int(series.count)} " f"avg={avg:.2f}s"
+            rows.append(
+                _LatencySummaryRow(
+                    label=label,
+                    engine=engine,
+                    count=int(series.count),
+                    avg_seconds=avg,
+                    p50_seconds=p50,
+                    p90_seconds=p90,
+                )
             )
-            if p50 is not None:
-                summary += f" p50<={p50:.2f}s"
-            if p90 is not None:
-                summary += f" p90<={p90:.2f}s"
-            lines.append(summary)
-        return lines
+        return rows
 
-    def render_human_summary(self) -> str:
-        """Render a compact human-readable metrics summary."""
-        snapshot = self.status_snapshot()
-        success_total = self._aggregate_counter_by_label_value(
-            "clitg_text_requests_total",
-            label_name="result",
-        ).get("success", 0.0)
-        failure_total = self._aggregate_counter_by_label_value(
-            "clitg_text_requests_total",
-            label_name="result",
-        ).get("failure", 0.0)
-        queued_total = sum(
-            self._aggregate_counter_by_label_value(
-                "clitg_text_requests_queued_total",
-                label_name="engine",
-            ).values()
-        )
-        status = (
+    def _summary_status(self, snapshot: Mapping[str, Any]) -> str:
+        """Return overall health status for summary surfaces."""
+        return (
             "healthy"
             if snapshot["bot_running"] >= 1
             and snapshot["polling_up"] >= 1
             and snapshot["storage_up"] >= 1
             else "degraded"
         )
+
+    def _summary_text_request_totals(self) -> dict[str, int]:
+        """Aggregate request counters for summary surfaces."""
+        request_totals = self._aggregate_counter_by_label_value(
+            "clitg_text_requests_total",
+            label_name="result",
+        )
+        queued_total = sum(
+            self._aggregate_counter_by_label_value(
+                "clitg_text_requests_queued_total",
+                label_name="engine",
+            ).values()
+        )
+        return {
+            "success_total": int(request_totals.get("success", 0.0)),
+            "failure_total": int(request_totals.get("failure", 0.0)),
+            "queued_total": int(queued_total),
+        }
+
+    def _format_latency_summary_row(self, row: _LatencySummaryRow) -> str:
+        """Render one latency row for the plain-text summary."""
+        summary = (
+            f"- {row.label} [{row.engine}]: "
+            f"count={row.count} avg={row.avg_seconds:.2f}s"
+        )
+        if row.p50_seconds is not None:
+            summary += f" p50<={row.p50_seconds:.2f}s"
+        if row.p90_seconds is not None:
+            summary += f" p90<={row.p90_seconds:.2f}s"
+        return summary
+
+    def _format_latency_duration(self, value: Optional[float]) -> str:
+        """Render one latency duration for summary views."""
+        if value is None:
+            return "-"
+        return f"{value:.2f}s"
+
+    def _render_latency_table_row(self, row: _LatencySummaryRow) -> str:
+        """Render one latency table row for the HTML dashboard."""
+        return "".join(
+            [
+                "<tr>",
+                f'<td data-label="Metric">{escape(row.label)}</td>',
+                f'<td data-label="Engine">{escape(row.engine)}</td>',
+                f'<td data-label="Count">{row.count}</td>',
+                f'<td data-label="Avg">{row.avg_seconds:.2f}s</td>',
+                (
+                    f'<td data-label="P50">'
+                    f"{self._format_latency_duration(row.p50_seconds)}</td>"
+                ),
+                (
+                    f'<td data-label="P90">'
+                    f"{self._format_latency_duration(row.p90_seconds)}</td>"
+                ),
+                "</tr>",
+            ]
+        )
+
+    def _latency_summary_rows(self) -> list[_LatencySummaryRow]:
+        """Build all latency rows for human-facing summaries."""
+        rows: list[_LatencySummaryRow] = []
+        latency_sections = [
+            (
+                "clitg_text_end_to_first_reply_seconds",
+                "end_to_first_reply",
+            ),
+            ("clitg_text_cli_exec_seconds", "cli_exec"),
+            ("clitg_text_reply_send_seconds", "reply_send"),
+            ("clitg_text_queue_wait_seconds", "queue_wait"),
+            ("clitg_text_preprocess_seconds", "preprocess"),
+            ("clitg_text_telegram_delivery_seconds", "telegram_delivery"),
+        ]
+        for metric_name, label in latency_sections:
+            rows.extend(self._build_histogram_summary_rows(metric_name, label=label))
+        return rows
+
+    def _select_summary_response_format(
+        self,
+        *,
+        query_string: str,
+        accept_header: Optional[str],
+    ) -> str:
+        """Pick HTML for browsers while keeping scripts on plain text."""
+        format_values = parse_qs(query_string).get("format", [])
+        if format_values:
+            requested_format = format_values[0].strip().lower()
+            if requested_format in {"text", "html"}:
+                return requested_format
+
+        normalized_accept = str(accept_header or "").lower()
+        if (
+            "text/html" in normalized_accept
+            or "application/xhtml+xml" in normalized_accept
+        ):
+            return "html"
+        return "text"
+
+    def render_human_summary(self) -> str:
+        """Render a compact human-readable metrics summary."""
+        snapshot = self.status_snapshot()
+        request_totals = self._summary_text_request_totals()
+        status = self._summary_status(snapshot)
 
         lines = [
             f"status: {status}",
@@ -697,32 +821,493 @@ class RuntimeMetrics:
             f"pending_updates: {int(snapshot['pending_update_count'])}",
             "",
             "text_requests:",
-            f"- success_total: {int(success_total)}",
-            f"- failure_total: {int(failure_total)}",
-            f"- queued_total: {int(queued_total)}",
+            f"- success_total: {request_totals['success_total']}",
+            f"- failure_total: {request_totals['failure_total']}",
+            f"- queued_total: {request_totals['queued_total']}",
             "",
             "latency:",
         ]
-        latency_sections = [
-            (
-                "clitg_text_end_to_first_reply_seconds",
-                "end_to_first_reply",
-            ),
-            ("clitg_text_cli_exec_seconds", "cli_exec"),
-            ("clitg_text_reply_send_seconds", "reply_send"),
-            ("clitg_text_queue_wait_seconds", "queue_wait"),
-            ("clitg_text_preprocess_seconds", "preprocess"),
-            ("clitg_text_telegram_delivery_seconds", "telegram_delivery"),
+        latency_lines = [
+            self._format_latency_summary_row(row)
+            for row in self._latency_summary_rows()
         ]
-        for metric_name, label in latency_sections:
-            section_lines = self._build_histogram_summary_lines(
-                metric_name, label=label
-            )
-            if section_lines:
-                lines.extend(section_lines)
+        lines.extend(latency_lines)
         if lines[-1] == "latency:":
             lines.append("- no successful latency samples yet")
         return "\n".join(lines) + "\n"
+
+    def render_human_summary_html(self) -> str:
+        """Render a browser-friendly summary dashboard."""
+        snapshot = self.status_snapshot()
+        request_totals = self._summary_text_request_totals()
+        latency_rows = self._latency_summary_rows()
+        status = self._summary_status(snapshot)
+        is_healthy = status == "healthy"
+        status_label = "HEALTHY" if is_healthy else "DEGRADED"
+        status_note = (
+            "Bot、轮询和存储都处于正常状态。"
+            if is_healthy
+            else "至少有一个关键运行信号异常，需要检查日志与原始指标。"
+        )
+
+        state_cards = [
+            {
+                "title": "Bot Loop",
+                "value": "Running" if snapshot["bot_running"] >= 1 else "Stopped",
+                "tone": "healthy" if snapshot["bot_running"] >= 1 else "degraded",
+                "detail": "主事件循环",
+            },
+            {
+                "title": "Polling",
+                "value": "Up" if snapshot["polling_up"] >= 1 else "Down",
+                "tone": "healthy" if snapshot["polling_up"] >= 1 else "degraded",
+                "detail": "Telegram 轮询",
+            },
+            {
+                "title": "Storage",
+                "value": "Healthy" if snapshot["storage_up"] >= 1 else "Offline",
+                "tone": "healthy" if snapshot["storage_up"] >= 1 else "degraded",
+                "detail": "存储健康检查",
+            },
+            {
+                "title": "Restart Flag",
+                "value": (
+                    "Requested"
+                    if snapshot["polling_restart_requested"] >= 1
+                    else "Idle"
+                ),
+                "tone": (
+                    "degraded"
+                    if snapshot["polling_restart_requested"] >= 1
+                    else "neutral"
+                ),
+                "detail": "轮询重启请求",
+            },
+        ]
+        runtime_facts = [
+            ("Active tasks", str(int(snapshot["active_tasks"]))),
+            ("CLI processes", str(int(snapshot["cli_active_processes"]))),
+            ("Pending updates", str(int(snapshot["pending_update_count"]))),
+            (
+                "Health probe age",
+                f"{snapshot['last_health_probe_age_seconds']:.2f}s",
+            ),
+            ("Watchdog age", f"{snapshot['watchdog_tick_age_seconds']:.2f}s"),
+            (
+                "Summary format",
+                '<a href="?format=text">text</a> / <a href="?format=html">html</a>',
+            ),
+        ]
+
+        cards_html = "\n".join(
+            (
+                '<article class="state-card">'
+                f'<p class="state-title">{escape(card["title"])}</p>'
+                f'<p class="state-value">{escape(card["value"])}</p>'
+                f'<span class="state-chip {escape(card["tone"])}">'
+                f'{escape(card["detail"])}</span>'
+                "</article>"
+            )
+            for card in state_cards
+        )
+        runtime_html = "\n".join(
+            (
+                "<div class=\"fact-row\">"
+                f"<dt>{escape(label)}</dt>"
+                f"<dd>{value}</dd>"
+                "</div>"
+            )
+            for label, value in runtime_facts
+        )
+        request_cards_html = "\n".join(
+            (
+                '<article class="metric-card">'
+                f'<p class="metric-value">{value}</p>'
+                f'<p class="metric-label">{escape(label)}</p>'
+                "</article>"
+            )
+            for label, value in (
+                ("Success", request_totals["success_total"]),
+                ("Failure", request_totals["failure_total"]),
+                ("Queued", request_totals["queued_total"]),
+            )
+        )
+        if latency_rows:
+            latency_rows_html = "\n".join(
+                self._render_latency_table_row(row) for row in latency_rows
+            )
+            latency_html = (
+                "<table>"
+                "<thead><tr>"
+                "<th>Metric</th><th>Engine</th><th>Count</th>"
+                "<th>Avg</th><th>P50</th><th>P90</th>"
+                "</tr></thead>"
+                f"<tbody>{latency_rows_html}</tbody>"
+                "</table>"
+            )
+        else:
+            latency_html = (
+                '<div class="empty-state">暂无成功请求的延迟样本，先跑一条消息再看。</div>'
+            )
+
+        return f"""<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <meta http-equiv="refresh" content="5">
+    <title>CLI TG Bot Metrics</title>
+    <style>
+        :root {{
+            color-scheme: light;
+            --bg: #eef3f1;
+            --panel: rgba(255, 255, 255, 0.86);
+            --panel-strong: #ffffff;
+            --ink: #14221c;
+            --muted: #607066;
+            --line: rgba(20, 34, 28, 0.10);
+            --accent: #0e8f6f;
+            --accent-soft: rgba(14, 143, 111, 0.12);
+            --danger: #b5442f;
+            --danger-soft: rgba(181, 68, 47, 0.12);
+            --neutral: rgba(20, 34, 28, 0.08);
+            --shadow: 0 18px 50px rgba(31, 45, 39, 0.10);
+        }}
+        * {{
+            box-sizing: border-box;
+        }}
+        body {{
+            margin: 0;
+            font-family: "Avenir Next", "PingFang SC", "Helvetica Neue", sans-serif;
+            color: var(--ink);
+            background:
+                radial-gradient(
+                    circle at top left,
+                    rgba(14, 143, 111, 0.18),
+                    transparent 32%
+                ),
+                radial-gradient(
+                    circle at top right,
+                    rgba(230, 147, 32, 0.12),
+                    transparent 24%
+                ),
+                linear-gradient(180deg, #f7faf8 0%, var(--bg) 100%);
+            min-height: 100vh;
+            padding: 32px 18px 48px;
+        }}
+        main {{
+            max-width: 1180px;
+            margin: 0 auto;
+        }}
+        .hero {{
+            display: flex;
+            justify-content: space-between;
+            gap: 20px;
+            align-items: flex-start;
+            margin-bottom: 20px;
+        }}
+        .hero-copy {{
+            max-width: 760px;
+        }}
+        .eyebrow {{
+            margin: 0 0 10px;
+            font-size: 12px;
+            letter-spacing: 0.14em;
+            text-transform: uppercase;
+            color: var(--muted);
+        }}
+        h1 {{
+            margin: 0;
+            font-size: clamp(30px, 4vw, 44px);
+            line-height: 1.05;
+        }}
+        .hero-copy p {{
+            margin: 12px 0 0;
+            color: var(--muted);
+            font-size: 15px;
+        }}
+        .status-pill {{
+            flex-shrink: 0;
+            border-radius: 999px;
+            padding: 12px 18px;
+            font-size: 13px;
+            letter-spacing: 0.08em;
+            font-weight: 700;
+            text-transform: uppercase;
+            border: 1px solid transparent;
+        }}
+        .status-pill.healthy {{
+            color: var(--accent);
+            background: var(--accent-soft);
+            border-color: rgba(14, 143, 111, 0.18);
+        }}
+        .status-pill.degraded {{
+            color: var(--danger);
+            background: var(--danger-soft);
+            border-color: rgba(181, 68, 47, 0.18);
+        }}
+        .panel {{
+            background: var(--panel);
+            backdrop-filter: blur(16px);
+            border: 1px solid rgba(255, 255, 255, 0.7);
+            border-radius: 24px;
+            box-shadow: var(--shadow);
+            padding: 24px;
+            margin-bottom: 18px;
+        }}
+        .panel-head {{
+            display: flex;
+            justify-content: space-between;
+            gap: 16px;
+            align-items: baseline;
+            margin-bottom: 18px;
+        }}
+        .panel h2 {{
+            margin: 0;
+            font-size: 20px;
+        }}
+        .panel-head p {{
+            margin: 0;
+            color: var(--muted);
+            font-size: 14px;
+        }}
+        .links {{
+            display: flex;
+            flex-wrap: wrap;
+            gap: 10px;
+        }}
+        .links a,
+        .fact-row a {{
+            color: inherit;
+        }}
+        .link-chip {{
+            display: inline-flex;
+            align-items: center;
+            gap: 8px;
+            padding: 10px 14px;
+            border-radius: 999px;
+            background: var(--panel-strong);
+            border: 1px solid var(--line);
+            text-decoration: none;
+        }}
+        .state-grid,
+        .request-grid {{
+            display: grid;
+            gap: 14px;
+            grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+        }}
+        .state-card,
+        .metric-card {{
+            background: var(--panel-strong);
+            border-radius: 20px;
+            border: 1px solid var(--line);
+            padding: 18px;
+        }}
+        .state-title,
+        .metric-label {{
+            margin: 0;
+            font-size: 13px;
+            color: var(--muted);
+            text-transform: uppercase;
+            letter-spacing: 0.08em;
+        }}
+        .state-value,
+        .metric-value {{
+            margin: 10px 0 12px;
+            font-size: 30px;
+            line-height: 1;
+            font-weight: 700;
+        }}
+        .state-chip {{
+            display: inline-flex;
+            align-items: center;
+            border-radius: 999px;
+            padding: 6px 10px;
+            font-size: 12px;
+            font-weight: 600;
+        }}
+        .state-chip.healthy {{
+            color: var(--accent);
+            background: var(--accent-soft);
+        }}
+        .state-chip.degraded {{
+            color: var(--danger);
+            background: var(--danger-soft);
+        }}
+        .state-chip.neutral {{
+            color: var(--ink);
+            background: var(--neutral);
+        }}
+        .facts {{
+            display: grid;
+            gap: 14px;
+            grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+        }}
+        .fact-row {{
+            background: var(--panel-strong);
+            border: 1px solid var(--line);
+            border-radius: 18px;
+            padding: 16px 18px;
+        }}
+        .fact-row dt {{
+            color: var(--muted);
+            font-size: 13px;
+            margin-bottom: 8px;
+        }}
+        .fact-row dd {{
+            margin: 0;
+            font-size: 22px;
+            font-weight: 650;
+        }}
+        table {{
+            width: 100%;
+            border-collapse: collapse;
+            background: var(--panel-strong);
+            border-radius: 20px;
+            overflow: hidden;
+        }}
+        thead {{
+            background: rgba(20, 34, 28, 0.04);
+        }}
+        th,
+        td {{
+            padding: 14px 16px;
+            text-align: left;
+            border-bottom: 1px solid var(--line);
+        }}
+        th {{
+            font-size: 12px;
+            letter-spacing: 0.08em;
+            text-transform: uppercase;
+            color: var(--muted);
+        }}
+        td {{
+            font-family: "SFMono-Regular", "JetBrains Mono", monospace;
+            font-size: 14px;
+        }}
+        tbody tr:last-child td {{
+            border-bottom: none;
+        }}
+        .empty-state {{
+            border: 1px dashed var(--line);
+            border-radius: 18px;
+            padding: 24px;
+            background: rgba(255, 255, 255, 0.55);
+            color: var(--muted);
+        }}
+        @media (max-width: 760px) {{
+            .hero,
+            .panel-head {{
+                flex-direction: column;
+            }}
+            body {{
+                padding-top: 24px;
+            }}
+            .panel {{
+                padding: 20px;
+            }}
+            table,
+            thead,
+            tbody,
+            th,
+            td,
+            tr {{
+                display: block;
+            }}
+            thead {{
+                display: none;
+            }}
+            tbody tr {{
+                border-bottom: 1px solid var(--line);
+                padding: 10px 0;
+            }}
+            td {{
+                border-bottom: none;
+                padding: 6px 0;
+            }}
+            td::before {{
+                content: attr(data-label);
+                display: block;
+                font-family: "Avenir Next", "PingFang SC", sans-serif;
+                font-size: 12px;
+                letter-spacing: 0.06em;
+                text-transform: uppercase;
+                color: var(--muted);
+                margin-bottom: 4px;
+            }}
+        }}
+    </style>
+</head>
+<body>
+    <main>
+        <section class="hero">
+            <div class="hero-copy">
+                <p class="eyebrow">CLI TG Bot Runtime Monitor</p>
+                <h1>Metrics Overview</h1>
+                <p>{escape(status_note)} 每 5 秒自动刷新，适合浏览器快速看状态。</p>
+            </div>
+            <div class="status-pill {status}">{status_label}</div>
+        </section>
+
+        <section class="panel">
+            <div class="panel-head">
+                <h2>Access</h2>
+                <p>兼容浏览器查看，也保留原始文本与 Prometheus 指标。</p>
+            </div>
+            <div class="links">
+                <a class="link-chip" href="{escape(snapshot['address'])}?format=text">
+                    Plain summary
+                </a>
+                <a class="link-chip" href="{escape(snapshot['raw_address'])}">
+                    Prometheus raw
+                </a>
+                <a class="link-chip" href="{escape(snapshot['address'])}?format=html">
+                    Force HTML
+                </a>
+            </div>
+        </section>
+
+        <section class="panel">
+            <div class="panel-head">
+                <h2>Runtime State</h2>
+                <p>核心健康信号</p>
+            </div>
+            <div class="state-grid">
+                {cards_html}
+            </div>
+        </section>
+
+        <section class="panel">
+            <div class="panel-head">
+                <h2>Runtime Facts</h2>
+                <p>关键计数与时延年龄</p>
+            </div>
+            <dl class="facts">
+                {runtime_html}
+            </dl>
+        </section>
+
+        <section class="panel">
+            <div class="panel-head">
+                <h2>Text Requests</h2>
+                <p>请求结果总览</p>
+            </div>
+            <div class="request-grid">
+                {request_cards_html}
+            </div>
+        </section>
+
+        <section class="panel">
+            <div class="panel-head">
+                <h2>Latency Breakdown</h2>
+                <p>按指标与引擎聚合</p>
+            </div>
+            {latency_html}
+        </section>
+    </main>
+</body>
+</html>
+"""
 
     def status_snapshot(self) -> dict[str, Any]:
         """Build a compact runtime snapshot for ops output."""

@@ -188,7 +188,7 @@ def test_compose_prompt_with_telegram_remote_context_injects_hint():
     enriched = _compose_prompt_with_telegram_remote_context(prompt)
 
     assert enriched != prompt
-    assert "Telegram 与用户远程协作" in enriched
+    assert "Telegram remote session. User is not on this machine." in enriched
     assert prompt in enriched
 
 

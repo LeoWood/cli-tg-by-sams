@@ -136,7 +136,7 @@ _BOT_REACTION_PROCESSING = "👀"
 _BOT_REACTION_SUCCESS = "👍"
 _BOT_REACTION_FAILED = "👎"
 _TELEGRAM_REMOTE_CONTEXT_HINT = (
-    "系统提示：你正在通过 Telegram 与用户远程协作，" "用户不在当前机器终端。"
+    "Telegram remote session. User is not on this machine."
 )
 
 
@@ -2287,13 +2287,6 @@ def _compose_prompt_with_telegram_remote_context(
         return prompt
 
     context_lines = [_TELEGRAM_REMOTE_CONTEXT_HINT]
-    if settings is not None:
-        _, _, preferred_root = _build_auto_delivery_policy(settings)
-        if preferred_root is not None:
-            context_lines.append(
-                "如需自动回传生成的图片或文件，请将输出保存到：" f"`{preferred_root}`。"
-            )
-            context_lines.append("完成后请在回复中写明：`文件路径: <绝对路径>`。")
 
     return "\n".join(context_lines) + f"\n\n{prompt}"
 

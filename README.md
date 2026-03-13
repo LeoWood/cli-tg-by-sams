@@ -2,7 +2,14 @@
 
 通过 IM 远程操控 CLI 编码智能体，支持多引擎切换、多会话、工具权限审批、流式输出。
 
-基于 Python，当前集成 Telegram + Codex/Claude 双引擎（Codex 为主，Claude 备选）。Long Polling 模式，无需公网 IP 或反向代理，启动即用。
+基于 Python，当前集成 Telegram + Codex/Claude 双引擎（Codex 为主，Claude 备选）。Long Polling 模式，无需公网 IP 或反向代理，启动即用；当前版本还支持更顺滑的 `/resume` 会话恢复、可展开的 thinking 过程展示、轮询自愈，以及可选的本地 runtime metrics 端点。
+
+## 近期重要更新
+
+- `/resume` 现在默认直接针对当前目录恢复桌面会话；会话按钮会显示更易读的主题摘要，恢复成功后会附带上下文摘要和“最近5轮”入口，也支持在目标目录直接开启全新会话。
+- 流式回复的 thinking 过程会先折叠成简洁摘要，按需通过 `View thinking process` 展开；取消、异常结束时也会尽量保留可回看的 thinking 记录。
+- Long Polling 增加了更稳健的自愈逻辑：区分传输异常、待处理 update 堵塞等场景自动恢复；`scripts/tmux-bot.sh` 也内置启动重试与退避，降低 bot 启动偶发失败的影响。
+- 新增可选本地只读 metrics HTTP 端点：`/metrics` 提供 Prometheus 风格原始指标，`/metricsz` 提供紧凑文本摘要；Telegram 内的 `/opsstatus` 也会带上 tmux / 进程 / 重启事件 / metrics 快照。
 
 ## 架构概览
 
@@ -86,6 +93,15 @@ CODEX_CLI_PATH=/opt/homebrew/bin/codex
 # 建议默认 false，避免 MCP 启动卡顿；需要 MCP 工具时再临时打开
 CODEX_ENABLE_MCP=false
 
+# === 可选：本地 runtime metrics ===
+METRICS_ENABLED=false
+METRICS_HOST=127.0.0.1
+METRICS_PORT=9464
+
+# === 可选：轮询自愈阈值 ===
+POLLING_UPDATE_STALL_SECONDS=60
+POLLING_PENDING_UPDATE_STALL_SECONDS=120
+
 # === Claude 备选（可选）===
 USE_SDK=false
 CLAUDE_CLI_PATH=./claude-wrapper.sh
@@ -93,8 +109,9 @@ CLAUDE_MAX_TURNS=50
 CLAUDE_TIMEOUT_SECONDS=600
 ```
 
-完整配置项参考 `.env.example`。
+完整配置项参考 `.env.example`；若模板里暂未列出最新变量，可按 `src/config/settings.py` 中同名环境变量补充。
 如果暂时只用 Codex，可先不配置 Claude 相关项。
+如果要接 Prometheus / VictoriaMetrics / curl 自查，可再打开 `METRICS_ENABLED=true`。
 
 如果你安装了 Poetry 但 `poetry` 命令不可用，请先把 Poetry 加入 PATH：
 
@@ -186,7 +203,7 @@ claude auth status
 | `/cancel` | 取消当前运行中的任务 | 全部 |
 | `/provider` | Claude 通道切换（cc-switch） | Claude |
 | `/restartbot` | 远程重启 bot（管理员，重启前会先刷新会话持久化） | 全部 |
-| `/opsstatus` | 查看运行态诊断信息（管理员） | 全部 |
+| `/opsstatus` | 查看运行态诊断信息（管理员，含 tmux / 进程 / 重启事件 / metrics 快照） | 全部 |
 
 ### 会话导出说明
 
@@ -210,6 +227,29 @@ claude auth status
 - `New`：创建新会话
 - `Resume`：直接恢复当前目录可续接会话（不再强制先选目录）
 - `Help`：打开帮助信息
+
+### 会话恢复与 Thinking 展示
+
+- `/resume` 默认优先扫描当前目录，不再强制先选项目；按钮文案会尽量显示“最近主题摘要 + 会话短 ID”，便于快速判断要接哪条上下文。
+- 恢复成功后，Bot 会回显当前目录、session 短 ID、最近上下文摘要，并附带“最近5轮”按钮，便于快速确认是否接对会话。
+- 如果当前目录下没有合适的历史会话，可直接点 *Start New Session Here* 清空旧绑定，在原目录开一条全新 session。
+- 流式输出结束后默认展示折叠版 thinking 摘要；点 `View thinking process` 可展开/收起详细推理过程，取消或报错时也会尽量保留该入口。
+
+### 本地 Runtime Metrics（可选）
+
+启用 `METRICS_ENABLED=true` 后，bot 会在本机启动只读 HTTP 端点（默认 `127.0.0.1:9464`）：
+
+- `GET /metrics`：Prometheus 文本格式，适合采集系统直接抓取
+- `GET /metricsz`：紧凑的人类可读摘要，便于 `curl http://127.0.0.1:9464/metricsz`
+
+当前已覆盖的指标重点包括：
+
+- bot / polling / storage 是否在线
+- polling 是否请求过自愈重启
+- watchdog tick 与最近健康探针年龄
+- pending updates 数量
+- 当前活跃任务数、CLI 活跃进程数
+- 文本请求成功/失败/排队次数与多段延迟直方图
 
 ## 安全模型
 
@@ -248,10 +288,14 @@ claude auth status
 
 - 默认会写入滚动日志到 `logs/bot.log`（单文件 10MB，保留 5 个历史文件）
 - 可通过环境变量覆盖日志路径：`CLITG_LOG_FILE=/path/to/custom.log`
+- `scripts/tmux-bot.sh restart` / `restart-detached` 现在内置多轮启动重试与退避；异步重启日志默认写入 `logs/restart-detached.log`
+- shell 侧会持续刷新 `logs/bot-health.txt`，便于排查 watchdog、健康探针与 polling 自愈状态
 - 轮询模式会周期写入 watchdog 心跳与健康探针日志，建议重点检索：
   - `Polling watchdog heartbeat`
   - `Polling health probe succeeded` / `Polling health probe failed`
   - `Attempting polling self-recovery` / `Polling self-recovery failed`
+  - `Telegram transport failure detected`
+  - `Pending updates detected but bot is not consuming them`
   - `Shutdown signal received`
 
 ### 服务宕机/短线自救（iCloud + iOS 快捷指令）
