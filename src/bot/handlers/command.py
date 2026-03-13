@@ -2239,62 +2239,22 @@ async def ops_status_command(
             restart_events_shown=len(restart_tail),
         )
 
-        report_lines = [
-            f"opsstatus request_id={request_id}",
-            f"healthy={'yes' if healthy else 'no'}",
-            "",
-            f"tmux_status_rc={tmux_rc}",
-            "tmux_status_stdout:",
-            tmux_out or "(empty)",
-        ]
-        if tmux_err:
-            report_lines.extend(["", "tmux_status_stderr:", tmux_err])
-
-        report_lines.extend(
-            [
-                "",
-                f"ps_status_rc={ps_rc}",
-                f"bot_process_count={process_count}",
-                "bot_processes:",
-                *process_preview,
-            ]
+        report = _render_opsstatus_report(
+            request_id=request_id,
+            healthy=healthy,
+            tmux_rc=tmux_rc,
+            tmux_out=tmux_out,
+            tmux_err=tmux_err,
+            ps_rc=ps_rc,
+            ps_err=ps_err,
+            process_count=process_count,
+            process_preview=process_preview,
+            restart_tail=restart_tail,
+            metrics_snapshot=metrics_snapshot,
+            runtime_metrics=runtime_metrics
+            if isinstance(runtime_metrics, RuntimeMetrics)
+            else None,
         )
-        if ps_err:
-            report_lines.extend(["", "ps_stderr:", ps_err])
-
-        report_lines.extend(
-            [
-                "",
-                f"restart_events_tail(last={_OPSSTATUS_RESTART_TAIL_LINES}):",
-                *restart_tail,
-            ]
-        )
-        if metrics_snapshot is not None:
-            report_lines.extend(
-                [
-                    "",
-                    "metrics:",
-                    f"metrics_enabled={'yes' if metrics_snapshot['enabled'] else 'no'}",
-                    f"metrics_address={metrics_snapshot['address']}",
-                    f"metrics_raw_address={metrics_snapshot['raw_address']}",
-                    f"metrics_bot_running={int(metrics_snapshot['bot_running'])}",
-                    f"metrics_polling_up={int(metrics_snapshot['polling_up'])}",
-                    "metrics_polling_restart_requested="
-                    f"{int(metrics_snapshot['polling_restart_requested'])}",
-                    "metrics_watchdog_tick_age_seconds="
-                    f"{metrics_snapshot['watchdog_tick_age_seconds']:.2f}",
-                    "metrics_last_health_probe_age_seconds="
-                    f"{metrics_snapshot['last_health_probe_age_seconds']:.2f}",
-                    "metrics_pending_update_count="
-                    f"{int(metrics_snapshot['pending_update_count'])}",
-                    f"metrics_storage_up={int(metrics_snapshot['storage_up'])}",
-                    f"metrics_active_tasks={int(metrics_snapshot['active_tasks'])}",
-                    "metrics_cli_active_processes="
-                    f"{int(metrics_snapshot['cli_active_processes'])}",
-                ]
-            )
-
-        report = "\n".join(report_lines)
         chunks = _split_text_chunks(report, max_chars=3400)
         for idx, chunk in enumerate(chunks):
             if idx == 0:
@@ -2332,6 +2292,71 @@ async def ops_status_command(
                 args=[request_id],
                 success=False,
             )
+
+
+def _render_opsstatus_report(
+    *,
+    request_id: str,
+    healthy: bool,
+    tmux_rc: int,
+    tmux_out: str,
+    tmux_err: str,
+    ps_rc: int,
+    ps_err: str,
+    process_count: int,
+    process_preview: list[str],
+    restart_tail: list[str],
+    metrics_snapshot: dict[str, Any] | None,
+    runtime_metrics: RuntimeMetrics | None,
+) -> str:
+    """Render /opsstatus in a human-readable metrics-style layout."""
+    tmux_summary = tmux_out.splitlines()[0].strip() if tmux_out.strip() else "(empty)"
+    last_restart = restart_tail[-1].strip() if restart_tail else "(no restart events)"
+    lines = [
+        f"opsstatus request_id={request_id}",
+        f"ops_status: {'healthy' if healthy else 'degraded'}",
+    ]
+
+    if runtime_metrics is not None and metrics_snapshot is not None:
+        metrics_summary = runtime_metrics.render_human_summary().strip()
+        if metrics_summary:
+            lines.extend(["", metrics_summary])
+    else:
+        lines.extend(
+            [
+                "",
+                "status: unavailable",
+                "metrics_address: unavailable",
+                "metrics_raw: unavailable",
+            ]
+        )
+
+    lines.extend(
+        [
+            "",
+            "ops_checks:",
+            f"- tmux: {'ok' if tmux_rc == 0 else 'error'} (rc={tmux_rc})",
+            f"- bot_processes: {process_count}",
+            f"- last_restart: {last_restart}",
+            f"- tmux_summary: {tmux_summary}",
+        ]
+    )
+    if ps_rc != 0:
+        lines.append(f"- ps: error (rc={ps_rc})")
+
+    if not healthy or tmux_err or ps_err:
+        lines.extend(["", "ops_details:"])
+        lines.append("- bot_processes_preview:")
+        lines.extend(f"  {line}" for line in process_preview)
+        if tmux_err:
+            lines.append("- tmux_stderr:")
+            lines.extend(f"  {line}" for line in tmux_err.splitlines())
+        if ps_err:
+            lines.append("- ps_stderr:")
+            lines.extend(f"  {line}" for line in ps_err.splitlines())
+        lines.append(f"- restart_events_tail(last={_OPSSTATUS_RESTART_TAIL_LINES}):")
+        lines.extend(f"  {line}" for line in restart_tail)
+    return "\n".join(lines)
 
 
 def _split_text_chunks(text: str, max_chars: int = 3500) -> list[str]:

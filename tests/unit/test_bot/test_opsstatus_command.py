@@ -96,14 +96,16 @@ async def test_opsstatus_reports_healthy_snapshot(tmp_path, monkeypatch):
     reply_call = update.message.reply_text.await_args
     rendered = reply_call.args[0]
     assert "opsstatus request_id=aaaaaaaabbbb" in rendered
-    assert "healthy=yes" in rendered
-    assert "bot_process_count=1" in rendered
+    assert "ops_status: healthy" in rendered
+    assert "status: healthy" in rendered
+    assert "bot_processes: 1" in rendered
+    assert "tmux: ok (rc=0)" in rendered
     assert "event=restart_succeeded" in rendered
-    assert "metrics_enabled=no" in rendered
-    assert "metrics_address=http://127.0.0.1:9464/metricsz" in rendered
-    assert "metrics_raw_address=http://127.0.0.1:9464/metrics" in rendered
-    assert "metrics_active_tasks=2" in rendered
-    assert "metrics_cli_active_processes=1" in rendered
+    assert "metrics_address: http://127.0.0.1:9464/metricsz" in rendered
+    assert "metrics_raw: http://127.0.0.1:9464/metrics" in rendered
+    assert "active_tasks: 2" in rendered
+    assert "cli_active_processes: 1" in rendered
+    assert "ops_details:" not in rendered
 
     assert capture.await_count == 2
     assert capture.await_args_list[0].args[:3] == (
@@ -150,8 +152,10 @@ async def test_opsstatus_handles_missing_tmux_script(tmp_path, monkeypatch):
     await ops_status_command(update, context)
 
     rendered = update.message.reply_text.await_args.args[0]
-    assert "healthy=no" in rendered
-    assert "tmux_status_rc=127" in rendered
+    assert "ops_status: degraded" in rendered
+    assert "status: unavailable" in rendered
+    assert "tmux: error (rc=127)" in rendered
+    assert "ops_details:" in rendered
     assert "script not found" in rendered
 
     capture.assert_awaited_once()
