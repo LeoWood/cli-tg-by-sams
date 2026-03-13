@@ -285,6 +285,118 @@ async def test_photo_upload_codex_passes_cli_image_file_and_cleans_up(
 
 
 @pytest.mark.asyncio
+async def test_photo_upload_gemini_passes_workspace_cli_image_file_and_cleans_up(
+    tmp_path,
+):
+    """Gemini image flow should attach workspace-local @path source files."""
+    approved = tmp_path / "approved"
+    approved.mkdir()
+    user_id = 3202
+
+    settings = Settings(
+        telegram_bot_token="test:token",
+        telegram_bot_username="testbot",
+        approved_directory=approved,
+        use_sdk=False,
+    )
+
+    progress_msg = SimpleNamespace(
+        edit_text=AsyncMock(),
+        delete=AsyncMock(),
+        message_id=9102,
+    )
+    message = SimpleNamespace(
+        reply_text=AsyncMock(return_value=progress_msg),
+        message_id=1002,
+        caption="请分析",
+        photo=[SimpleNamespace()],
+    )
+    update = SimpleNamespace(
+        effective_user=SimpleNamespace(id=user_id),
+        effective_chat=SimpleNamespace(id=user_id),
+        effective_message=SimpleNamespace(message_thread_id=None),
+        message=message,
+    )
+
+    image_bytes = b"\x89PNG\r\n\x1a\n" + b"\x00" * 256
+    processed_image = SimpleNamespace(
+        prompt="请分析",
+        base64_data=base64.b64encode(image_bytes).decode("utf-8"),
+        metadata={"format": "png"},
+    )
+    image_handler = SimpleNamespace(
+        process_image=AsyncMock(return_value=processed_image)
+    )
+
+    async def _run_command_side_effect(**kwargs):
+        on_stream = kwargs.get("on_stream")
+        if on_stream:
+            await on_stream(
+                _FakeStreamUpdate(
+                    update_type="system",
+                    metadata={"subtype": "init", "tools": [], "engine": "gemini"},
+                )
+            )
+            await on_stream(
+                _FakeStreamUpdate(
+                    update_type="progress",
+                    metadata={"engine": "gemini", "subtype": "turn.started"},
+                )
+            )
+            await on_stream(
+                _FakeStreamUpdate(
+                    update_type="system",
+                    metadata={
+                        "subtype": "model_resolved",
+                        "model": "gemini-2.5-pro",
+                    },
+                )
+            )
+        return SimpleNamespace(
+            session_id="gemini-session-1",
+            content="图片分析完成",
+        )
+
+    run_command = AsyncMock(side_effect=_run_command_side_effect)
+    gemini_integration = SimpleNamespace(
+        config=SimpleNamespace(use_sdk=False),
+        sdk_manager=None,
+        process_manager=SimpleNamespace(supports_image_inputs=lambda images=None: True),
+        run_command=run_command,
+    )
+
+    context = SimpleNamespace(
+        bot=SimpleNamespace(),
+        bot_data={
+            "settings": settings,
+            "features": _FakeFeatures(image_handler=image_handler),
+            "cli_integrations": {"gemini": gemini_integration},
+        },
+        user_data={
+            "scope_state": {
+                _scope_key(user_id): {
+                    ENGINE_STATE_KEY: "gemini",
+                    "current_directory": approved,
+                }
+            }
+        },
+    )
+
+    await handle_photo(update, context)
+
+    kwargs = run_command.await_args.kwargs
+    image_payload = kwargs["images"][0]
+    image_path = Path(image_payload["file_path"])
+    edited_texts = [call.args[0] for call in progress_msg.edit_text.await_args_list]
+
+    assert image_payload["media_type"] == "image/png"
+    assert image_path.parent.name == ".gemini-images"
+    assert image_path.exists() is False
+    assert any("Gemini is working" in text for text in edited_texts)
+    assert any("Gemini 正在分析图片" in text for text in edited_texts)
+
+
+@pytest.mark.asyncio
 async def test_photo_upload_claude_stream_progress_matches_text_flow(tmp_path):
     """Claude image flow should also show stream-thinking style progress lines."""
     approved = tmp_path / "approved"

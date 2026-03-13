@@ -181,6 +181,50 @@ def build_precise_context_status_lines(context_usage: Dict[str, Any]) -> List[st
     return lines
 
 
+def build_gemini_daily_usage_lines(daily_usage: Dict[str, Any]) -> List[str]:
+    """Build Gemini daily per-model request counters for /status output."""
+    if not isinstance(daily_usage, dict):
+        return []
+
+    models = daily_usage.get("models")
+    if not isinstance(models, dict):
+        return []
+
+    date_text = str(daily_usage.get("date") or "").strip()
+    lines: List[str] = ["", "*Daily Model Usage (Gemini)*"]
+    if date_text:
+        lines.append(f"Date: `{date_text}`")
+
+    total_turns = int(daily_usage.get("total_turns", 0) or 0)
+    total_sessions = int(daily_usage.get("total_sessions", 0) or 0)
+    lines.append(
+        f"Total: `{total_turns}` turns"
+        + (f" across `{total_sessions}` sessions" if total_sessions > 0 else "")
+    )
+
+    for model_name, payload in sorted(
+        models.items(),
+        key=lambda item: (
+            -int((item[1] or {}).get("turns", 0) or 0),
+            str(item[0]),
+        ),
+    ):
+        if not isinstance(payload, dict):
+            continue
+        turns = int(payload.get("turns", 0) or 0)
+        if turns <= 0:
+            continue
+        sessions = int(payload.get("sessions", 0) or 0)
+        line = f"- `{model_name}`: `{turns}` turns"
+        if sessions > 0:
+            line += f" / `{sessions}` sessions"
+        lines.append(line)
+
+    if len(lines) <= 3:
+        lines.append("- No Gemini turns recorded today")
+    return lines
+
+
 def _build_rate_limit_lines(rate_limits: Any) -> List[str]:
     """Build Codex status window usage lines from token_count.rate_limits."""
     if not isinstance(rate_limits, dict):

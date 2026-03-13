@@ -282,6 +282,7 @@ def test_build_command_for_gemini_uses_headless_stream_json_flags(
         session_id="gemini-session-1",
         continue_session=True,
         model="gemini-2.5-pro",
+        working_directory=tmp_path,
     )
 
     assert cmd == [
@@ -297,6 +298,91 @@ def test_build_command_for_gemini_uses_headless_stream_json_flags(
         "--model",
         "gemini-2.5-pro",
     ]
+
+
+def test_build_command_for_gemini_appends_image_refs_from_workspace(
+    tmp_path, monkeypatch
+):
+    """Gemini CLI should pass local image attachments as @path prompt references."""
+    manager = _build_manager(
+        tmp_path,
+        gemini_approval_mode="yolo",
+    )
+    monkeypatch.setattr(
+        "src.claude.sdk_integration.find_claude_cli",
+        lambda _: "/opt/homebrew/bin/gemini",
+    )
+
+    image_path = tmp_path / ".gemini-images" / "a test.png"
+    image_path.parent.mkdir(parents=True)
+    image_path.write_bytes(b"png")
+
+    cmd = manager._build_command(
+        prompt="分析这张图",
+        session_id=None,
+        continue_session=False,
+        images=[{"file_path": str(image_path)}],
+        working_directory=tmp_path,
+    )
+
+    assert cmd == [
+        "/opt/homebrew/bin/gemini",
+        "--prompt",
+        "分析这张图\n\n@.gemini-images/a\\ test.png",
+        "--output-format",
+        "stream-json",
+        "--approval-mode",
+        "yolo",
+    ]
+
+
+def test_build_command_for_gemini_with_blank_prompt_uses_image_default(
+    tmp_path, monkeypatch
+):
+    """Gemini image prompt should fall back to image-aware default text."""
+    manager = _build_manager(
+        tmp_path,
+        gemini_approval_mode="yolo",
+    )
+    monkeypatch.setattr(
+        "src.claude.sdk_integration.find_claude_cli",
+        lambda _: "/opt/homebrew/bin/gemini",
+    )
+
+    cmd = manager._build_command(
+        prompt="",
+        session_id=None,
+        continue_session=False,
+        images=[{"file_path": str(tmp_path / ".gemini-images" / "a.png")}],
+        working_directory=tmp_path,
+    )
+
+    assert cmd == [
+        "/opt/homebrew/bin/gemini",
+        "--prompt",
+        "Please analyze the attached image(s) and describe what you see.\n\n@.gemini-images/a.png",
+        "--output-format",
+        "stream-json",
+        "--approval-mode",
+        "yolo",
+    ]
+
+
+def test_supports_image_inputs_for_gemini_accepts_local_files(tmp_path, monkeypatch):
+    """Gemini should advertise image capability for photo upload flow."""
+    manager = _build_manager(tmp_path)
+    monkeypatch.setattr(
+        "src.claude.sdk_integration.find_claude_cli",
+        lambda _: "/opt/homebrew/bin/gemini",
+    )
+
+    assert manager.supports_image_inputs() is True
+    assert (
+        manager.supports_image_inputs(
+            [{"file_path": str(tmp_path / ".gemini-images" / "a.png")}]
+        )
+        is True
+    )
 
 
 def test_parse_result_for_gemini_stream_json_payload(tmp_path):

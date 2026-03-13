@@ -5,13 +5,14 @@ from __future__ import annotations
 import json
 import time
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from pathlib import Path
 from typing import Any, Awaitable, Callable, Dict, List, Mapping, Optional
 
 import structlog
 
 from ..bot.utils.status_usage import (
+    build_gemini_daily_usage_lines,
     build_model_usage_status_lines,
     build_precise_context_status_lines,
 )
@@ -38,6 +39,8 @@ class SessionService:
     _codex_snapshot_ttl_seconds = 5
     _gemini_snapshot_cache: Dict[str, tuple[float, Dict[str, Any]]] = {}
     _gemini_snapshot_ttl_seconds = 5
+    _gemini_daily_usage_cache: Dict[str, tuple[float, Dict[str, Any]]] = {}
+    _gemini_daily_usage_ttl_seconds = 15
     _codex_global_rate_limits_cache: Optional[tuple[float, Dict[str, Any]]] = None
     _codex_global_rate_limits_ttl_seconds = 0
 
@@ -468,6 +471,138 @@ class SessionService:
         return snapshot
 
     @classmethod
+    def _probe_gemini_daily_model_usage(
+        cls,
+        *,
+        target_date: Optional[date] = None,
+        sessions_root: Optional[Path] = None,
+    ) -> Optional[Dict[str, Any]]:
+        """Aggregate today's Gemini turns by model from local session JSON files."""
+        local_now = datetime.now().astimezone()
+        effective_date = target_date or local_now.date()
+        date_key = effective_date.isoformat()
+
+        now = time.monotonic()
+        cache_entry = cls._gemini_daily_usage_cache.get(date_key)
+        if cache_entry:
+            cached_at, cached_snapshot = cache_entry
+            if now - cached_at <= cls._gemini_daily_usage_ttl_seconds:
+                return dict(cached_snapshot)
+
+        root = sessions_root or (Path.home() / ".gemini" / "tmp")
+        if not root.is_dir():
+            return None
+
+        try:
+            candidates = root.rglob("session-*.json")
+        except OSError:
+            return None
+
+        models: Dict[str, Dict[str, Any]] = {}
+        total_turns = 0
+        seen_sessions: set[str] = set()
+        for candidate in candidates:
+            parsed = cls._extract_gemini_daily_usage_from_file(
+                candidate,
+                target_date=effective_date,
+            )
+            if not parsed:
+                continue
+
+            total_turns += int(parsed.get("turns", 0) or 0)
+            session_id = str(parsed.get("session_id") or "").strip()
+            if session_id:
+                seen_sessions.add(session_id)
+
+            for model_name, payload in (parsed.get("models") or {}).items():
+                if not isinstance(payload, dict):
+                    continue
+                entry = models.setdefault(str(model_name), {"turns": 0, "sessions": 0})
+                entry["turns"] += int(payload.get("turns", 0) or 0)
+                entry["sessions"] += int(payload.get("sessions", 0) or 0)
+
+        snapshot = {
+            "date": date_key,
+            "models": models,
+            "total_turns": total_turns,
+            "total_sessions": len(seen_sessions),
+        }
+        cls._gemini_daily_usage_cache[date_key] = (now, dict(snapshot))
+        return snapshot
+
+    @staticmethod
+    def _extract_gemini_daily_usage_from_file(
+        session_file: Path,
+        *,
+        target_date: date,
+    ) -> Optional[Dict[str, Any]]:
+        """Extract one day's Gemini turn counts from one session file."""
+        try:
+            raw = json.loads(session_file.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return None
+
+        if not isinstance(raw, dict):
+            return None
+
+        session_id = str(raw.get("sessionId") or "").strip()
+        messages = raw.get("messages")
+        if not session_id or not isinstance(messages, list):
+            return None
+
+        pending_turn_dates: List[date] = []
+        model_turns: Dict[str, int] = {}
+
+        for message in messages:
+            if not isinstance(message, dict):
+                continue
+
+            msg_type = str(message.get("type") or "").strip().lower()
+            timestamp = SessionService._parse_gemini_message_timestamp(
+                message.get("timestamp")
+            )
+
+            if msg_type == "user":
+                if timestamp is not None:
+                    pending_turn_dates.append(timestamp.astimezone().date())
+                continue
+
+            if msg_type != "gemini":
+                continue
+            if not pending_turn_dates:
+                continue
+
+            pending_turn_date = pending_turn_dates.pop(0)
+            if pending_turn_date != target_date:
+                continue
+
+            model_name = str(message.get("model") or "").strip() or "gemini"
+            model_turns[model_name] = int(model_turns.get(model_name, 0) or 0) + 1
+
+        if not model_turns:
+            return None
+
+        return {
+            "session_id": session_id,
+            "turns": sum(model_turns.values()),
+            "models": {
+                model_name: {"turns": turns, "sessions": 1}
+                for model_name, turns in model_turns.items()
+            },
+        }
+
+    @staticmethod
+    def _parse_gemini_message_timestamp(value: Any) -> Optional[datetime]:
+        """Parse Gemini session message timestamp as timezone-aware datetime."""
+        text = str(value or "").strip()
+        if not text:
+            return None
+        try:
+            return datetime.fromisoformat(text.replace("Z", "+00:00"))
+        except ValueError:
+            return None
+
+    @classmethod
     def _probe_latest_codex_global_rate_limits(cls) -> Optional[Dict[str, Any]]:
         """Read the newest available Codex rate-limit snapshot across all sessions."""
         now = time.monotonic()
@@ -703,6 +838,7 @@ class SessionService:
         precise_context = None
         session_info = None
         resumable_payload = None
+        gemini_daily_usage: Optional[Dict[str, Any]] = None
 
         if session_id:
             lines.append(f"Session: `{session_id[:8]}...`")
@@ -721,6 +857,9 @@ class SessionService:
                 elif cli_kind == "gemini":
                     gemini_local_snapshot = (
                         SessionService._probe_gemini_session_snapshot(session_id)
+                    )
+                    gemini_daily_usage = (
+                        SessionService._probe_gemini_daily_model_usage()
                     )
 
                 if allow_precise_context_probe and cli_kind != "codex":
@@ -864,6 +1003,9 @@ class SessionService:
                     )
                     lines[model_line_idx] = f"Model: `{model_display}`"
 
+                if cli_kind == "gemini" and isinstance(gemini_daily_usage, dict):
+                    lines.extend(build_gemini_daily_usage_lines(gemini_daily_usage))
+
             if event_lines_provider:
                 try:
                     event_lines = await event_lines_provider(session_id)
@@ -901,6 +1043,10 @@ class SessionService:
                         f"Resumable: `{existing.session_id[:8]}...` "
                         f"({existing.message_count} msgs)"
                     )
+            if cli_kind == "gemini":
+                gemini_daily_usage = SessionService._probe_gemini_daily_model_usage()
+                if isinstance(gemini_daily_usage, dict):
+                    lines.extend(build_gemini_daily_usage_lines(gemini_daily_usage))
 
         return ContextStatusSnapshot(
             lines=lines,

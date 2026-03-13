@@ -1,7 +1,9 @@
 """Tests for session/event services."""
 
+import json
 import tempfile
 import time
+from datetime import date
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
@@ -409,6 +411,21 @@ async def test_build_context_snapshot_gemini_uses_local_session_usage(monkeypatc
             }
         ),
     )
+    monkeypatch.setattr(
+        SessionService,
+        "_probe_gemini_daily_model_usage",
+        classmethod(
+            lambda cls: {
+                "date": "2026-03-13",
+                "total_turns": 6,
+                "total_sessions": 3,
+                "models": {
+                    "gemini-3.1-pro-preview": {"turns": 4, "sessions": 2},
+                    "gemini-2.5-flash": {"turns": 2, "sessions": 1},
+                },
+            }
+        ),
+    )
 
     snapshot = await SessionService.build_context_snapshot(
         user_id=3014,
@@ -427,7 +444,128 @@ async def test_build_context_snapshot_gemini_uses_local_session_usage(monkeypatc
     assert "Context (gemini-3.1-pro-preview)" in rendered
     assert "Tokens: `29,919`" in rendered
     assert "Input: `23,245` | Output: `396`" in rendered
+    assert "Daily Model Usage (Gemini)" in rendered
+    assert "- `gemini-3.1-pro-preview`: `4` turns / `2` sessions" in rendered
     claude_integration.get_precise_context_usage.assert_not_awaited()
+
+
+def test_probe_gemini_daily_model_usage_counts_user_turns_once_per_reply_model(
+    tmp_path,
+):
+    """Gemini daily usage should count one turn per user prompt and reply model."""
+    sessions_root = tmp_path / ".gemini" / "tmp"
+    chats_a = sessions_root / "project-a" / "chats"
+    chats_b = sessions_root / "project-b" / "chats"
+    chats_a.mkdir(parents=True)
+    chats_b.mkdir(parents=True)
+
+    session_a = {
+        "sessionId": "gem-a",
+        "messages": [
+            {"type": "user", "timestamp": "2026-03-13T01:00:00Z"},
+            {
+                "type": "gemini",
+                "timestamp": "2026-03-13T01:00:01Z",
+                "model": "gemini-2.5-pro",
+            },
+            {
+                "type": "gemini",
+                "timestamp": "2026-03-13T01:00:02Z",
+                "model": "gemini-2.5-pro",
+            },
+            {"type": "user", "timestamp": "2026-03-13T02:00:00Z"},
+            {"type": "error", "timestamp": "2026-03-13T02:00:01Z"},
+            {"type": "user", "timestamp": "2026-03-13T03:00:00Z"},
+            {
+                "type": "gemini",
+                "timestamp": "2026-03-13T03:00:01Z",
+                "model": "gemini-2.5-flash",
+            },
+        ],
+    }
+    session_b = {
+        "sessionId": "gem-b",
+        "messages": [
+            {"type": "user", "timestamp": "2026-03-12T12:00:00Z"},
+            {
+                "type": "gemini",
+                "timestamp": "2026-03-12T12:00:01Z",
+                "model": "gemini-2.5-pro",
+            },
+            {"type": "user", "timestamp": "2026-03-13T04:00:00Z"},
+            {
+                "type": "gemini",
+                "timestamp": "2026-03-13T04:00:01Z",
+                "model": "gemini-2.5-pro",
+            },
+        ],
+    }
+
+    (chats_a / "session-a.json").write_text(json.dumps(session_a), encoding="utf-8")
+    (chats_b / "session-b.json").write_text(json.dumps(session_b), encoding="utf-8")
+
+    SessionService._gemini_daily_usage_cache.clear()
+    snapshot = SessionService._probe_gemini_daily_model_usage(
+        target_date=date(2026, 3, 13),
+        sessions_root=sessions_root,
+    )
+
+    assert snapshot is not None
+    assert snapshot["date"] == "2026-03-13"
+    assert snapshot["total_turns"] == 3
+    assert snapshot["total_sessions"] == 2
+    assert snapshot["models"]["gemini-2.5-pro"]["turns"] == 2
+    assert snapshot["models"]["gemini-2.5-pro"]["sessions"] == 2
+    assert snapshot["models"]["gemini-2.5-flash"]["turns"] == 1
+    assert snapshot["models"]["gemini-2.5-flash"]["sessions"] == 1
+
+
+@pytest.mark.asyncio
+async def test_build_context_snapshot_gemini_without_session_shows_daily_usage(
+    monkeypatch,
+):
+    """Gemini /status should still show daily model usage after /new clears session."""
+    approved = Path("/tmp/project")
+    current_dir = approved
+    claude_integration = SimpleNamespace(
+        process_manager=SimpleNamespace(
+            _resolve_cli_path=lambda: "/opt/homebrew/bin/gemini",
+            _detect_cli_kind=lambda _: "gemini",
+        ),
+        _find_resumable_session=AsyncMock(return_value=None),
+    )
+    monkeypatch.setattr(
+        SessionService,
+        "_probe_gemini_daily_model_usage",
+        classmethod(
+            lambda cls: {
+                "date": "2026-03-13",
+                "total_turns": 5,
+                "total_sessions": 2,
+                "models": {
+                    "gemini-2.5-pro": {"turns": 3, "sessions": 1},
+                    "gemini-2.5-flash": {"turns": 2, "sessions": 1},
+                },
+            }
+        ),
+    )
+
+    snapshot = await SessionService.build_context_snapshot(
+        user_id=3015,
+        session_id=None,
+        current_dir=current_dir,
+        approved_directory=approved,
+        current_model="default",
+        claude_integration=claude_integration,
+        include_resumable=True,
+        allow_precise_context_probe=False,
+    )
+
+    rendered = "\n".join(snapshot.lines)
+    assert "Session: none" in rendered
+    assert "Daily Model Usage (Gemini)" in rendered
+    assert "Total: `5` turns across `2` sessions" in rendered
+    assert "- `gemini-2.5-pro`: `3` turns / `1` sessions" in rendered
 
 
 def test_get_cached_codex_snapshot_respects_ttl(monkeypatch):

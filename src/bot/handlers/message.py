@@ -1134,19 +1134,35 @@ def _integration_uses_cli_image_files(cli_integration: Any) -> bool:
     return False
 
 
+def _resolve_cli_image_directory(
+    *,
+    engine: str,
+    working_directory: Path,
+) -> Path:
+    """Pick per-engine temporary directory for CLI image attachments."""
+    normalized = str(engine or "").strip().lower()
+    if normalized == ENGINE_GEMINI:
+        return working_directory / ".gemini-images"
+    return working_directory / ".claude-images"
+
+
 def _persist_cli_image_file(
     *,
     base64_data: str,
     image_format: str,
     working_directory: Path,
+    engine: str,
 ) -> Path:
-    """Persist uploaded image bytes to local file for Codex CLI --image."""
+    """Persist uploaded image bytes to local file for subprocess image inputs."""
     try:
         payload = base64.b64decode(base64_data, validate=True)
     except (binascii.Error, ValueError) as exc:
-        raise ValueError("图片编码无效，无法提交给 Codex。") from exc
+        raise ValueError("图片编码无效，无法提交给 CLI 引擎。") from exc
 
-    images_dir = working_directory / ".claude-images"
+    images_dir = _resolve_cli_image_directory(
+        engine=engine,
+        working_directory=working_directory,
+    )
     images_dir.mkdir(parents=True, exist_ok=True)
 
     normalized = (image_format or "jpeg").strip().lower()
@@ -4575,10 +4591,11 @@ async def handle_photo(
                             base64_data=processed_image.base64_data,
                             image_format=img_format,
                             working_directory=current_dir,
+                            engine=active_engine,
                         )
                         cli_image_files.append(cli_image_file)
                         images[idx]["file_path"] = str(cli_image_file)
-                engine_label = "Codex" if active_engine == "codex" else "Claude"
+                engine_label = _engine_label(active_engine)
                 await _set_image_status(
                     _build_image_stage_status(
                         4,

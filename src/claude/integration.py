@@ -128,6 +128,7 @@ class ClaudeProcessManager:
             model=model,
             reasoning_effort=reasoning_effort,
             images=images,
+            working_directory=working_directory,
         )
         cli_kind = self._detect_cli_kind(cmd[0])
         cli_display_name = self._cli_display_name(cli_kind)
@@ -303,6 +304,7 @@ class ClaudeProcessManager:
         model: Optional[str] = None,
         reasoning_effort: Optional[str] = None,
         images: Optional[List[Dict[str, str]]] = None,
+        working_directory: Optional[Path] = None,
     ) -> List[str]:
         """Build CLI command with engine-specific arguments."""
         cli_path = self._resolve_cli_path()
@@ -325,6 +327,7 @@ class ClaudeProcessManager:
                 continue_session=continue_session,
                 model=model,
                 images=images,
+                working_directory=working_directory,
             )
         return self._build_claude_command(
             cli_path=cli_path,
@@ -458,15 +461,17 @@ class ClaudeProcessManager:
         continue_session: bool,
         model: Optional[str],
         images: Optional[List[Dict[str, str]]] = None,
+        working_directory: Optional[Path] = None,
     ) -> List[str]:
         """Build Gemini CLI command."""
-        if images:
-            raise ClaudeProcessError(
-                "Gemini CLI image input is not supported in this bot MVP."
-            )
-
-        normalized_prompt = (
-            str(prompt or "").strip() or "Please continue where we left off"
+        normalized_prompt = str(prompt or "").strip()
+        image_refs = self._extract_gemini_image_refs(
+            images=images,
+            working_directory=working_directory,
+        )
+        normalized_prompt = self._build_gemini_prompt(
+            prompt=normalized_prompt,
+            image_refs=image_refs,
         )
         approval_mode = str(
             getattr(self.config, "gemini_approval_mode", "yolo") or "yolo"
@@ -492,6 +497,26 @@ class ClaudeProcessManager:
         return cmd
 
     @staticmethod
+    def _build_gemini_prompt(
+        *,
+        prompt: str,
+        image_refs: List[str],
+    ) -> str:
+        """Build Gemini headless prompt, appending @image references when needed."""
+        normalized_prompt = str(prompt or "").strip()
+        if not normalized_prompt:
+            normalized_prompt = "Please continue where we left off"
+        if not image_refs:
+            return normalized_prompt
+
+        if not str(prompt or "").strip():
+            normalized_prompt = (
+                "Please analyze the attached image(s) and describe what you see."
+            )
+
+        return "\n\n".join([normalized_prompt, *image_refs])
+
+    @staticmethod
     def _normalize_codex_reasoning_effort(value: Optional[str]) -> str:
         """Normalize codex reasoning effort values from Telegram/state input."""
         normalized = str(value or "").strip().lower().replace("_", "-")
@@ -506,11 +531,16 @@ class ClaudeProcessManager:
     ) -> bool:
         """Whether current subprocess CLI can accept image attachments."""
         cli_path = self._resolve_cli_path()
-        if self._detect_cli_kind(cli_path) != "codex":
+        cli_kind = self._detect_cli_kind(cli_path)
+        if cli_kind == "codex":
+            if not images:
+                return True
+            return bool(self._extract_codex_image_paths(images))
+        if cli_kind != "gemini":
             return False
         if not images:
             return True
-        return bool(self._extract_codex_image_paths(images))
+        return bool(self._extract_gemini_image_refs(images))
 
     @staticmethod
     def _extract_codex_image_paths(
@@ -525,6 +555,37 @@ class ClaudeProcessManager:
             if file_path:
                 paths.append(file_path)
         return paths
+
+    @staticmethod
+    def _escape_gemini_path_ref(path_ref: str) -> str:
+        """Escape whitespace so Gemini can parse @path references reliably."""
+        return path_ref.replace("\\", "\\\\").replace(" ", "\\ ")
+
+    def _extract_gemini_image_refs(
+        self,
+        images: Optional[List[Dict[str, str]]],
+        working_directory: Optional[Path] = None,
+    ) -> List[str]:
+        """Extract Gemini @image references from local image file paths."""
+        if not images:
+            return []
+
+        resolved_cwd = working_directory.resolve() if working_directory else None
+        refs: List[str] = []
+        for image in images:
+            file_path = str(image.get("file_path") or "").strip()
+            if not file_path:
+                continue
+
+            path_obj = Path(file_path)
+            path_ref = file_path
+            if resolved_cwd is not None:
+                try:
+                    path_ref = str(path_obj.resolve().relative_to(resolved_cwd))
+                except ValueError:
+                    path_ref = str(path_obj)
+            refs.append(f"@{self._escape_gemini_path_ref(path_ref)}")
+        return refs
 
     async def _start_process(
         self,
