@@ -493,6 +493,24 @@ def test_format_error_message_uses_status_command_for_codex_hints():
     assert "/context" not in text
 
 
+def test_format_error_message_preserves_gatekeeper_fix_instructions():
+    """Gatekeeper quarantine errors should keep their actionable fix commands."""
+    error_text = (
+        "🔒 **Codex Blocked by Gatekeeper**\n\n"
+        "Codex CLI is quarantined by macOS Gatekeeper after a Homebrew update.\n"
+        "**Binary:** `/opt/homebrew/bin/codex`\n\n"
+        "**Fix now:**\n"
+        "• Run `xattr -dr com.apple.quarantine /opt/homebrew/bin/codex`\n\n"
+        "**Avoid next time:**\n"
+        "• Upgrade with `brew upgrade --cask codex --no-quarantine`"
+    )
+
+    text = _format_error_message(error_text, engine=ENGINE_CODEX)
+
+    assert text == error_text
+    assert "Codex CLI Error" not in text
+
+
 def test_build_context_tag_renders_codex_badge():
     """Context tag should include Codex badge for Codex engine responses."""
     tag = _build_context_tag(

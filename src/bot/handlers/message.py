@@ -1621,6 +1621,8 @@ def _format_error_message(error_str: str, *, engine: str = ENGINE_CLAUDE) -> str
     if "usage limit reached" in error_str.lower():
         # Usage limit error - already user-friendly from integration.py
         return error_str
+    elif "quarantined by macos gatekeeper" in error_str.lower():
+        return error_str
     elif "tool not allowed" in error_str.lower():
         # Tool validation error - already handled in facade.py
         return error_str

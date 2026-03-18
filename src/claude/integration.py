@@ -11,7 +11,9 @@ import asyncio
 import json
 import os
 import re
+import shlex
 import signal
+import sys
 import uuid
 from asyncio.subprocess import Process
 from collections import deque
@@ -295,6 +297,58 @@ class ClaudeProcessManager:
         if cli_kind == "gemini":
             return "Gemini CLI"
         return "Claude Code"
+
+    @staticmethod
+    def _read_quarantine_attribute(binary_path: Path) -> str:
+        """Return macOS quarantine xattr value when present."""
+        try:
+            raw_value = os.getxattr(str(binary_path), "com.apple.quarantine")
+        except (AttributeError, OSError, TypeError, ValueError):
+            return ""
+
+        if isinstance(raw_value, bytes):
+            return raw_value.decode("utf-8", errors="ignore").strip()
+        return str(raw_value).strip()
+
+    def _ensure_cli_ready(self, cli_path: str) -> None:
+        """Block known macOS Gatekeeper issues before spawning Codex."""
+        if sys.platform != "darwin":
+            return
+
+        cli_kind = self._detect_cli_kind(cli_path)
+        if cli_kind != "codex":
+            return
+
+        resolved_path = Path(str(cli_path or "").strip()).expanduser()
+        try:
+            resolved_path = resolved_path.resolve()
+        except OSError:
+            resolved_path = resolved_path.absolute()
+
+        quarantine_value = self._read_quarantine_attribute(resolved_path)
+        if not quarantine_value:
+            return
+
+        release_command = (
+            "xattr -dr com.apple.quarantine "
+            f"{shlex.quote(str(resolved_path))}"
+        )
+        logger.error(
+            "Codex CLI blocked by macOS Gatekeeper quarantine",
+            cli_path=str(resolved_path),
+            quarantine=quarantine_value,
+        )
+        raise ClaudeProcessError(
+            "🔒 **Codex Blocked by Gatekeeper**\n\n"
+            "Codex CLI is quarantined by macOS Gatekeeper after a Homebrew "
+            "update.\n"
+            f"**Binary:** `{resolved_path}`\n\n"
+            "**Fix now:**\n"
+            f"• Run `{release_command}`\n"
+            "• Or open Codex locally once and approve the system prompt\n\n"
+            "**Avoid next time:**\n"
+            "• Upgrade with `brew upgrade --cask codex --no-quarantine`"
+        )
 
     def _build_command(
         self,
@@ -595,6 +649,8 @@ class ClaudeProcessManager:
         stdin_payload: Optional[str] = None,
     ) -> Process:
         """Start Claude Code subprocess."""
+        if cmd:
+            self._ensure_cli_ready(cmd[0])
         env = os.environ.copy()
         # Avoid nested Claude session detection when bot is launched from CLAUDECODE env.
         env.pop("CLAUDECODE", None)

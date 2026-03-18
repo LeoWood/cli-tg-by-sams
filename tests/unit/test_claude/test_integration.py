@@ -7,6 +7,7 @@ from unittest.mock import AsyncMock, Mock
 
 import pytest
 
+import src.claude.integration as integration_module
 from src.claude.exceptions import ClaudeProcessError
 from src.claude.integration import ClaudeProcessManager
 from src.config.settings import Settings
@@ -623,6 +624,50 @@ def test_parse_stream_message_supports_codex_turn_failed(tmp_path):
     assert update.type == "error"
     assert update.content == "invalid model"
     assert update.metadata and update.metadata.get("engine") == "codex"
+
+
+def test_ensure_cli_ready_blocks_quarantined_codex_on_macos(tmp_path, monkeypatch):
+    """macOS quarantine should fail fast with actionable Codex instructions."""
+    manager = _build_manager(tmp_path)
+    codex_path = tmp_path / "codex"
+    codex_path.write_text("#!/bin/sh\n", encoding="utf-8")
+    codex_path.chmod(0o755)
+
+    monkeypatch.setattr(integration_module.sys, "platform", "darwin")
+    monkeypatch.setattr(
+        integration_module.os,
+        "getxattr",
+        lambda *_args, **_kwargs: b"03c1;1234;;OpenAI",
+        raising=False,
+    )
+
+    with pytest.raises(ClaudeProcessError) as exc_info:
+        manager._ensure_cli_ready(str(codex_path))
+
+    error_text = str(exc_info.value)
+    assert "Codex CLI is quarantined by macOS Gatekeeper" in error_text
+    assert str(codex_path.resolve()) in error_text
+    assert "xattr -dr com.apple.quarantine" in error_text
+    assert "brew upgrade --cask codex --no-quarantine" in error_text
+
+
+def test_ensure_cli_ready_allows_unquarantined_codex_on_macos(tmp_path, monkeypatch):
+    """Codex should start normally when quarantine metadata is absent."""
+    manager = _build_manager(tmp_path)
+    codex_path = tmp_path / "codex"
+    codex_path.write_text("#!/bin/sh\n", encoding="utf-8")
+    codex_path.chmod(0o755)
+
+    monkeypatch.setattr(integration_module.sys, "platform", "darwin")
+
+    def _raise_missing_attr(*_args, **_kwargs):
+        raise OSError("attribute not found")
+
+    monkeypatch.setattr(
+        integration_module.os, "getxattr", _raise_missing_attr, raising=False
+    )
+
+    manager._ensure_cli_ready(str(codex_path))
 
 
 @pytest.mark.asyncio
