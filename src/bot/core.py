@@ -664,7 +664,40 @@ class ClaudeCodeBot:
         approved_directory = getattr(self.settings, "approved_directory", None)
         if not isinstance(approved_directory, Path):
             return None
-        return approved_directory / "data/state/telegram/update-offset.json"
+        identity_suffix = self._build_update_offset_identity_suffix()
+        return (
+            approved_directory
+            / "data/state/telegram"
+            / f"update-offset-{identity_suffix}.json"
+        )
+
+    def _build_update_offset_identity_suffix(self) -> str:
+        """Build a stable per-bot suffix so different bots do not share offsets."""
+        raw_token = getattr(self.settings, "telegram_bot_token", None)
+        token_value = ""
+        if raw_token is not None:
+            get_secret_value = getattr(raw_token, "get_secret_value", None)
+            if callable(get_secret_value):
+                try:
+                    token_value = str(get_secret_value() or "").strip()
+                except Exception:
+                    token_value = ""
+            else:
+                token_value = str(raw_token).strip()
+
+        token_prefix = token_value.split(":", 1)[0].strip()
+        if token_prefix.isdigit():
+            return token_prefix
+
+        raw_username = str(
+            getattr(self.settings, "telegram_bot_username", "") or ""
+        ).strip()
+        normalized_username = raw_username.lstrip("@").lower()
+        sanitized_username = "".join(
+            char if char.isalnum() or char in {"-", "_"} else "-"
+            for char in normalized_username
+        ).strip("-_")
+        return sanitized_username or "default"
 
     def _initialize_update_tracking(self) -> None:
         """Initialize update dedupe and persisted offset tracking."""

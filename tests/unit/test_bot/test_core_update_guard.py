@@ -8,6 +8,44 @@ from telegram.ext import ApplicationHandlerStop
 from src.bot.core import ClaudeCodeBot
 
 
+def test_build_update_offset_state_file_uses_bot_specific_suffix(tmp_path):
+    """Different Telegram bots should not share the same offset file."""
+    settings = SimpleNamespace(
+        approved_directory=tmp_path,
+        telegram_bot_token="8501544866:example-token",
+        telegram_bot_username="leo_everglow_bot",
+    )
+    bot = ClaudeCodeBot(settings=settings, dependencies={})
+
+    state_file = bot._build_update_offset_state_file()
+
+    assert state_file == (
+        tmp_path / "data" / "state" / "telegram" / "update-offset-8501544866.json"
+    )
+
+
+def test_build_update_offset_state_file_falls_back_to_username_when_token_invalid(
+    tmp_path,
+):
+    """Username fallback keeps offset isolation when token is unavailable in tests."""
+    settings = SimpleNamespace(
+        approved_directory=tmp_path,
+        telegram_bot_token="not-a-token",
+        telegram_bot_username="@Leo Everglow Bot",
+    )
+    bot = ClaudeCodeBot(settings=settings, dependencies={})
+
+    state_file = bot._build_update_offset_state_file()
+
+    assert state_file == (
+        tmp_path
+        / "data"
+        / "state"
+        / "telegram"
+        / "update-offset-leo-everglow-bot.json"
+    )
+
+
 @pytest.mark.asyncio
 async def test_update_guard_blocks_duplicate_update():
     """Duplicate updates should be blocked by the guard."""
