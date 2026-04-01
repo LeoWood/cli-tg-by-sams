@@ -29,7 +29,7 @@ class TaskState(enum.Enum):
 @dataclass
 class ActiveTask:
     user_id: int
-    task: asyncio.Task
+    task: Optional[asyncio.Task] = None
     state: TaskState = TaskState.RUNNING
     created_at: datetime = field(default_factory=datetime.now)
     prompt_summary: str = ""
@@ -63,6 +63,105 @@ class TaskRegistry:
         """Get all task keys that belong to a user."""
         return [k for k, t in self._tasks.items() if t.user_id == user_id]
 
+    def _new_active_task(
+        self,
+        *,
+        user_id: int,
+        task: Optional[asyncio.Task] = None,
+        prompt_summary: str = "",
+        progress_message_id: Optional[int] = None,
+        chat_id: Optional[int] = None,
+        scope_key: Optional[str] = None,
+    ) -> ActiveTask:
+        """Build a normalized running task record."""
+        return ActiveTask(
+            user_id=user_id,
+            task=task,
+            prompt_summary=prompt_summary[:100],
+            progress_message_id=progress_message_id,
+            chat_id=chat_id,
+            scope_key=scope_key,
+        )
+
+    async def try_start(
+        self,
+        user_id: int,
+        *,
+        prompt_summary: str = "",
+        progress_message_id: Optional[int] = None,
+        chat_id: Optional[int] = None,
+        scope_key: Optional[str] = None,
+    ) -> bool:
+        """Atomically reserve a running slot for a scope."""
+        async with self._lock:
+            key = self._task_key(user_id, scope_key)
+            active = self._tasks.get(key)
+            if active and active.state == TaskState.RUNNING:
+                return False
+
+            self._tasks[key] = self._new_active_task(
+                user_id=user_id,
+                task=None,
+                prompt_summary=prompt_summary,
+                progress_message_id=progress_message_id,
+                chat_id=chat_id,
+                scope_key=scope_key,
+            )
+            self._sync_metrics_unlocked()
+            return True
+
+    async def attach_task(
+        self,
+        user_id: int,
+        task: asyncio.Task,
+        *,
+        prompt_summary: str = "",
+        progress_message_id: Optional[int] = None,
+        chat_id: Optional[int] = None,
+        scope_key: Optional[str] = None,
+    ) -> bool:
+        """Bind a concrete asyncio task to an existing running slot."""
+        async with self._lock:
+            key = self._task_key(user_id, scope_key)
+            active = self._tasks.get(key)
+
+            if active is None:
+                self._tasks[key] = self._new_active_task(
+                    user_id=user_id,
+                    task=task,
+                    prompt_summary=prompt_summary,
+                    progress_message_id=progress_message_id,
+                    chat_id=chat_id,
+                    scope_key=scope_key,
+                )
+                self._sync_metrics_unlocked()
+                return True
+
+            if active.state == TaskState.CANCELLED:
+                task.cancel()
+                self._sync_metrics_unlocked()
+                return False
+
+            if active.state != TaskState.RUNNING:
+                self._tasks[key] = self._new_active_task(
+                    user_id=user_id,
+                    task=task,
+                    prompt_summary=prompt_summary,
+                    progress_message_id=progress_message_id,
+                    chat_id=chat_id,
+                    scope_key=scope_key,
+                )
+                self._sync_metrics_unlocked()
+                return True
+
+            active.task = task
+            active.prompt_summary = prompt_summary[:100]
+            active.progress_message_id = progress_message_id
+            active.chat_id = chat_id
+            active.scope_key = scope_key
+            self._sync_metrics_unlocked()
+            return True
+
     async def register(
         self,
         user_id: int,
@@ -72,16 +171,14 @@ class TaskRegistry:
         chat_id: Optional[int] = None,
         scope_key: Optional[str] = None,
     ) -> None:
-        async with self._lock:
-            self._tasks[self._task_key(user_id, scope_key)] = ActiveTask(
-                user_id=user_id,
-                task=task,
-                prompt_summary=prompt_summary[:100],
-                progress_message_id=progress_message_id,
-                chat_id=chat_id,
-                scope_key=scope_key,
-            )
-            self._sync_metrics_unlocked()
+        await self.attach_task(
+            user_id,
+            task,
+            prompt_summary=prompt_summary,
+            progress_message_id=progress_message_id,
+            chat_id=chat_id,
+            scope_key=scope_key,
+        )
 
     async def cancel(self, user_id: int, scope_key: Optional[str] = None) -> bool:
         """Cancel the user's active task. Returns True if cancelled."""
@@ -97,7 +194,8 @@ class TaskRegistry:
                 if not active or active.state != TaskState.RUNNING:
                     continue
                 active.state = TaskState.CANCELLED
-                active.task.cancel()
+                if active.task is not None:
+                    active.task.cancel()
                 cancelled = True
 
             if not cancelled:

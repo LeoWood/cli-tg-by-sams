@@ -2436,6 +2436,59 @@ def _build_queue_controls_keyboard(queue_id: str) -> InlineKeyboardMarkup:
     )
 
 
+async def _try_claim_scope_slot(
+    task_registry: Optional[TaskRegistry],
+    *,
+    user_id: int,
+    scope_key: str,
+    prompt_summary: str,
+    chat_id: Optional[int],
+) -> bool:
+    """Reserve a running slot atomically when registry supports it."""
+    if not isinstance(task_registry, TaskRegistry):
+        return False
+    return await task_registry.try_start(
+        user_id,
+        prompt_summary=prompt_summary,
+        chat_id=chat_id,
+        scope_key=scope_key,
+    )
+
+
+async def _attach_scope_task(
+    task_registry: Optional[TaskRegistry],
+    *,
+    user_id: int,
+    scope_key: str,
+    task: asyncio.Task,
+    prompt_summary: str,
+    progress_message_id: Optional[int],
+    chat_id: Optional[int],
+) -> bool:
+    """Attach task to reserved running slot, with backward compatibility."""
+    if isinstance(task_registry, TaskRegistry):
+        return await task_registry.attach_task(
+            user_id,
+            task,
+            prompt_summary=prompt_summary,
+            progress_message_id=progress_message_id,
+            chat_id=chat_id,
+            scope_key=scope_key,
+        )
+
+    register = getattr(task_registry, "register", None)
+    if callable(register):
+        await register(
+            user_id,
+            task,
+            prompt_summary=prompt_summary,
+            progress_message_id=progress_message_id,
+            chat_id=chat_id,
+            scope_key=scope_key,
+        )
+    return True
+
+
 async def dispatch_next_queued_task_if_idle(
     *, context: ContextTypes.DEFAULT_TYPE, scope_key: str
 ) -> bool:
@@ -2666,6 +2719,7 @@ async def handle_text_message(
     end_to_first_reply_seconds: Optional[float] = None
     first_reply_sent = False
     request_result = "failure"
+    scope_slot_claimed = False
 
     try:
         # Check rate limit with estimated cost for text processing
@@ -2687,7 +2741,19 @@ async def handle_text_message(
 
         # Check if user already has an active task
         task_registry: Optional[TaskRegistry] = context.bot_data.get("task_registry")
-        if task_registry and await task_registry.is_busy(user_id, scope_key=scope_key):
+        claimed_now = await _try_claim_scope_slot(
+            task_registry,
+            user_id=user_id,
+            scope_key=scope_key,
+            prompt_summary=message_text,
+            chat_id=getattr(update.effective_chat, "id", None),
+        )
+        scope_slot_claimed = claimed_now
+        if (
+            task_registry
+            and not claimed_now
+            and await task_registry.is_busy(user_id, scope_key=scope_key)
+        ):
             if _from_queue:
                 logger.info(
                     "Skip queued text dispatch because scope is still busy",
@@ -2790,6 +2856,8 @@ async def handle_text_message(
             )
             metrics_finalize_request = False
             return
+        if scope_slot_claimed:
+            queue_dispatch_needed = True
         noncritical_failure_threshold = max(
             1, int(getattr(settings, "telegram_noncritical_failure_threshold", 3) or 3)
         )
@@ -3203,19 +3271,21 @@ async def handle_text_message(
         preprocess_seconds = max(
             0.0, cli_exec_started_monotonic - request_processing_started_monotonic
         )
-        queue_dispatch_needed = True
+        if not queue_dispatch_needed and task_registry is not None:
+            queue_dispatch_needed = True
         task = asyncio.create_task(_run_claude())
 
         # Register task for cancel support
-        if task_registry:
-            await task_registry.register(
-                user_id,
-                task,
-                prompt_summary=message_text,
-                progress_message_id=progress_msg.message_id,
-                chat_id=update.effective_chat.id,
-                scope_key=scope_key,
-            )
+        if not await _attach_scope_task(
+            task_registry,
+            user_id=user_id,
+            scope_key=scope_key,
+            task=task,
+            prompt_summary=message_text,
+            progress_message_id=progress_msg.message_id,
+            chat_id=getattr(update.effective_chat, "id", None),
+        ):
+            raise asyncio.CancelledError
 
         claude_response = None
         command_succeeded = False
@@ -3282,6 +3352,7 @@ async def handle_text_message(
             await _cancel_progress_flush_task()
             if task_registry:
                 await task_registry.remove(user_id, scope_key=scope_key)
+                scope_slot_claimed = False
             # Preserve thinking process with cancelled label
             if all_progress_lines and not _noncritical_transport_blocked():
                 summary_text = "[Cancelled] " + _generate_thinking_summary(
@@ -3365,6 +3436,7 @@ async def handle_text_message(
         # Clean up task registry
         if task_registry:
             await task_registry.remove(user_id, scope_key=scope_key)
+            scope_slot_claimed = False
         await _cancel_progress_flush_task()
 
         # Build context tag for display in thinking summary or reply header
@@ -3671,6 +3743,8 @@ async def handle_text_message(
 
         logger.exception("Error processing text message", error=str(e), user_id=user_id)
     finally:
+        if scope_slot_claimed and task_registry:
+            await task_registry.remove(user_id, scope_key=scope_key)
         resolved_engine = locals().get("active_engine", ENGINE_CLAUDE)
         if metrics_finalize_request and hasattr(
             runtime_metrics, "increment_text_requests_total"
@@ -4089,6 +4163,8 @@ async def handle_photo(
 ) -> None:
     """Handle photo uploads."""
     user_id = update.effective_user.id
+    scope_slot_claimed = False
+    queue_dispatch_needed = False
     queued_prompt_chat_id = (
         _queued_prompt_chat_id if isinstance(_queued_prompt_chat_id, int) else None
     )
@@ -4146,7 +4222,20 @@ async def handle_photo(
 
     if image_handler:
         task_registry: Optional[TaskRegistry] = context.bot_data.get("task_registry")
-        if task_registry and await task_registry.is_busy(user_id, scope_key=scope_key):
+        claimed_now = await _try_claim_scope_slot(
+            task_registry,
+            user_id=user_id,
+            scope_key=scope_key,
+            prompt_summary=grouped_caption or f"[photo x{photo_count}]",
+            chat_id=getattr(update.effective_chat, "id", None),
+        )
+        scope_slot_claimed = claimed_now
+        queue_dispatch_needed = claimed_now
+        if (
+            task_registry
+            and not claimed_now
+            and await task_registry.is_busy(user_id, scope_key=scope_key)
+        ):
             if _from_queue:
                 logger.info(
                     "Skip queued photo dispatch because scope is still busy",
@@ -4635,15 +4724,16 @@ async def handle_photo(
                     )
 
                 image_task = asyncio.create_task(_run_image_claude())
-                if task_registry:
-                    await task_registry.register(
-                        user_id,
-                        image_task,
-                        prompt_summary=model_prompt,
-                        progress_message_id=progress_msg.message_id,
-                        chat_id=update.effective_chat.id,
-                        scope_key=scope_key,
-                    )
+                if not await _attach_scope_task(
+                    task_registry,
+                    user_id=user_id,
+                    scope_key=scope_key,
+                    task=image_task,
+                    prompt_summary=model_prompt,
+                    progress_message_id=progress_msg.message_id,
+                    chat_id=getattr(update.effective_chat, "id", None),
+                ):
+                    raise asyncio.CancelledError
 
                 try:
                     claude_response = await image_task
@@ -4699,6 +4789,8 @@ async def handle_photo(
                     await _cancel_stream_flush_task()
                     if task_registry:
                         await task_registry.remove(user_id, scope_key=scope_key)
+                        scope_slot_claimed = False
+                    queue_dispatch_needed = False
                     try:
                         await dispatch_next_queued_task_if_idle(
                             context=context,
@@ -4949,6 +5041,23 @@ async def handle_photo(
                 ),
                 parse_mode="Markdown",
             )
+        finally:
+            if scope_slot_claimed and task_registry:
+                await task_registry.remove(user_id, scope_key=scope_key)
+                scope_slot_claimed = False
+            if queue_dispatch_needed:
+                try:
+                    await dispatch_next_queued_task_if_idle(
+                        context=context,
+                        scope_key=scope_key,
+                    )
+                except Exception as dispatch_error:
+                    logger.warning(
+                        "Failed to dispatch queued task after image setup failure",
+                        error=str(dispatch_error),
+                        user_id=user_id,
+                        scope_key=scope_key,
+                    )
     else:
         # Fall back to unsupported message
         await _reply_text_resilient(

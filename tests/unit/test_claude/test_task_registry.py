@@ -93,3 +93,35 @@ async def test_list_running_returns_only_running_tasks() -> None:
         await task_running
     with suppress(asyncio.CancelledError):
         await task_done
+
+
+@pytest.mark.asyncio
+async def test_try_start_prevents_second_running_scope() -> None:
+    """Atomic scope reservation should reject a concurrent second start."""
+    registry = TaskRegistry()
+    scope_key = "77:-100:1"
+
+    first_started = await registry.try_start(77, scope_key=scope_key)
+    second_started = await registry.try_start(77, scope_key=scope_key)
+
+    assert first_started is True
+    assert second_started is False
+    assert await registry.is_busy(77, scope_key=scope_key) is True
+
+
+@pytest.mark.asyncio
+async def test_attach_task_cancels_when_slot_was_cancelled() -> None:
+    """Binding a task after cancellation should immediately cancel it."""
+    registry = TaskRegistry()
+    scope_key = "88:-100:1"
+
+    assert await registry.try_start(88, scope_key=scope_key) is True
+    assert await registry.cancel(88, scope_key=scope_key) is True
+
+    task = asyncio.create_task(_long_running())
+    attached = await registry.attach_task(88, task, scope_key=scope_key)
+    await asyncio.sleep(0)
+
+    assert attached is False
+    assert task.cancelled() is True
+    assert await registry.is_busy(88, scope_key=scope_key) is False
