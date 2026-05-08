@@ -82,6 +82,26 @@ def test_resume_summary_prefers_thread_name_over_messages():
     assert summary == "调整 resume 菜单优先使用最..."
 
 
+def test_resume_summary_strips_telegram_transport_prefix():
+    """Transport context should not dominate resume button summaries."""
+    summary = build_resume_session_summary(
+        thread_name="",
+        first_message=(
+            "系统提示：你正在通过 Telegram 与用户远程协作，用户不在当前机器终端。"
+            "\n如需自动回传生成的图片或文件，请将输出保存到指定目录。"
+            "\n\n看看这个 resume 标题逻辑有什么问题"
+        ),
+        last_user_message=(
+            "Telegram remote session. User is not on this machine.\n\n"
+            "修复 projects 会话选择分页"
+        ),
+        previous_user_message="",
+        max_len=20,
+    )
+
+    assert summary == "修复 projects 会话选择分页"
+
+
 def test_resume_button_label_uses_summary_instead_of_low_signal_tail():
     """Button labels should surface the topic summary for resume choices."""
     candidate = _Candidate(

@@ -122,6 +122,56 @@ async def test_codex_scanner_list_projects_filters_by_approved_directory(tmp_pat
 
 
 @pytest.mark.asyncio
+async def test_codex_scanner_list_projects_accepts_multiple_approved_roots(tmp_path):
+    """Projects under any approved root should be listed."""
+    approved_a = tmp_path / "approved-a"
+    approved_b = tmp_path / "approved-b"
+    outside = tmp_path / "outside"
+    approved_a.mkdir()
+    approved_b.mkdir()
+    outside.mkdir()
+    sessions_dir = tmp_path / ".codex" / "sessions"
+
+    now = datetime.utcnow()
+    _write_codex_session(
+        file_path=sessions_dir / "2026/02/14/rollout-a.jsonl",
+        session_id="session-a",
+        cwd=approved_a / "proj-a",
+        first_message="hello a",
+        last_message=None,
+        timestamp=now,
+    )
+    _write_codex_session(
+        file_path=sessions_dir / "2026/02/14/rollout-b.jsonl",
+        session_id="session-b",
+        cwd=approved_b / "proj-b",
+        first_message="hello b",
+        last_message=None,
+        timestamp=now + timedelta(seconds=10),
+    )
+    _write_codex_session(
+        file_path=sessions_dir / "2026/02/14/rollout-outside.jsonl",
+        session_id="session-outside",
+        cwd=outside / "proj-outside",
+        first_message="hello outside",
+        last_message=None,
+        timestamp=now + timedelta(seconds=20),
+    )
+
+    scanner = CodexSessionScanner(
+        approved_directory=(approved_a, approved_b),
+        cache_ttl_sec=0,
+        sessions_dir=sessions_dir,
+    )
+    projects = await scanner.list_projects()
+
+    assert projects == [
+        (approved_b / "proj-b").resolve(),
+        (approved_a / "proj-a").resolve(),
+    ]
+
+
+@pytest.mark.asyncio
 async def test_codex_scanner_list_sessions_extracts_message_and_activity(tmp_path):
     """Session list should include parsed message preview and activity marker."""
     approved = tmp_path / "approved"
@@ -181,6 +231,44 @@ async def test_codex_scanner_list_sessions_extracts_message_and_activity(tmp_pat
     assert sessions[1].last_user_message == "old latest"
     assert sessions[1].previous_user_message == "old previous"
     assert sessions[1].is_probably_active is False
+
+
+@pytest.mark.asyncio
+async def test_codex_scanner_strips_telegram_prefix_before_preview_truncation(
+    tmp_path,
+):
+    """Transport prefixes should be removed before scanner preview truncation."""
+    approved = tmp_path / "approved"
+    project = approved / "proj-a"
+    project.mkdir(parents=True)
+    sessions_dir = tmp_path / ".codex" / "sessions"
+
+    _write_codex_session(
+        file_path=sessions_dir / "2026/02/14/rollout.jsonl",
+        session_id="session-a",
+        cwd=project,
+        first_message=(
+            "系统提示：你正在通过 Telegram 与用户远程协作，用户不在当前机器终端。"
+            "\n如需自动回传生成的图片或文件，请将输出保存到指定目录。"
+            "\n\n看看这个 resume 标题逻辑有什么问题"
+        ),
+        last_message=(
+            "Telegram remote session. User is not on this machine.\n\n"
+            "修复 projects 会话选择分页"
+        ),
+        timestamp=datetime.utcnow(),
+    )
+
+    scanner = CodexSessionScanner(
+        approved_directory=approved,
+        cache_ttl_sec=0,
+        sessions_dir=sessions_dir,
+    )
+    sessions = await scanner.list_sessions(project_cwd=project, active_window_sec=5)
+
+    assert len(sessions) == 1
+    assert sessions[0].first_message == "看看这个 resume 标题逻辑有什么问题"
+    assert sessions[0].last_user_message == "修复 projects 会话选择分页"
 
 
 @pytest.mark.asyncio

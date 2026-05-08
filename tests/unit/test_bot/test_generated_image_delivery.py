@@ -20,6 +20,8 @@ def _build_settings(approved_directory: Path) -> Settings:
         telegram_bot_token="test:token",
         telegram_bot_username="testbot",
         approved_directory=approved_directory,
+        auto_delivery_directory=None,
+        auto_delivery_require_directory=False,
         use_sdk=True,
     )
 

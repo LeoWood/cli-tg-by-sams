@@ -29,6 +29,25 @@ ClaudeResponse = Union["CLIClaudeResponse", "SDKClaudeResponse"]
 logger = structlog.get_logger()
 
 
+def _get_approved_roots(settings: Settings) -> tuple[Path, ...]:
+    """Return approved roots while preserving legacy Settings shape."""
+    roots = getattr(settings, "approved_roots", None)
+    if roots:
+        return tuple(Path(root).resolve() for root in roots)
+    return (settings.approved_directory.resolve(),)
+
+
+def _is_path_under_roots(path: Path, roots: tuple[Path, ...]) -> bool:
+    """Return True when path is inside any approved root."""
+    for root in roots:
+        try:
+            path.relative_to(root)
+            return True
+        except ValueError:
+            continue
+    return False
+
+
 @dataclass
 class ClaudeSession:
     """Claude Code session state."""
@@ -130,7 +149,7 @@ class SessionStorage:
 class InMemorySessionStorage(SessionStorage):
     """In-memory session storage for development/testing."""
 
-    def __init__(self):
+    def __init__(self) -> None:
         """Initialize in-memory storage."""
         self.sessions: Dict[str, ClaudeSession] = {}
 
@@ -196,11 +215,13 @@ class SessionManager:
 
         # Try to load from storage
         if session_id:
-            session = await self.storage.load_session(session_id)
-            if session and not session.is_expired(self.config.session_timeout_hours):
-                self.active_sessions[session_id] = session
+            stored_session = await self.storage.load_session(session_id)
+            if stored_session and not stored_session.is_expired(
+                self.config.session_timeout_hours
+            ):
+                self.active_sessions[session_id] = stored_session
                 logger.info("Loaded session from storage", session_id=session_id)
-                return session
+                return stored_session
 
         # Check user session limit
         user_sessions = await self._get_user_sessions(user_id)
@@ -290,12 +311,13 @@ class SessionManager:
         allow_project_rebind: bool = False,
     ) -> ClaudeSession:
         """Inner implementation of adopt_external_session, called under lock."""
-        # 2. Validate project_path within approved_directory
+        # 2. Validate project_path within approved directories
         resolved = project_path.resolve()
-        approved = self.config.approved_directory.resolve()
-        if not resolved.is_relative_to(approved):
+        approved_roots = _get_approved_roots(self.config)
+        if not _is_path_under_roots(resolved, approved_roots):
             raise ValueError(
-                f"Project path {resolved} is not under approved directory {approved}"
+                f"Project path {resolved} is not under approved directories "
+                f"{[str(root) for root in approved_roots]}"
             )
 
         # 3. Validate timestamps (normalize to naive UTC for consistency)

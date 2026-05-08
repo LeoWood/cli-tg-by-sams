@@ -84,6 +84,8 @@ cp .env.example .env
 TELEGRAM_BOT_TOKEN=<从 BotFather 获取>
 TELEGRAM_BOT_USERNAME=<Bot 用户名，不带 @>
 APPROVED_DIRECTORY=/path/to/your/projects
+# 可选：额外项目根目录，逗号分隔
+APPROVED_DIRECTORIES=/path/to/other/projects,/path/to/more/projects
 
 # === 安全 ===
 ALLOWED_USERS=<你的 Telegram User ID>

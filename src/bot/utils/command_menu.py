@@ -25,6 +25,7 @@ class MenuCommandSpec:
 COMMAND_MENU_SPECS: tuple[MenuCommandSpec, ...] = (
     MenuCommandSpec("new", "Clear context and start fresh session"),
     MenuCommandSpec("restartbot", "Restart bot service (admin)"),
+    MenuCommandSpec("projects", "Show all projects"),
     MenuCommandSpec("opsstatus", "Show bot runtime ops status"),
     MenuCommandSpec("resume", "Resume a desktop session"),
     MenuCommandSpec("context", "Show session context and usage"),
@@ -36,7 +37,6 @@ COMMAND_MENU_SPECS: tuple[MenuCommandSpec, ...] = (
     MenuCommandSpec("model", "View or set model"),
     MenuCommandSpec("effort", "View or set reasoning effort (Codex)"),
     MenuCommandSpec("codexdiag", "Diagnose Codex MCP status (Codex)"),
-    MenuCommandSpec("projects", "Show all projects"),
     MenuCommandSpec("cd", "Change directory (resumes project session)"),
     MenuCommandSpec("ls", "List files in current directory"),
     MenuCommandSpec("git", "Git repository commands"),
@@ -63,7 +63,7 @@ async def sync_chat_command_menu(
     engine: str | None,
 ) -> List[BotCommand]:
     """Apply per-chat command menu for the active engine."""
-    if bot is None or not isinstance(chat_id, int) or chat_id <= 0:
+    if bot is None or not isinstance(chat_id, int) or chat_id == 0:
         return []
 
     normalized = normalize_cli_engine(engine or DEFAULT_CLI_ENGINE)

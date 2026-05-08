@@ -6,6 +6,8 @@ REQUESTER_ID="${2:-unknown}"
 CHAT_ID="${3:-unknown}"
 MESSAGE_THREAD_ID="${4:-0}"
 DELAY_SECONDS="${RESTART_DELAY_SECONDS:-1.5}"
+POST_RESTART_STATUS_TIMEOUT_SECONDS="${POST_RESTART_STATUS_TIMEOUT_SECONDS:-45}"
+POST_RESTART_STATUS_INTERVAL_SECONDS="${POST_RESTART_STATUS_INTERVAL_SECONDS:-2}"
 
 PROJECT_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 LOG_DIR="$PROJECT_ROOT/logs"
@@ -77,6 +79,29 @@ $detail"
   fi
 }
 
+wait_for_post_restart_status() {
+  local deadline
+  local now
+  local rc=1
+  deadline=$(( $(date +%s) + POST_RESTART_STATUS_TIMEOUT_SECONDS ))
+
+  while true; do
+    if "$PROJECT_ROOT/scripts/tmux-bot.sh" status >>"$LOG_FILE" 2>&1; then
+      return 0
+    fi
+    rc=$?
+
+    now="$(date +%s)"
+    if (( now >= deadline )); then
+      return "$rc"
+    fi
+
+    log_event "post_status_retry" \
+      "exit_code=$rc interval_seconds=$POST_RESTART_STATUS_INTERVAL_SECONDS"
+    sleep "$POST_RESTART_STATUS_INTERVAL_SECONDS"
+  done
+}
+
 log_event "restart_requested" "pid=$$ ppid=$PPID delay_seconds=$DELAY_SECONDS"
 
 if ! command -v tmux >/dev/null 2>&1; then
@@ -97,7 +122,7 @@ else
   exit "$rc"
 fi
 
-if "$PROJECT_ROOT/scripts/tmux-bot.sh" status >>"$LOG_FILE" 2>&1; then
+if wait_for_post_restart_status; then
   log_event "post_status_ok"
   notify_telegram "success"
 else

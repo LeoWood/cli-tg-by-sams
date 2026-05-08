@@ -1,9 +1,11 @@
 """UI helpers for /resume project selection."""
 
 from pathlib import Path
-from typing import Iterable, Optional
+from typing import Any, Iterable, Optional
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup
+
+from .approved_roots import normalize_approved_roots, relative_path_for_roots
 
 RECENT_PROJECT_LIMIT = 5
 
@@ -35,19 +37,23 @@ def _escape_markdown(text: str) -> str:
     return text
 
 
-def _relative_path_text(project: Path, approved_root: Path) -> str:
+def _relative_path_text(
+    project: Path,
+    approved_root: Path,
+    approved_roots: Optional[tuple[Path, ...]] = None,
+) -> str:
     """Return project path relative to approved root."""
-    try:
-        rel = project.relative_to(approved_root)
-        rel_text = str(rel)
-    except ValueError:
-        rel_text = project.name
-    return "." if rel_text in ("", ".") else rel_text
+    roots = approved_roots or (approved_root,)
+    return relative_path_for_roots(project, roots)
 
 
-def _button_label(project: Path, approved_root: Path) -> str:
+def _button_label(
+    project: Path,
+    approved_root: Path,
+    approved_roots: Optional[tuple[Path, ...]] = None,
+) -> str:
     """Build compact button label: 'name · parent'."""
-    rel = _relative_path_text(project, approved_root)
+    rel = _relative_path_text(project, approved_root, approved_roots)
     if rel == ".":
         return "📁 Approved Root"
 
@@ -68,15 +74,19 @@ def build_resume_project_selector(
     *,
     projects: Iterable[Path],
     approved_root: Path,
-    token_mgr,
+    token_mgr: Any,
     user_id: int,
     current_directory: Optional[Path] = None,
     show_all: bool = False,
     payload_extra: Optional[dict] = None,
     engine: Optional[str] = None,
+    approved_roots: Optional[Iterable[Path]] = None,
 ) -> tuple[str, InlineKeyboardMarkup]:
     """Build message text and keyboard for /resume project selection."""
     project_list = [p.resolve() for p in projects]
+    root_tuple = normalize_approved_roots(
+        tuple(approved_roots) if approved_roots is not None else (approved_root,)
+    )
 
     current_resolved = None
     if current_directory is not None:
@@ -92,7 +102,11 @@ def build_resume_project_selector(
         )
 
     # Hide approved root when there are other meaningful project options.
-    non_root = [p for p in project_list if _relative_path_text(p, approved_root) != "."]
+    non_root = [
+        p
+        for p in project_list
+        if _relative_path_text(p, approved_root, root_tuple) != "."
+    ]
     display_pool = non_root if non_root else project_list
 
     if show_all:
@@ -102,7 +116,7 @@ def build_resume_project_selector(
 
     keyboard = []
     for proj in visible_projects:
-        label = _button_label(proj, approved_root)
+        label = _button_label(proj, approved_root, root_tuple)
         if current_resolved and proj == current_resolved:
             label = f"✅ {label}"
         token = token_mgr.issue(
@@ -154,7 +168,7 @@ def build_resume_project_selector(
 
     preview_lines = []
     for proj in visible_projects:
-        rel_text = _relative_path_text(proj, approved_root)
+        rel_text = _relative_path_text(proj, approved_root, root_tuple)
         if rel_text == ".":
             rel_text = "(approved root)"
         line_prefix = "•"

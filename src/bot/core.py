@@ -13,7 +13,7 @@ import pickle
 import time
 from collections import deque
 from pathlib import Path
-from typing import Any, Callable, Dict, List, MutableMapping, Optional, Tuple
+from typing import Any, Callable, Dict, List, MutableMapping, Optional, Tuple, cast
 
 import structlog
 from telegram import Update
@@ -37,9 +37,9 @@ from ..exceptions import ClaudeCodeTelegramError
 from ..monitoring import RuntimeMetrics
 from .features.registry import FeatureRegistry
 from .inbound_task_queue import InboundTaskQueue
-from .utils.cli_engine import get_default_cli_engine
-from .utils.command_menu import build_bot_commands_for_engine
-from .utils.scope_state import SCOPE_STATE_CONTAINER_KEY
+from .utils.cli_engine import get_active_cli_engine, get_default_cli_engine
+from .utils.command_menu import build_bot_commands_for_engine, sync_chat_command_menu
+from .utils.scope_state import SCOPE_STATE_CONTAINER_KEY, get_scope_state_from_update
 from .utils.telegram_send import is_transient_network_error, send_message_resilient
 from .utils.update_dedupe import UpdateDedupeCache
 from .utils.update_offset_store import UpdateOffsetStore
@@ -116,6 +116,7 @@ class ClaudeCodeBot:
         self._update_dedupe_cache = UpdateDedupeCache(ttl_seconds=300, max_size=5000)
         self._update_offset_store: Optional[UpdateOffsetStore] = None
         self._startup_min_update_id: Optional[int] = None
+        self._synced_command_menu_by_chat: dict[int, str] = {}
 
     def _get_runtime_metrics(self) -> Optional[RuntimeMetrics]:
         """Return shared runtime metrics service when available."""
@@ -777,7 +778,7 @@ class ClaudeCodeBot:
     def _inject_deps(self, handler: Callable) -> Callable:
         """Inject dependencies into handlers."""
 
-        async def wrapped(update: Update, context: ContextTypes.DEFAULT_TYPE):
+        async def wrapped(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Any:
             # Add dependencies to context
             for key, value in self.deps.items():
                 context.bot_data[key] = value
@@ -786,9 +787,57 @@ class ClaudeCodeBot:
             context.bot_data["settings"] = self.settings
             context.bot_data["bot_runtime"] = self
 
+            await self._sync_command_menu_for_update(update, context)
+
             return await handler(update, context)
 
         return wrapped
+
+    async def _sync_command_menu_for_update(
+        self,
+        update: Update,
+        context: ContextTypes.DEFAULT_TYPE,
+    ) -> None:
+        """Refresh chat-scoped command menu once per chat/engine."""
+        if self.app is None:
+            return
+
+        chat_id = getattr(getattr(update, "effective_chat", None), "id", None)
+        if not isinstance(chat_id, int) or chat_id == 0:
+            return
+
+        _, scope_state = get_scope_state_from_update(
+            user_data=cast(dict[str, Any], context.user_data),
+            update=update,
+            default_directory=self.settings.approved_directory,
+        )
+        engine = get_active_cli_engine(scope_state)
+        if self._synced_command_menu_by_chat.get(chat_id) == engine:
+            return
+
+        try:
+            commands = await sync_chat_command_menu(
+                bot=self.app.bot,
+                chat_id=chat_id,
+                engine=engine,
+            )
+        except Exception as exc:
+            logger.warning(
+                "Failed to sync command menu for update",
+                chat_id=chat_id,
+                engine=engine,
+                error=str(exc),
+            )
+            return
+
+        if commands:
+            self._synced_command_menu_by_chat[chat_id] = engine
+            logger.info(
+                "Synced command menu for update",
+                chat_id=chat_id,
+                engine=engine,
+                commands=[cmd.command for cmd in commands],
+            )
 
     def _add_middleware(self) -> None:
         """Add middleware to application."""

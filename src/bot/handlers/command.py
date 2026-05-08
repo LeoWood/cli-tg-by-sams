@@ -21,6 +21,7 @@ from ...services.session_interaction_service import SessionInteractionService
 from ...services.session_lifecycle_service import SessionLifecycleService
 from ...services.session_service import SessionService
 from ..inbound_task_queue import InboundTaskQueue
+from ..utils.approved_roots import get_approved_roots, relative_path_for_roots
 from ..utils.cli_engine import (
     ENGINE_CLAUDE,
     ENGINE_CODEX,
@@ -282,7 +283,7 @@ def _get_or_create_resume_scanner(
     if scanner is None:
         scanner = (
             CodexSessionScanner(
-                approved_directory=settings.approved_directory,
+                approved_directory=get_approved_roots(settings),
                 cache_ttl_sec=settings.resume_scan_cache_ttl_seconds,
             )
             if engine == ENGINE_CODEX
@@ -791,6 +792,7 @@ async def switch_engine(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
             show_all=False,
             payload_extra={"engine": requested_engine},
             engine=requested_engine,
+            approved_roots=get_approved_roots(settings),
         )
         await _reply_update_message_resilient(
             update,
@@ -1409,61 +1411,52 @@ async def print_working_directory(
 
 async def show_projects(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Handle /projects command."""
+    user_id = update.effective_user.id
     settings: Settings = context.bot_data["settings"]
 
     try:
-        # Get directories in approved directory (these are "projects")
-        projects = []
-        for item in sorted(settings.approved_directory.iterdir()):
-            if item.is_dir() and not item.name.startswith("."):
-                projects.append(item.name)
+        _, scope_state = get_scope_state_from_update(
+            user_data=context.user_data,
+            update=update,
+            default_directory=settings.approved_directory,
+        )
+        active_engine = get_active_cli_engine(scope_state)
+        token_mgr = _get_or_create_resume_token_manager(context)
+        scanner = _get_or_create_resume_scanner(
+            context=context,
+            settings=settings,
+            engine=active_engine,
+        )
+        projects = await scanner.list_projects()
 
         if not projects:
             await _reply_update_message_resilient(
                 update,
                 context,
-                "📁 **No Projects Found**\n\n"
-                "No subdirectories found in your approved directory.\n"
-                "Create some directories to organize your projects!",
+                f"📁 **No {_engine_display_name(active_engine)} Projects Found**\n\n"
+                "No desktop sessions were found under the approved directories.",
             )
             return
 
-        # Create inline keyboard with project buttons
-        keyboard = []
-        for i in range(0, len(projects), 2):
-            row = []
-            for j in range(2):
-                if i + j < len(projects):
-                    project = projects[i + j]
-                    row.append(
-                        InlineKeyboardButton(
-                            f"📁 {project}", callback_data=f"cd:{project}"
-                        )
-                    )
-            keyboard.append(row)
-
-        # Add navigation buttons
-        keyboard.append(
-            [
-                InlineKeyboardButton("🏠 Go to Root", callback_data="cd:/"),
-                InlineKeyboardButton(
-                    "🔄 Refresh", callback_data="action:show_projects"
-                ),
-            ]
+        current_dir = scope_state.get("current_directory")
+        message_text, keyboard = build_resume_project_selector(
+            projects=projects,
+            approved_root=settings.approved_directory,
+            token_mgr=token_mgr,
+            user_id=user_id,
+            current_directory=Path(current_dir) if current_dir else None,
+            show_all=False,
+            payload_extra={"engine": active_engine},
+            engine=active_engine,
+            approved_roots=get_approved_roots(settings),
         )
-
-        reply_markup = InlineKeyboardMarkup(keyboard)
-
-        project_list = "\n".join([f"• `{project}/`" for project in projects])
 
         await _reply_update_message_resilient(
             update,
             context,
-            f"📁 **Available Projects**\n\n"
-            f"{project_list}\n\n"
-            f"Click a project below to navigate to it:",
+            message_text,
             parse_mode="Markdown",
-            reply_markup=reply_markup,
+            reply_markup=keyboard,
         )
 
     except Exception as e:
@@ -2251,9 +2244,9 @@ async def ops_status_command(
             process_preview=process_preview,
             restart_tail=restart_tail,
             metrics_snapshot=metrics_snapshot,
-            runtime_metrics=runtime_metrics
-            if isinstance(runtime_metrics, RuntimeMetrics)
-            else None,
+            runtime_metrics=(
+                runtime_metrics if isinstance(runtime_metrics, RuntimeMetrics) else None
+            ),
         )
         chunks = _split_text_chunks(report, max_chars=3400)
         for idx, chunk in enumerate(chunks):
@@ -2690,9 +2683,9 @@ async def _reply_resume_sessions_for_project(
     keyboard.append([InlineKeyboardButton("❌ Cancel", callback_data="resume:cancel")])
 
     try:
-        rel = project_cwd.relative_to(settings.approved_directory)
+        rel = relative_path_for_roots(project_cwd, get_approved_roots(settings))
         project_label = f"{rel}/"
-    except ValueError:
+    except OSError:
         project_label = f"{project_cwd.name}/"
 
     await _reply_update_message_resilient(
@@ -3185,6 +3178,7 @@ async def resume_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             show_all=False,
             payload_extra={"engine": active_engine},
             engine=active_engine,
+            approved_roots=get_approved_roots(settings),
         )
 
         await _reply_update_message_resilient(

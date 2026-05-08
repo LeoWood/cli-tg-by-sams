@@ -15,10 +15,11 @@ def test_build_bot_commands_for_claude_hides_codexdiag():
     """Claude menu should include model and hide codex diagnostics."""
     commands = build_bot_commands_for_engine("claude")
     names = [cmd.command for cmd in commands]
-    assert names[1:3] == ["restartbot", "opsstatus"]
+    assert names[:3] == ["new", "restartbot", "projects"]
     assert "context" in names
     assert "model" in names
     assert "restartbot" in names
+    assert "projects" in names
     assert "opsstatus" in names
     assert "queue" in names
     assert "dequeue" in names
@@ -31,12 +32,13 @@ def test_build_bot_commands_for_codex_includes_read_only_model():
     """Codex menu should include model/effort, status and codex diagnostics."""
     commands = build_bot_commands_for_engine("codex")
     names = [cmd.command for cmd in commands]
-    assert names[1:3] == ["restartbot", "opsstatus"]
+    assert names[:3] == ["new", "restartbot", "projects"]
     assert "context" not in names
     assert "codexdiag" in names
     assert "model" in names
     assert "effort" in names
     assert "restartbot" in names
+    assert "projects" in names
     assert "opsstatus" in names
     assert "queue" in names
     assert "dequeue" in names
@@ -59,3 +61,20 @@ async def test_sync_chat_command_menu_uses_chat_scope():
     kwargs = set_my_commands.await_args.kwargs
     assert kwargs["scope"].chat_id == 321
     assert any(cmd.command == "codexdiag" for cmd in kwargs["commands"])
+
+
+@pytest.mark.asyncio
+async def test_sync_chat_command_menu_allows_group_chat_scope():
+    """Group chats use negative chat IDs and still need scoped menus."""
+    set_my_commands = AsyncMock()
+    bot = SimpleNamespace(set_my_commands=set_my_commands)
+
+    commands = await sync_chat_command_menu(
+        bot=bot,
+        chat_id=-100321,
+        engine="codex",
+    )
+
+    assert commands
+    kwargs = set_my_commands.await_args.kwargs
+    assert kwargs["scope"].chat_id == -100321

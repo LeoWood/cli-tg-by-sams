@@ -49,6 +49,7 @@ def load_config(
             telegram_bot_token_set=bool(os.getenv("TELEGRAM_BOT_TOKEN")),
             telegram_bot_username=os.getenv("TELEGRAM_BOT_USERNAME"),
             approved_directory=os.getenv("APPROVED_DIRECTORY"),
+            approved_directories=os.getenv("APPROVED_DIRECTORIES"),
             debug_mode=os.getenv("DEBUG"),
         )
 
@@ -67,6 +68,7 @@ def load_config(
             environment=env,
             debug=settings.debug,
             approved_directory=str(settings.approved_directory),
+            approved_roots=[str(root) for root in settings.approved_roots],
             features_enabled=_get_enabled_features_summary(settings),
         )
 
@@ -104,13 +106,16 @@ def _apply_environment_overrides(settings: Settings, env: Optional[str]) -> Sett
 def _validate_config(settings: Settings) -> None:
     """Perform additional runtime validation."""
     # Check file system permissions
-    try:
-        if not os.access(settings.approved_directory, os.R_OK | os.X_OK):
+    for approved_root in settings.approved_roots:
+        try:
+            if not os.access(approved_root, os.R_OK | os.X_OK):
+                raise InvalidConfigError(
+                    f"Cannot access approved directory: {approved_root}"
+                )
+        except OSError as e:
             raise InvalidConfigError(
-                f"Cannot access approved directory: {settings.approved_directory}"
-            )
-    except OSError as e:
-        raise InvalidConfigError(f"Error accessing approved directory: {e}") from e
+                f"Error accessing approved directory {approved_root}: {e}"
+            ) from e
 
     # Validate feature dependencies
     if settings.enable_mcp and not settings.mcp_config_path:

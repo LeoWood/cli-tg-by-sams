@@ -9,9 +9,12 @@ import time
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, Iterable, List, Optional, Tuple
 
 import structlog
+
+from .approved_roots import is_path_under_roots, normalize_approved_roots
+from .resume_summary import clean_resume_message_text
 
 logger = structlog.get_logger()
 
@@ -54,12 +57,13 @@ class CodexSessionScanner:
 
     def __init__(
         self,
-        approved_directory: Path,
+        approved_directory: Path | Iterable[Path],
         cache_ttl_sec: int = 30,
         sessions_dir: Optional[Path] = None,
         session_index_path: Optional[Path] = None,
     ):
-        self._approved = approved_directory.resolve()
+        self._approved_roots = normalize_approved_roots(approved_directory)
+        self._approved = self._approved_roots[0]
         self._cache_ttl = cache_ttl_sec
         self._sessions_dir = sessions_dir or CODEX_SESSIONS_DIR
         self._session_index_path = (
@@ -92,7 +96,7 @@ class CodexSessionScanner:
                 continue
             _, cwd = meta
             resolved = cwd.resolve()
-            if not resolved.is_relative_to(self._approved):
+            if not is_path_under_roots(resolved, self._approved_roots):
                 continue
             try:
                 mtime = jsonl.stat().st_mtime
@@ -122,7 +126,7 @@ class CodexSessionScanner:
     ) -> List[CodexSessionCandidate]:
         """Return sessions whose cwd matches project_cwd."""
         resolved_cwd = project_cwd.resolve()
-        if not resolved_cwd.is_relative_to(self._approved):
+        if not is_path_under_roots(resolved_cwd, self._approved_roots):
             return []
 
         cache_key = str(resolved_cwd)
@@ -284,6 +288,7 @@ class CodexSessionScanner:
                     if payload.get("type") != "user_message":
                         continue
                     message = str(payload.get("message") or "").strip()
+                    message = clean_resume_message_text(message)
                     if message:
                         return message[:120]
         except OSError:
@@ -330,6 +335,7 @@ class CodexSessionScanner:
                 payload = record.get("payload")
                 if isinstance(payload, dict) and payload.get("type") == "user_message":
                     message = str(payload.get("message") or "").strip()
+                    message = clean_resume_message_text(message)
                     if message:
                         recent_user_messages.append(message[:120])
 

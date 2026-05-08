@@ -45,11 +45,30 @@ _LOW_SIGNAL_FRAGMENTS = (
 )
 
 _PUNCT_RE = re.compile(r"[，。！？、,.!?;:：/\-_#()]")
+_TELEGRAM_REMOTE_PREFIXES = (
+    "Telegram remote session. User is not on this machine.",
+    "系统提示：你正在通过 Telegram",
+)
+
+
+def clean_resume_message_text(raw: str) -> str:
+    """Remove transport-only context before building resume summaries."""
+    text = str(raw or "").strip()
+    if not text:
+        return ""
+
+    if any(text.startswith(prefix) for prefix in _TELEGRAM_REMOTE_PREFIXES):
+        parts = text.split("\n\n", 1)
+        if len(parts) == 2:
+            return parts[1].strip()
+        return ""
+
+    return text
 
 
 def normalize_resume_preview(raw: str, *, max_len: int) -> str:
     """Normalize preview text into one compact line."""
-    compact = " ".join(str(raw or "").split())
+    compact = " ".join(clean_resume_message_text(raw).split())
     if not compact:
         return "无预览"
     if len(compact) <= max_len:
@@ -100,10 +119,12 @@ def build_resume_session_summary(
     max_len: int,
 ) -> str:
     """Choose a compact, topic-like summary for one resumable session."""
-    thread = " ".join(str(thread_name or "").split()).strip()
-    first = " ".join(str(first_message or "").split()).strip()
-    last = " ".join(str(last_user_message or "").split()).strip()
-    previous = " ".join(str(previous_user_message or "").split()).strip()
+    thread = " ".join(clean_resume_message_text(thread_name).split()).strip()
+    first = " ".join(clean_resume_message_text(first_message).split()).strip()
+    last = " ".join(clean_resume_message_text(last_user_message).split()).strip()
+    previous = " ".join(
+        clean_resume_message_text(previous_user_message).split()
+    ).strip()
 
     if not thread and not first and not last and not previous:
         return "无预览"

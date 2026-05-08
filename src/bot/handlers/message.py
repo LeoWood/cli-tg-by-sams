@@ -551,17 +551,25 @@ def _extract_generated_image_paths(
     *,
     claude_response: Any | None,
     scope_state: dict[str, Any],
-    settings: Settings,
+    settings: Optional[Settings] = None,
+    approved_directory: Optional[Path] = None,
 ) -> list[Path]:
     """Collect generated image files from response content + tool traces."""
     if claude_response is None:
         return []
+    if settings is None and approved_directory is None:
+        return []
 
-    current_dir_raw = scope_state.get("current_directory", settings.approved_directory)
+    base_directory = (
+        Path(settings.approved_directory)
+        if settings is not None
+        else Path(approved_directory)  # type: ignore[arg-type]
+    )
+    current_dir_raw = scope_state.get("current_directory", base_directory)
     try:
         current_dir = Path(current_dir_raw)
     except TypeError:
-        current_dir = Path(settings.approved_directory)
+        current_dir = base_directory
 
     content_candidates = _collect_candidate_image_paths_from_text(
         str(getattr(claude_response, "content", "") or "")
@@ -569,7 +577,11 @@ def _extract_generated_image_paths(
     tool_candidates = _collect_candidate_image_paths_from_tools(
         getattr(claude_response, "tools_used", None)
     )
-    allowed_roots, required_root, _ = _build_auto_delivery_policy(settings)
+    if settings is not None:
+        allowed_roots, required_root, _ = _build_auto_delivery_policy(settings)
+    else:
+        allowed_roots = [Path(approved_directory).expanduser().resolve()]  # type: ignore[arg-type]
+        required_root = None
 
     return _resolve_image_paths_for_delivery(
         [*content_candidates, *tool_candidates],
@@ -583,17 +595,25 @@ def _extract_generated_file_paths(
     *,
     claude_response: Any | None,
     scope_state: dict[str, Any],
-    settings: Settings,
+    settings: Optional[Settings] = None,
+    approved_directory: Optional[Path] = None,
 ) -> list[Path]:
     """Collect generated non-image files from response content + tool traces."""
     if claude_response is None:
         return []
+    if settings is None and approved_directory is None:
+        return []
 
-    current_dir_raw = scope_state.get("current_directory", settings.approved_directory)
+    base_directory = (
+        Path(settings.approved_directory)
+        if settings is not None
+        else Path(approved_directory)  # type: ignore[arg-type]
+    )
+    current_dir_raw = scope_state.get("current_directory", base_directory)
     try:
         current_dir = Path(current_dir_raw)
     except TypeError:
-        current_dir = Path(settings.approved_directory)
+        current_dir = base_directory
 
     content_candidates = _collect_candidate_file_paths_from_text(
         str(getattr(claude_response, "content", "") or "")
@@ -601,7 +621,11 @@ def _extract_generated_file_paths(
     tool_candidates = _collect_candidate_file_paths_from_tools(
         getattr(claude_response, "tools_used", None)
     )
-    allowed_roots, required_root, _ = _build_auto_delivery_policy(settings)
+    if settings is not None:
+        allowed_roots, required_root, _ = _build_auto_delivery_policy(settings)
+    else:
+        allowed_roots = [Path(approved_directory).expanduser().resolve()]  # type: ignore[arg-type]
+        required_root = None
 
     return _resolve_file_paths_for_delivery(
         [*content_candidates, *tool_candidates],

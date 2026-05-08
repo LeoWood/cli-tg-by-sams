@@ -53,6 +53,22 @@ class TestSecurityValidator:
         assert path == (temp_approved_dir / "project").resolve()
         assert error is None
 
+    def test_valid_path_under_secondary_approved_directory(self, tmp_path):
+        """Multiple approved roots should allow paths under any configured root."""
+        primary = tmp_path / "primary"
+        secondary = tmp_path / "secondary"
+        primary.mkdir()
+        secondary.mkdir()
+        project = secondary / "project"
+        project.mkdir()
+
+        validator = SecurityValidator([primary, secondary])
+        valid, path, error = validator.validate_path(str(project))
+
+        assert valid is True
+        assert path == project.resolve()
+        assert error is None
+
     def test_path_traversal_attempts(self, validator, temp_approved_dir):
         """Test detection of path traversal attempts."""
         dangerous_paths = [

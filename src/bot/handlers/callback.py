@@ -17,8 +17,14 @@ from ...services import ApprovalService
 from ...services.session_interaction_service import SessionInteractionService
 from ...services.session_lifecycle_service import SessionLifecycleService
 from ...services.session_service import SessionService
+from ...utils.beijing_time import format_datetime_beijing
 from ..features.session_export import ExportFormat
 from ..inbound_task_queue import InboundTaskQueue
+from ..utils.approved_roots import (
+    get_approved_roots,
+    is_path_under_roots,
+    relative_path_for_roots,
+)
 from ..utils.cli_engine import (
     DEFAULT_CLI_ENGINE,
     ENGINE_CLAUDE,
@@ -370,7 +376,7 @@ async def _handle_queue_callback(
 
         task_registry = context.bot_data.get("task_registry")
         cancelled = False
-        if isinstance(task_registry, TaskRegistry):
+        if callable(getattr(task_registry, "cancel", None)):
             cancelled, used_fallback = await _cancel_task_with_fallback(
                 task_registry=task_registry,
                 user_id=user_id,
@@ -724,7 +730,7 @@ def _get_or_create_resume_scanner(
     if scanner is None:
         scanner = (
             CodexSessionScanner(
-                approved_directory=settings.approved_directory,
+                approved_directory=get_approved_roots(settings),
                 cache_ttl_sec=settings.resume_scan_cache_ttl_seconds,
             )
             if engine == ENGINE_CODEX
@@ -1224,55 +1230,43 @@ async def _handle_show_projects_action(
     settings: Settings = context.bot_data["settings"]
 
     try:
-        # Get directories in approved directory
-        projects = []
-        for item in sorted(settings.approved_directory.iterdir()):
-            if item.is_dir() and not item.name.startswith("."):
-                projects.append(item.name)
+        user_id = query.from_user.id
+        _, scope_state = _get_scope_state_for_query(query, context)
+        active_engine = get_active_cli_engine(scope_state)
+        token_mgr = _get_or_create_resume_token_manager(context)
+        scanner = _get_or_create_resume_scanner(
+            context=context,
+            settings=settings,
+            engine=active_engine,
+        )
+        projects = await scanner.list_projects()
 
         if not projects:
             await _edit_query_message_resilient(
                 query,
-                "📁 **No Projects Found**\n\n"
-                "No subdirectories found in your approved directory.\n"
-                "Create some directories to organize your projects!",
+                f"📁 **No {_resume_engine_label(active_engine)} Projects Found**\n\n"
+                "No desktop sessions were found under the approved directories.",
             )
             return
 
-        # Create project buttons
-        keyboard = []
-        for i in range(0, len(projects), 2):
-            row = []
-            for j in range(2):
-                if i + j < len(projects):
-                    project = projects[i + j]
-                    row.append(
-                        InlineKeyboardButton(
-                            f"📁 {project}", callback_data=f"cd:{project}"
-                        )
-                    )
-            keyboard.append(row)
-
-        # Add navigation buttons
-        keyboard.append(
-            [
-                InlineKeyboardButton("🏠 Root", callback_data="cd:/"),
-                InlineKeyboardButton(
-                    "🔄 Refresh", callback_data="action:show_projects"
-                ),
-            ]
+        current_dir = scope_state.get("current_directory")
+        message_text, keyboard = build_resume_project_selector(
+            projects=projects,
+            approved_root=settings.approved_directory,
+            token_mgr=token_mgr,
+            user_id=user_id,
+            current_directory=current_dir,
+            show_all=False,
+            payload_extra={"engine": active_engine},
+            engine=active_engine,
+            approved_roots=get_approved_roots(settings),
         )
-
-        reply_markup = InlineKeyboardMarkup(keyboard)
-        project_list = "\n".join([f"• `{project}/`" for project in projects])
 
         await _edit_query_message_resilient(
             query,
-            f"📁 **Available Projects**\n\n"
-            f"{project_list}\n\n"
-            f"Click a project to navigate to it:",
+            message_text,
             parse_mode="Markdown",
-            reply_markup=reply_markup,
+            reply_markup=keyboard,
         )
 
     except Exception as e:
@@ -1936,6 +1930,7 @@ async def handle_engine_callback(
             show_all=False,
             payload_extra={"engine": requested_engine},
             engine=requested_engine,
+            approved_roots=get_approved_roots(settings),
         )
         await _edit_query_message_resilient(
             query,
@@ -3169,6 +3164,7 @@ async def _resume_render_project_list(
         show_all=show_all,
         payload_extra={"engine": engine},
         engine=engine,
+        approved_roots=get_approved_roots(settings),
     )
     await _edit_query_message_resilient(
         query,
@@ -3265,6 +3261,13 @@ async def _resume_select_project(
     payload_engine = (
         normalize_cli_engine(payload_engine_raw) if payload_engine_raw else engine
     )
+    try:
+        offset = max(0, int(payload.get("offset", 0)))
+    except (TypeError, ValueError):
+        offset = 0
+    page_size = 5
+    if candidates and offset >= len(candidates):
+        offset = max(0, ((len(candidates) - 1) // page_size) * page_size)
 
     new_session_token = token_mgr.issue(
         kind="n",
@@ -3299,9 +3302,10 @@ async def _resume_select_project(
 
     # Build session selection buttons
     keyboard = []
+    page_candidates = candidates[offset : offset + page_size]
     visible_candidates = [
         candidate
-        for candidate in candidates[:10]
+        for candidate in page_candidates
         if str(getattr(candidate, "session_id", "") or "").strip()
     ]
     labels = build_resume_button_labels(
@@ -3331,6 +3335,25 @@ async def _resume_select_project(
             ]
         )
 
+    if offset + page_size < len(candidates):
+        more_token = token_mgr.issue(
+            kind="p",
+            user_id=user_id,
+            payload={
+                "cwd": str(project_cwd),
+                "engine": payload_engine,
+                "offset": offset + page_size,
+            },
+        )
+        keyboard.append(
+            [
+                InlineKeyboardButton(
+                    f"📚 More Sessions ({len(candidates) - offset - page_size})",
+                    callback_data=f"resume:p:{more_token}",
+                )
+            ]
+        )
+
     keyboard.append(
         [
             InlineKeyboardButton(
@@ -3349,13 +3372,16 @@ async def _resume_select_project(
     )
 
     try:
-        rel = project_cwd.relative_to(settings.approved_directory)
-    except ValueError:
+        rel = relative_path_for_roots(project_cwd, get_approved_roots(settings))
+    except OSError:
         rel = project_cwd.name
+
+    end_index = min(offset + len(visible_candidates), len(candidates))
 
     await _edit_query_message_resilient(
         query,
         f"**Sessions in** `{rel}`\n\n"
+        f"Showing `{offset + 1}-{end_index}` of `{len(candidates)}`.\n\n"
         f"Select a session to resume, or tap *Start New Session Here*:",
         parse_mode="Markdown",
         reply_markup=InlineKeyboardMarkup(keyboard),
@@ -3516,7 +3542,7 @@ async def _resume_start_new_session(
 
     try:
         resolved = project_cwd.resolve()
-        if not resolved.is_relative_to(settings.approved_directory.resolve()):
+        if not is_path_under_roots(resolved, get_approved_roots(settings)):
             await _edit_query_message_resilient(
                 query,
                 "Path is outside the approved directory. Cannot start a new session.",
@@ -3550,8 +3576,8 @@ async def _resume_start_new_session(
     )
 
     try:
-        rel = project_cwd.relative_to(settings.approved_directory)
-    except ValueError:
+        rel = relative_path_for_roots(project_cwd, get_approved_roots(settings))
+    except OSError:
         rel = project_cwd.name
 
     await _edit_query_message_resilient(
@@ -3589,7 +3615,7 @@ async def _do_adopt_session(
     # Defensive: verify project_cwd is under approved_directory
     try:
         resolved = project_cwd.resolve()
-        if not resolved.is_relative_to(settings.approved_directory.resolve()):
+        if not is_path_under_roots(resolved, get_approved_roots(settings)):
             await _edit_query_message_resilient(
                 query, "Path is outside the approved directory. Cannot adopt session."
             )
@@ -3681,8 +3707,8 @@ async def _do_adopt_session(
         )
 
         try:
-            rel = project_cwd.relative_to(settings.approved_directory)
-        except ValueError:
+            rel = relative_path_for_roots(project_cwd, get_approved_roots(settings))
+        except OSError:
             rel = project_cwd.name
 
         summary_block = "\n\n" + _build_resume_context_summary_text(history_preview)

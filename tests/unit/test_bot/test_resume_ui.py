@@ -58,6 +58,30 @@ def test_resume_selector_uses_compact_name_parent_label(tmp_path):
     assert any("cc-telegram · PycharmProjects" in label for label in labels)
 
 
+def test_resume_selector_labels_projects_under_secondary_root(tmp_path):
+    """Project labels should be relative to the matching approved root."""
+    primary = tmp_path / "primary"
+    secondary = tmp_path / "secondary"
+    primary.mkdir()
+    project = secondary / "PycharmProjects" / "cc-telegram"
+    project.mkdir(parents=True)
+
+    token_mgr = ResumeTokenManager()
+    text, keyboard = build_resume_project_selector(
+        projects=[project],
+        approved_root=primary,
+        approved_roots=(primary, secondary),
+        token_mgr=token_mgr,
+        user_id=1,
+        current_directory=None,
+        show_all=False,
+    )
+
+    labels = _button_texts(keyboard)
+    assert "PycharmProjects/cc\\-telegram" in text
+    assert any("cc-telegram · PycharmProjects" in label for label in labels)
+
+
 def test_resume_selector_has_show_all_toggle_when_projects_exceed_limit(tmp_path):
     """Selector should show a toggle button when list is truncated."""
     approved = tmp_path / "approved"

@@ -39,6 +39,13 @@ class Settings(BaseSettings):
 
     # Security
     approved_directory: Path = Field(..., description="Base directory for projects")
+    approved_directories: Optional[List[Path]] = Field(
+        None,
+        description=(
+            "Extra approved project roots. APPROVED_DIRECTORY remains the "
+            "default root."
+        ),
+    )
     allowed_users: Optional[List[int]] = Field(
         None, description="Allowed Telegram user IDs"
     )
@@ -380,6 +387,25 @@ class Settings(BaseSettings):
             return [int(uid) for uid in v]
         return v  # type: ignore[no-any-return]
 
+    @field_validator("approved_directories", mode="before")
+    @classmethod
+    def parse_approved_directories(cls, v: Any) -> Optional[List[Path]]:
+        """Parse comma-separated extra approved roots."""
+        if v is None:
+            return None
+        if isinstance(v, str):
+            raw_items = [item.strip() for item in v.split(",") if item.strip()]
+            return [Path(item) for item in raw_items] or None
+        if isinstance(v, list):
+            parsed: list[Path] = []
+            for item in v:
+                normalized = str(item).strip()
+                if not normalized:
+                    continue
+                parsed.append(Path(normalized))
+            return parsed or None
+        return v  # type: ignore[no-any-return]
+
     @field_validator("claude_allowed_tools", mode="before")
     @classmethod
     def parse_claude_allowed_tools(cls, v: Any) -> Optional[List[str]]:
@@ -469,6 +495,25 @@ class Settings(BaseSettings):
             raise ValueError(f"Approved directory is not a directory: {path}")
         return path  # type: ignore[no-any-return]
 
+    @field_validator("approved_directories")
+    @classmethod
+    def validate_approved_directories(
+        cls, v: Optional[List[Path]]
+    ) -> Optional[List[Path]]:
+        """Ensure extra approved roots exist and are absolute."""
+        if v is None:
+            return None
+
+        validated: list[Path] = []
+        for item in v:
+            path = Path(item).resolve()
+            if not path.exists():
+                raise ValueError(f"Approved directory does not exist: {path}")
+            if not path.is_dir():
+                raise ValueError(f"Approved directory is not a directory: {path}")
+            validated.append(path)
+        return validated or None
+
     @field_validator("mcp_config_path", mode="before")
     @classmethod
     def validate_mcp_config(cls, v: Any, info: Any) -> Optional[Path]:
@@ -525,6 +570,23 @@ class Settings(BaseSettings):
             raise ValueError("mcp_config_path required when enable_mcp is True")
 
         return self
+
+    @property
+    def approved_roots(self) -> tuple[Path, ...]:
+        """Return all approved roots with APPROVED_DIRECTORY first."""
+        roots = [self.approved_directory]
+        roots.extend(self.approved_directories or [])
+
+        deduped: list[Path] = []
+        seen: set[str] = set()
+        for root in roots:
+            resolved = root.resolve()
+            key = str(resolved)
+            if key in seen:
+                continue
+            seen.add(key)
+            deduped.append(resolved)
+        return tuple(deduped)
 
     @property
     def is_production(self) -> bool:

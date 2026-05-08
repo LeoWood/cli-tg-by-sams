@@ -60,7 +60,9 @@ require_tmux() {
 TMUX_BIN="$(resolve_tmux_bin || true)"
 
 list_bot_processes() {
-  pgrep -af "virtualenvs/cli-tg-.*bin/(cli-tg-bot|claude-telegram-bot)|python -m src.main" || true
+  ps -axo pid=,command= \
+    | grep -E "[v]irtualenvs/cli-tg-.*bin/(cli-tg-bot|claude-telegram-bot)|[p]ython -m src.main" \
+    || true
 }
 
 bot_process_count() {
